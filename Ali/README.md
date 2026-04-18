@@ -285,7 +285,6 @@ update alias paths in `config/resources.py` to real local files.
 
 - **Alspencer Omondi**
 - **Hanzi Li**
-- **Ethan Sandoval**
 - **Korin Aldam-Tajima**
 
 Built at the Cactus × YC Gemma 4 Voice Agents Hackathon, San Francisco, April 18–19 2026.
