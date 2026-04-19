@@ -161,6 +161,8 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 print("\n─── New command ───────────────────────────────")
                 overlay.push("transcript", f'"{transcript}"')
 
+                from intent.grad_calendar_hint import append_grad_calendar_note_if_needed
+
                 # Multi-turn follow-up: if the previous turn asked for a
                 # missing slot (e.g. "What should I say?", "Where to?"),
                 # route this transcript to the stored resume callback
@@ -261,9 +263,12 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     result = await answer_question(transcript)
                     print(f'      ← "{result.text}" (backend={result.backend}, '
                           f'snippets={result.snippets_used})')
-                    overlay.push("assistant", result.text or "I don't have that.")
+                    out = append_grad_calendar_note_if_needed(
+                        transcript, result.text or "I don't have that."
+                    )
+                    overlay.push("assistant", out)
                     _push_citations(overlay, result.cited_paths)
-                    speak(result.text or "I don't have that.")
+                    speak(out)
                     return
 
                 if intent.goal.value == "unknown":
@@ -275,7 +280,7 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     if index_exists():
                         rag = await answer_question(transcript)
                         if rag.snippets_used > 0 and rag.text:
-                            reply = rag.text
+                            reply = append_grad_calendar_note_if_needed(transcript, rag.text)
                             overlay.push("assistant", reply)
                             _push_citations(overlay, rag.cited_paths)
                             speak(reply)
@@ -298,8 +303,11 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     except Exception:
                         pass
                     # #endregion
-                    overlay.push("assistant", reply or "I didn't catch that.")
-                    speak(reply or "I didn't catch that.")
+                    out = append_grad_calendar_note_if_needed(
+                        transcript, reply or "I didn't catch that."
+                    )
+                    overlay.push("assistant", out)
+                    speak(out)
                     return
 
                 # send_message bypasses the browser sub-agent and the

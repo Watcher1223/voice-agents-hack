@@ -93,22 +93,26 @@ try:
 except ValueError:
     AMBIENT_IDLE_FLUSH_S = 3.5
 # Ambient Cactus fallback: when Gemini returns 429 / RESOURCE_EXHAUSTED or
-# the retry budget is blown, run the analysis locally via the Cactus CLI
-# instead of silently dropping the buffer. Gemma 4 (2B) on-device is slow
-# (~30s cold, ~3-5s warm) but keeps the checklist flowing during outages.
+# the retry budget is blown, run the analysis locally via the Cactus
+# CLI. OFF by default because the small on-device models we can afford
+# to call per utterance (gemma-3-1b-it, functiongemma-270m) aren't
+# reliable enough on this schema — they hallucinate names and drop
+# slots, which makes bad checklist rows that are worse than silent
+# failures. gemma-4-E2B-it is reliable but ~30-60s cold / ~3-5s warm,
+# which only makes sense behind a persistent sidecar server
+# (scripts/cactus_server.py). Flip VOICE_AGENT_AMBIENT_CACTUS_FALLBACK=1
+# to opt in and pick a model via VOICE_AGENT_AMBIENT_CACTUS_MODEL.
 AMBIENT_CACTUS_FALLBACK = os.environ.get(
-    "VOICE_AGENT_AMBIENT_CACTUS_FALLBACK", "1"
+    "VOICE_AGENT_AMBIENT_CACTUS_FALLBACK", "0"
 ).lower() in {"1", "true", "yes"}
 try:
     AMBIENT_CACTUS_TIMEOUT_S = max(
-        5.0, float(os.environ.get("VOICE_AGENT_AMBIENT_CACTUS_TIMEOUT_S", "60"))
+        5.0, float(os.environ.get("VOICE_AGENT_AMBIENT_CACTUS_TIMEOUT_S", "25"))
     )
 except ValueError:
-    AMBIENT_CACTUS_TIMEOUT_S = 60.0
-# Default to the Gemma 4 model (bigger + better JSON adherence than
-# functiongemma-270m which fails our stricter schema in practice).
+    AMBIENT_CACTUS_TIMEOUT_S = 25.0
 AMBIENT_CACTUS_MODEL = os.environ.get(
-    "VOICE_AGENT_AMBIENT_CACTUS_MODEL", CACTUS_GEMMA4_MODEL
+    "VOICE_AGENT_AMBIENT_CACTUS_MODEL", "google/gemma-3-1b-it"
 )
 # OpenCLI requires Node >= 22.19. Bypass the shebang and invoke node+entry
 # directly so a stale `env node` in PATH can't resolve to an older version.

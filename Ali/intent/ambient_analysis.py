@@ -367,6 +367,69 @@ def _assemble_prompt(
     )
 
 
+# Compact prompt for the small-model fallback (1B Gemma class). No
+# few-shot example — smaller models parrot names and places from
+# examples into outputs. Skips the screen block (Cactus is text-only).
+_CACTUS_SYSTEM = """\
+Read the CURRENT TRANSCRIPT at the bottom and output ONE JSON object
+describing what (if anything) the user just said they need to do.
+
+Rules:
+1. Output ONLY valid JSON. No prose, no markdown, no fences.
+2. Only use names, places, topics, and words that appear in the
+   CURRENT TRANSCRIPT. Do not invent details. Do not use names from
+   these instructions.
+3. If the transcript describes a task the user should do, set tier=3.
+   Otherwise set tier=4.
+
+JSON keys:
+  tier:      integer, 3 or 4.
+  headline:  short summary, empty string if tier=4.
+  detail:    empty string.
+  actions:   array of action objects (empty array if tier=4).
+
+Each action object:
+  {"kind": <"local"|"opencli"|"browser_task">,
+   "text": <see below>,
+   "slots": <see below>,
+   "label": <short verb phrase for the task>}
+
+kind="local" — text is one of:
+  compose_mail           slots: {"to":<name>, "subject":<topic>, "body":<message>}
+  send_imessage          slots: {"contact":<name>, "body":<message>}
+  create_calendar_event  slots: {"title":<what>, "date":<YYYY-MM-DD>, "time":<HH:MM>}
+  find_file              slots: {"file_query":<query>}
+  open_url               slots: {"url":<url>}
+
+kind="opencli" — text is an opencli command (hackernews top, google search X, wikipedia search Y, arxiv search Z). slots: {}.
+
+kind="browser_task" — text is a natural-language web goal (book flight, apply to job, research company). slots: {}.
+
+A single sentence can contain multiple actions. Each distinct action
+becomes its own entry in the actions array. Only include an action if
+the transcript actually implies it.
+
+If an action matching the transcript already appears under TASKS
+ALREADY ON CHECKLIST, do not re-emit it."""
+
+
+def _assemble_cactus_prompt(
+    history: list[str], previous: AmbientAnalysis | None
+) -> str:
+    # Only the most recent few turns — the 1B model tends to over-weight
+    # older lines when the context gets long, and the interesting signal
+    # is always in the last utterance or two.
+    tail = history[-4:] if history else []
+    hist_block = "\n".join(f"- {line}" for line in tail) or "(empty)"
+    checklist_block = _format_pending_checklist_block()
+    return (
+        f"{_CACTUS_SYSTEM}\n\n"
+        f"TASKS ALREADY ON CHECKLIST:\n{checklist_block}\n\n"
+        f"CURRENT TRANSCRIPT:\n{hist_block}\n\n"
+        "JSON output:"
+    )
+
+
 async def _analyse_with_gemini(
     prompt: str, screen_image_bytes: bytes
 ) -> tuple[dict[str, Any] | None, str, BaseException | None]:
@@ -432,10 +495,12 @@ async def _analyse_with_gemini(
 
 
 async def _analyse_with_cactus(
-    prompt: str,
+    history: list[str],
+    previous: AmbientAnalysis | None,
 ) -> tuple[dict[str, Any] | None, str]:
-    """Run the ambient analysis locally via the Cactus CLI. Returns
-    (parsed, cleaned_text) or (None, '') on failure. Never raises."""
+    """Run the ambient analysis locally via the Cactus CLI with a lean
+    prompt tuned for the 270M function-gemma model. Returns (parsed,
+    cleaned_text) or (None, '') on failure. Never raises."""
     if not AMBIENT_CACTUS_FALLBACK or not _CACTUS_CLI:
         return None, ""
     print(
@@ -443,6 +508,7 @@ async def _analyse_with_cactus(
         f"timeout={AMBIENT_CACTUS_TIMEOUT_S:.0f}s)…",
         flush=True,
     )
+    prompt = _assemble_cactus_prompt(history, previous)
     raw = await _run_cactus_analyse(prompt)
     if not raw:
         return None, ""
@@ -483,16 +549,28 @@ async def analyse(
         data, cleaned, last_exc = await _analyse_with_gemini(prompt, screen_image_bytes)
 
     # Escalate to Cactus when Gemini is unavailable OR when it failed
-    # (quota / repeated transient / parse). Cactus can't see screenshots,
-    # so pass the text-only prompt.
+    # (quota / repeated transient / parse). Cactus uses a leaner prompt
+    # tuned for the small function-gemma model — assembled internally,
+    # not the full multimodal prompt above.
     if data is None and AMBIENT_CACTUS_FALLBACK and _CACTUS_CLI:
-        cactus_data, cactus_cleaned = await _analyse_with_cactus(prompt)
+        cactus_data, cactus_cleaned = await _analyse_with_cactus(history, previous)
         if cactus_data is not None:
             data = cactus_data
             cleaned = cactus_cleaned
 
     if data is None:
-        if last_exc is not None:
+        # Surface an explicit hint when Gemini quota hit and the local
+        # fallback is off — otherwise the checklist silently stops
+        # filling and the user has no idea why.
+        if last_exc is not None and _is_quota_error(last_exc):
+            if not AMBIENT_CACTUS_FALLBACK:
+                print(
+                    "[ambient] Gemini quota exhausted and local fallback is "
+                    "OFF. Set VOICE_AGENT_AMBIENT_CACTUS_FALLBACK=1 to use "
+                    "Cactus on-device (slower, sometimes noisy), upgrade the "
+                    "Gemini key, or wait for the daily quota reset."
+                )
+        elif last_exc is not None:
             print(f"[ambient] no analysis produced (last error: {last_exc!s})")
         return AmbientAnalysis()
 
