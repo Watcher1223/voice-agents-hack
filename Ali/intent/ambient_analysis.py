@@ -108,41 +108,23 @@ Apply this decision hierarchy IN ORDER. Stop at the first tier that fires.
                                     slots: url.
 
     (C) kind='browser_task' — a real-world task best handled by a
-        browser agent we will run later. Use this for hotels, applying
-        to jobs, anything that needs a real web session — EXCEPT
-        flight search, which has its own kind (D). `text` should be a
-        natural-language goal (no slots required). Examples:
+        browser agent we will run later. Use this for applying to jobs,
+        anything that needs a real web session.
+        Do NOT use browser_task for flights — use find_flights instead.
+        `text` should be a natural-language goal (no slots required).
+        Examples:
           text="find a one-bedroom Airbnb in Lisbon under $150/night"
           text="apply to the Anthropic product engineer role"
 
-    (D) kind='find_flights' — the user wants to find/book a flight.
-        We hit the Kiwi flight-search API directly and hand back
-        clickable deeplinks, so STRUCTURED slots are required.
-        slots:
-          origin:       city name or IATA code (e.g. "SFO", "Ontario",
-                        "Boston"). Required.
-          destination:  city name or IATA code. Required.
-          depart_date:  YYYY-MM-DD. Required. If the user says
-                        "tomorrow" / "next weekend" / "April 25th",
-                        resolve to an absolute date.
-          return_date:  YYYY-MM-DD. Optional — only set for explicit
-                        round-trips.
-        `text` should be a short phrase like "SFO to Tokyo next
-        weekend". Examples:
-          text="SFO to Cancun next Tuesday"
-              slots={"origin":"SFO","destination":"Cancun",
-                     "depart_date":"2026-04-28"}
-          text="Boston to London tomorrow"
-              slots={"origin":"Boston","destination":"London",
-                     "depart_date":"2026-04-20"}
+    (D) kind='find_flights' — search for flights using Kiwi. Use this
+        whenever the user mentions booking or finding a flight.
+        slots: origin (str), destination (str), depart_date (YYYY-MM-DD,
+        optional), return_date (YYYY-MM-DD, optional).
+        Examples:
+          slots={"origin":"SFO","destination":"Cancun","depart_date":"2026-07-14"}
+          slots={"origin":"Ontario","destination":"LAX","depart_date":"2026-07-14"}
 
-        If ANY of origin, destination, or depart_date is missing, DO
-        NOT emit this action. Stay silent on this one (omit it from
-        the actions array) — the PTT flow will re-prompt the user for
-        the missing piece. Never fall back to browser_task for a
-        flight; it creates a ghost task the user can't complete.
-
-    If an action doesn't map to A/B/C/D, simply omit it — do not
+    If an action doesn't map to A/B/C, simply omit it — do not
     fabricate capabilities. But if *any* action fits, emit the
     analysis as tier-3, even if other mentioned actions don't.
 
@@ -177,10 +159,8 @@ Example for "email Hanzi that I want to book a grad trip to Hawaii":
      "slots":{"to":"Hanzi","subject":"Grad trip to Hawaii",
               "body":"I want to book a grad trip to Hawaii."},
      "label":"Email Hanzi about Hawaii grad trip"},
-    {"kind":"find_flights","text":"SFO to Honolulu for the grad trip",
-     "slots":{"origin":"SFO","destination":"Honolulu",
-              "depart_date":"2026-05-15"},
-     "label":"Find flights to Honolulu"}
+    {"kind":"find_flights","text":"book a flight to Hawaii for the grad trip",
+     "slots":{"origin":"San Francisco","destination":"Hawaii"}, "label":"Book flight to Hawaii"}
   ]
 }
 
@@ -435,7 +415,7 @@ JSON keys:
   actions:   array of action objects (empty array if tier=4).
 
 Each action object:
-  {"kind": <"local"|"opencli"|"browser_task"|"find_flights">,
+  {"kind": <"local"|"opencli"|"browser_task">,
    "text": <see below>,
    "slots": <see below>,
    "label": <short verb phrase for the task>}
@@ -453,9 +433,9 @@ attach it. The file name is the phrase the user said, NOT a path.
 
 kind="opencli" — text is an opencli command (hackernews top, google search X, wikipedia search Y, arxiv search Z). slots: {}.
 
-kind="browser_task" — text is a natural-language web goal (apply to job, research company, search hotels). slots: {}. Do NOT use browser_task for flight search — use kind="find_flights" instead.
+kind="browser_task" — text is a natural-language web goal (apply to job, research company). Do NOT use for flights. slots: {}.
 
-kind="find_flights" — the user wants a flight. slots: {"origin":<city or IATA>, "destination":<city or IATA>, "depart_date":"YYYY-MM-DD", "return_date":"YYYY-MM-DD" (optional)}. Resolve relative dates ("tomorrow", "next weekend") to absolute YYYY-MM-DD. If ANY of origin, destination, or depart_date is missing, OMIT this action entirely — never fall back to browser_task for a flight.
+kind="find_flights" — search for a flight using Kiwi. slots: {"origin":<city>, "destination":<city>, "depart_date":<YYYY-MM-DD or empty>}.
 
 A single sentence can contain multiple actions. Each distinct action
 becomes its own entry in the actions array. Only include an action if

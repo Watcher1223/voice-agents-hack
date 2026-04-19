@@ -15,6 +15,9 @@ SpeechRecognition>=3.10.0
 types-pyaudio>=0.2.16
 types-pynput>=1.7.6
 
+# OpenAI TTS (high-quality voice output)
+openai>=1.0.0
+
 # Speech-to-text fallback (used when Cactus STT is unavailable)
 faster-whisper>=1.0.0
 

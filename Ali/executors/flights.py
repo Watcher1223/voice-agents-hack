@@ -18,6 +18,34 @@ import asyncio
 import json
 import urllib.request
 from typing import Any
+from urllib.parse import quote
+
+_KIWI_BASE = "https://www.kiwi.com/en/search/results"
+
+
+def _slug(city: str) -> str:
+    """Normalise a city/airport name into the dash-separated slug Kiwi expects."""
+    return quote(city.strip().lower().replace(" ", "-"))
+
+
+def build_kiwi_url(slots: dict) -> str:
+    """Build a Kiwi.com search URL from flight intent slots.
+
+    Accepts city names ("San Francisco") or IATA codes ("SFO").
+    Returns a URL the browser agent (or user) can open directly.
+    """
+    origin = _slug(str(slots.get("origin") or ""))
+    destination = _slug(str(slots.get("destination") or ""))
+    if not origin or not destination:
+        raise ValueError("build_kiwi_url requires both origin and destination")
+    parts = [_KIWI_BASE, origin, destination]
+    depart = str(slots.get("depart_date") or "").strip()
+    return_ = str(slots.get("return_date") or "").strip()
+    if depart:
+        parts.append(depart)
+        if return_:
+            parts.append(return_)
+    return "/".join(parts)
 
 _MCP_URL = "https://mcp.kiwi.com/"
 _PROTOCOL_VERSION = "2025-06-18"

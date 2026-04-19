@@ -549,22 +549,11 @@ class TranscriptionOverlay(QWidget):
         QTimer.singleShot(120, self._emit_wake_capture)
 
     def _play_wake_greeting(self) -> None:
-        if sys.platform != "darwin":
-            return
         try:
-            from voice.speak import _voice
-            proc = subprocess.Popen(
-                ["/usr/bin/say", "-v", _voice(), "-r", "160", "Hi"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            try:
-                from voice.speak import track_tts_process
-                track_tts_process(proc)
-            except Exception:
-                pass
+            from voice.speak import speak
+            speak("Hi")
             # #region agent log
-            _dlog("overlay:_play_wake_greeting", "wake greeting launched", {"pid": proc.pid}, "H2")
+            _dlog("overlay:_play_wake_greeting", "wake greeting launched", {}, "H2")
             # #endregion
         except Exception:
             # #region agent log

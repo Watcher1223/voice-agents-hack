@@ -62,7 +62,7 @@ _GEMINI_DISABLED_THIS_SESSION = False
 SYSTEM_PROMPT = """You are an intent classifier for a voice agent called Ali.
 Given a voice transcript, output ONE JSON object with EXACTLY these fields:
 {
-  "goal": one of [apply_to_job, send_message, send_email, add_calendar_event, open_url, find_file, capture_meeting, ask_knowledge, unknown],
+  "goal": one of [apply_to_job, send_message, send_email, add_calendar_event, open_url, find_file, capture_meeting, ask_knowledge, find_flights, unknown],
   "target": {"type": "url|contact|file|question|calendar", "value": "..."},
   "uses_local_data": list of strings drawn from [resume, cover_letter, attachment, document, deck, contacts, calendar, index],
   "requires_browser": true|false,
@@ -146,6 +146,12 @@ Transcript: "who am I"
 
 Transcript: "start meeting capture"
 {"goal":"capture_meeting","target":{},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{}}
+
+Transcript: "find flights from SF to Tokyo next weekend"
+{"goal":"find_flights","target":{"type":"url","value":"kiwi.com"},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{"origin":"SF","destination":"Tokyo","depart_date":null}}
+
+Transcript: "book a flight from Ontario to San Francisco on April 20th"
+{"goal":"find_flights","target":{"type":"url","value":"kiwi.com"},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{"origin":"Ontario","destination":"San Francisco","depart_date":"2026-04-20"}}
 
 Output ONLY the JSON object. No prose, no markdown fences, no explanation."""
 
@@ -523,7 +529,7 @@ def _is_knowledge_question(transcript: str) -> bool:
     return any(t.startswith(prefix) for prefix in _KNOWLEDGE_QUESTION_STARTS)
 
 
-_FLIGHT_TRIGGERS = ("flight", "flights", "fly to", "fly from", "ticket to", "tickets to")
+_FLIGHT_TRIGGERS = ("flight", "flights", "fly to", "fly from", "ticket to", "tickets to", "book a flight", "book flight")
 
 
 def _parse_when_phrase(phrase: str, today) -> str | None:

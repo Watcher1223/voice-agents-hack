@@ -70,43 +70,38 @@ async def _run_through_shared_client(
 
 
 async def search_flight(
-    client: "LocalAgentClient",
-    lock: asyncio.Lock,
     destination: str,
     date: str,
     origin: str = "",
+    # Legacy browser args kept for call-site compatibility but ignored.
+    client: "LocalAgentClient | None" = None,
+    lock: "asyncio.Lock | None" = None,
 ) -> TaskResult:
-    """Find the cheapest one-way flight. Returns info only — no booking."""
+    """Find the cheapest one-way flight via Kiwi MCP. No browser required."""
+    from executors.flights import search_flights, format_flight_summary, build_kiwi_url
+
     origin = (origin.strip() or _DEFAULT_ORIGIN)
     destination = destination.strip() or "Los Angeles"
 
-    task = (
-        f"Go to https://www.google.com/travel/flights. "
-        f"Search for the cheapest one-way flight from {origin} to {destination} on {date}. "
-        f"Wait for results to load. "
-        f"Find the cheapest available option. "
-        f"Reply with exactly one sentence in this format: "
-        f"'$<price> on <airline>, departs <time>' — nothing else."
-    )
-    session_id = f"flight-{uuid.uuid4().hex[:8]}"
+    slots: dict = {"origin": origin, "destination": destination}
+    if date:
+        # Accept YYYY-MM-DD or natural language; pass through — Kiwi MCP
+        # validates and the parser already normalised dates upstream.
+        slots["depart_date"] = date
 
     try:
-        status = await _run_through_shared_client(
-            client, lock, task, session_id,
-            url="https://www.google.com/travel/flights",
-            max_wait=120.0,
-            confirmation_followup_wait=60.0,
-        )
-        if status.state == "complete" and status.answer:
-            answer = status.answer.strip()[:80]
-            return TaskResult(
-                True, answer,
-                url="https://www.google.com/travel/flights",
-            )
-        err = status.error or status.state
-        return TaskResult(False, "search failed", detail=err)
+        flights = await search_flights(slots)
     except Exception as e:
-        return TaskResult(False, "unavailable", detail=str(e))
+        return TaskResult(False, "search failed", detail=str(e))
+
+    if not flights:
+        return TaskResult(False, "no flights found",
+                          url=build_kiwi_url(slots) if slots.get("destination") else "")
+
+    top = flights[0]
+    summary = format_flight_summary(top)
+    deeplink = top.get("deepLink", build_kiwi_url(slots))
+    return TaskResult(True, summary, url=deeplink)
 
 
 async def draft_email_in_gmail(

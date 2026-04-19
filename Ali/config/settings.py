@@ -67,8 +67,8 @@ AGENT_NODE_BIN     = os.getenv("AGENT_NODE_BIN",     "node")
 # loop). If no intent matches or the flag is off, we fall back to
 # ROUTE_BROWSER_TASK_ENABLED — the LLM-driven browser sub-agent. Both flags can
 # be toggled at the command line via env to A/B the two paths live.
-ROUTE_OPENCLI_ENABLED     = os.environ.get("VOICE_AGENT_ROUTE_OPENCLI", "1").lower() in {"1", "true", "yes"}
-ROUTE_BROWSER_TASK_ENABLED = os.environ.get("VOICE_AGENT_ROUTE_BROWSER_TASK", "1").lower() in {"1", "true", "yes"}
+ROUTE_OPENCLI_ENABLED     = os.environ.get("VOICE_AGENT_ROUTE_OPENCLI", "0").lower() in {"1", "true", "yes"}
+ROUTE_BROWSER_TASK_ENABLED = os.environ.get("VOICE_AGENT_ROUTE_BROWSER_TASK", "0").lower() in {"1", "true", "yes"}
 # Ambient mode: run Deepgram from boot + glass-style intent detection that
 # surfaces suggestions every 5 final transcripts (not 12s wall-clock). On
 # by default because the task checklist (loose utterances → tickable rows)

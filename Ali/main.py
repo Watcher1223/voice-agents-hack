@@ -284,6 +284,14 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     from executors.local.disk_index import answer_question, index_exists
                     from intent.chat import chat_reply
                     from voice.speak import speak
+                    # Easter egg
+                    _COMPLIMENTS = ("you're the best", "youre the best", "you are the best",
+                                    "you're amazing", "youre amazing", "you are amazing")
+                    _t_lower = transcript.strip().lower()
+                    if any(c in _t_lower for c in _COMPLIMENTS):
+                        overlay.push("assistant", "I know.")
+                        speak("I know.")
+                        return
                     print("[2.5/3] Unknown intent → conversational reply...")
                     reply = ""
                     if index_exists():
@@ -377,6 +385,55 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 print("[3/3] Executing...")
                 menu_bar.set_status("running")
                 overlay.push("action", f"Running: {goal_label}…")
+
+                # Flights: call Kiwi MCP for real structured results. Pick the
+                # cheapest, speak its summary, open Kiwi's booking deeplink.
+                if intent.goal == KnownGoal.FIND_FLIGHTS:
+                    from executors.flights import search_flights, format_flight_summary, FlightSearchError
+                    from voice.speak import speak
+                    try:
+                        flights = await search_flights(intent.slots)
+                    except FlightSearchError as e:
+                        overlay.push("error", f"Flight search failed: {e}")
+                        speak(str(e))
+                        return
+                    except Exception as e:
+                        overlay.push("error", f"Flight search error: {e}")
+                        speak("I couldn't reach the flight search service.")
+                        return
+                    if not flights:
+                        overlay.push("done", "No flights found")
+                        speak("I couldn't find any flights for that route.")
+                        return
+                    top = flights[0]
+                    # Header
+                    origin_code = top.get("flyFrom", intent.slots.get("origin", ""))
+                    dest_code   = top.get("flyTo",   intent.slots.get("destination", ""))
+                    date_label  = f"  {intent.slots.get('depart_date', '')}" if intent.slots.get("depart_date") else ""
+                    overlay.push("assistant", f"Flights  {origin_code} → {dest_code}{date_label}")
+                    # List up to top 5 results
+                    for i, f in enumerate(flights[:5], 1):
+                        overlay.push("assistant", f"  {i}.  {format_flight_summary(f)}")
+                    speak(f"Found {len(flights[:5])} flights. Cheapest is {top.get('price')} dollars, {format_flight_summary(top).split('•')[-1].strip()}.")
+                    deeplink = top.get("deepLink")
+                    if deeplink:
+                        _open_url_local(deeplink)
+                    # Add calendar event(s) for the flight date(s)
+                    try:
+                        import json as _json
+                        from executors.calendar import add_flight_events
+                        n = add_flight_events(intent.slots, top)
+                        if n > 0:
+                            label = "events" if n > 1 else "event"
+                            overlay.push("assistant", f"Added {n} calendar {label}")
+                            overlay.push("cited_paths", _json.dumps([
+                                {"label": "Open Calendar", "path": "ali://calendar/"}
+                            ]))
+                            speak(f"I've added {n} calendar {label} for your trip.")
+                    except Exception:
+                        pass
+                    return
+
 
                 # Browser-shaped intents (open_url, apply_to_job, anything the
                 # parser flagged requires_browser=True) all enter the same
@@ -913,7 +970,7 @@ async def _dispatch_extracted_items(
                 dest = slots.get("destination") or "Los Angeles"
                 date = slots.get("date") or "Tuesday"
                 origin = slots.get("origin") or ""
-                result = await search_flight(browser_client, browser_lock, dest, date, origin)
+                result = await search_flight(dest, date, origin)
             elif item_type in ("draft_email", "send_email", "compose_email", "compose_mail"):
                 result = await _dispatch_email_item(
                     slots, task_label, browser_client, browser_lock,
@@ -1196,42 +1253,52 @@ async def _execute_ambient_action(analysis, overlay) -> None:
         overlay.push("ambient_ack", f"✗ {headline[:140]}: {e}")
 
 
+_FLIGHT_KEYWORDS = ("flight", "flights", "fly to", "fly from", "book a flight",
+                    "book flight", "ticket to", "tickets to")
+
+
 async def _execute_ambient_browser_task(
     task_text: str, overlay, headline: str
 ) -> None:
-    """Route a checklist browser_task through the persistent browser
-    sub-agent. The agent's MCP server bundle must already be built
-    (`cd executors/browser/agent/server && npm install && npm run build`).
-    When missing, we surface a readable error on the overlay so the
-    user sees why the task didn't run."""
+    """Handle a checklist browser_task action.
+
+    Flight-related tasks are routed directly to Kiwi MCP (no browser needed).
+    All other browser tasks surface a clear 'browser disabled' message so the
+    user knows why they didn't run, rather than crashing with a relay error.
+    """
     from observer.agent_log import log as agent_log
-    from executors.browser.agent_client import LocalAgentClient
 
     goal = (task_text or headline or "").strip()
     if not goal:
         overlay.push("ambient_ack", "✗ browser_task: no goal text")
-        agent_log("tool:browser_task", "empty goal — skipping")
         return
 
-    overlay.push("action", f"▶  browser  ·  {goal[:160]}")
-    agent_log("tool:browser_task", f"checklist goal={goal[:160]}")
-    client = LocalAgentClient()
-    try:
-        status = await client.run_task(task=goal, session_id="")
-    except Exception as exc:
-        overlay.push("ambient_ack", f"✗ {str(exc)[:160]}")
-        agent_log("tool:browser_task:err", str(exc)[:200])
+    goal_lower = goal.lower()
+    if any(kw in goal_lower for kw in _FLIGHT_KEYWORDS):
+        # Parse slots out of the natural-language goal and use Kiwi MCP.
+        from intent.parser import _extract_flight_slots
+        from executors.meeting_tasks import search_flight
+        from voice.speak import speak
+        import datetime as _dt
+
+        slots = _extract_flight_slots(goal)
+        dest = slots.get("destination") or ""
+        origin = slots.get("origin") or ""
+        date = slots.get("depart_date") or _dt.date.today().isoformat()
+
+        overlay.push("action", f"Searching flights {origin} → {dest}…")
+        agent_log("tool:browser_task", f"flight via kiwi: {origin}→{dest} {date}")
+        result = await search_flight(dest, date, origin)
+        if result.success:
+            overlay.push("assistant", result.summary)
+            speak(result.summary)
+        else:
+            overlay.push("ambient_ack", f"✗ {result.detail or 'no flights found'}")
         return
 
-    if status.state == "complete":
-        answer = (status.answer or "Done.").strip()[:400]
-        overlay.push("assistant", answer)
-        agent_log("tool:browser_task:done", answer[:200])
-        return
-
-    err = status.error or status.state or "browser task did not complete"
-    overlay.push("ambient_ack", f"✗ {err[:160]}")
-    agent_log("tool:browser_task:err", err[:200])
+    # Non-flight browser tasks — browser agent is disabled.
+    agent_log("tool:browser_task", f"browser disabled, skipping: {goal[:120]}")
+    overlay.push("ambient_ack", f"✗ browser tasks are disabled ({goal[:80]})")
 
 
 async def _execute_ambient_find_flights(
@@ -2181,12 +2248,32 @@ async def _run_meeting_capture(overlay, menu_bar) -> None:
 
     # End-of-meeting spoken briefing
     from voice.speak import speak
+
+    # 1. Verbatim task-list readback — user hears exactly what Ali captured
+    #    before the paraphrased Gemini summary. Skipped if nothing ran.
+    if results:
+        readback = _format_task_readback(results)
+        overlay.push("assistant", readback)
+        speak(readback)
+
+    # 2. Paraphrased briefing (Gemini).
     if results:
         briefing = await _meeting_briefing(results, capture.full_transcript)
     else:
         briefing = "Meeting captured. No action items were detected."
     overlay.push("assistant", briefing)
     speak(briefing)
+
+    # 3. Q1-gated fact-check. If the meeting transcript mentions Q1 /
+    #    revenue, run the full transcript through the disk-index RAG
+    #    (answer.py's system prompt already instructs the model to lead
+    #    corrections with "Actually, …" when a user claim conflicts with
+    #    the excerpts). Only speak the reply when it's an actual
+    #    correction — silence otherwise so we don't tack noise onto every
+    #    meeting end.
+    await _maybe_speak_meeting_correction(
+        capture.full_transcript, overlay, speak
+    )
 
     # Per-action confirmation dialog. Only fires for actions whose executor
     # set a confirm_prompt (e.g. drafted emails). Each confirmation runs as
@@ -2274,9 +2361,7 @@ async def _run_quick_multi_action(transcript: str, overlay, menu_bar) -> bool:
                 dest = slots.get("destination") or "Los Angeles"
                 date = slots.get("date") or "Tuesday"
                 origin = slots.get("origin") or ""
-                result = await search_flight(
-                    browser_client, browser_lock, dest, date, origin,
-                )
+                result = await search_flight(dest, date, origin)
             elif item_type in ("draft_email", "send_email", "compose_email", "compose_mail"):
                 result = await _dispatch_email_item(
                     slots, task_label, browser_client, browser_lock,
@@ -2434,6 +2519,111 @@ def _interpret_yes_no(text: str) -> bool | None:
         if phrase in t:
             return True
     return None
+
+
+_READBACK_ORDINALS = (
+    "One",
+    "Two",
+    "Three",
+    "Four",
+    "Five",
+    "Six",
+    "Seven",
+    "Eight",
+    "Nine",
+    "Ten",
+)
+
+
+def _format_task_readback(results: list[str]) -> str:
+    """Build the verbatim spoken task list.
+
+    `results` items look like "<task>: <summary>". For readback we speak
+    only the task label — the paraphrased Gemini briefing covers the
+    outcome sentence afterwards. Beyond 10 items we fall back to numeric
+    prefixes so the ordinal list doesn't run off the end.
+    """
+    labels: list[str] = []
+    for entry in results:
+        label = entry.split(":", 1)[0].strip()
+        if label:
+            labels.append(label)
+
+    if not labels:
+        return "Meeting wrapped."
+
+    parts: list[str] = ["Here's what I did."]
+    for idx, label in enumerate(labels):
+        prefix = (
+            _READBACK_ORDINALS[idx] if idx < len(_READBACK_ORDINALS) else f"{idx + 1}"
+        )
+        parts.append(f"{prefix}, {label.rstrip('.')}.")
+    return " ".join(parts)
+
+
+_Q1_CORRECTION_KEYWORDS = ("q1", "first quarter", "quarter one")
+
+
+async def _maybe_speak_meeting_correction(
+    transcript: str,
+    overlay,
+    speak,
+) -> None:
+    """Fact-check the meeting transcript against the disk index and speak
+    the correction only when the model actually found a mismatch.
+
+    Gated on the transcript mentioning Q1 so we don't spam an extra TTS
+    turn on every meeting that has nothing to correct. The RAG prompt in
+    `executors/local/disk_index/answer.py` already instructs the model
+    to lead corrections with "Actually, …" when the user's claim
+    conflicts with file excerpts — we use that as the signal.
+    """
+    text = (transcript or "").lower()
+    if not any(kw in text for kw in _Q1_CORRECTION_KEYWORDS):
+        return
+
+    try:
+        from executors.local.disk_index import answer_question, index_exists
+    except Exception as exc:
+        print(f"[meeting][correct] disk-index unavailable: {exc}")
+        return
+
+    if not index_exists():
+        print("[meeting][correct] disk index not built — skipping correction pass")
+        return
+
+    # Craft a fact-check prompt that feeds the FULL meeting transcript as a
+    # claim for the RAG layer to verify. The system prompt in answer.py
+    # already handles statements-as-claims behaviour.
+    claim = transcript.strip()
+    probe = (
+        "I just said the following in a meeting — fact-check me against my "
+        "files and only reply if something is actually wrong. Be brief and "
+        "lead with \"Actually,\" if you're correcting me:\n"
+        f"{claim}"
+    )
+
+    try:
+        result = await answer_question(probe)
+    except Exception as exc:
+        print(f"[meeting][correct] answer_question failed: {exc}")
+        return
+
+    reply = (result.text or "").strip()
+    if not reply:
+        return
+
+    # Only speak when the model produced a genuine correction. The prompt
+    # contract is "lead with Actually,". Anything else (agreement,
+    # hedge, fallback) is suppressed to keep the wrap-up clean.
+    if not reply.lower().startswith("actually"):
+        print(f"[meeting][correct] no correction surfaced (reply=\"{reply[:120]}\")")
+        return
+
+    print(f"[meeting][correct] speaking correction: {reply[:200]}")
+    overlay.push("assistant", reply)
+    _push_citations(overlay, result.cited_paths)
+    speak(reply)
 
 
 async def _meeting_briefing(results: list[str], transcript: str) -> str:
