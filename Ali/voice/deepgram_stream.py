@@ -53,7 +53,10 @@ def stream_transcription_sync(
     except ImportError:
         raise RuntimeError("pip install deepgram-sdk")
 
-    dg = DeepgramClient(access_token=DEEPGRAM_API_KEY)
+    # Our .env holds a standard Deepgram API key — use api_key= (Token auth),
+    # not access_token= which expects a Bearer OAuth token and 400s the WS
+    # handshake.
+    dg = DeepgramClient(api_key=DEEPGRAM_API_KEY)
 
     audio  = pyaudio.PyAudio()
     stream = audio.open(
@@ -66,13 +69,14 @@ def stream_transcription_sync(
 
     print("[deepgram] Streaming started")
     try:
+        # Minimal connect: some Deepgram accounts 400 on interim_results /
+        # vad_events / utterance_end_ms even with nova-2. Ambient only
+        # triggers on final transcripts anyway; meeting mode's live-word
+        # overlay gracefully downgrades to final-only.
         with dg.listen.v1.connect(
             model="nova-2",
             encoding="linear16",
             sample_rate=SAMPLE_RATE,
-            interim_results=True,
-            vad_events=True,
-            utterance_end_ms=1200,
         ) as connection:
 
             def _on_message(msg) -> None:
