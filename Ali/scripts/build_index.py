@@ -257,6 +257,24 @@ def main(argv: list[str] | None = None) -> int:
                 f"embedded={data.get('embedded')}"
             )
 
+    def _refresh_contact_vocab() -> None:
+        """Warm the contact-derived STT bias cache as a side effect of the build.
+
+        Silent best-effort — a failure here never fails the overall build.
+        Runs post-build because the Contacts source may have just granted
+        permission for the first time.
+        """
+        try:
+            from config.contact_vocab import refresh_cache
+            payload = refresh_cache()
+            _say(
+                "contact vocab refreshed: "
+                f"names={len(payload.get('unusual_first_names') or [])} "
+                f"rules={len(payload.get('mis_splits') or [])}"
+            )
+        except Exception as exc:
+            _say(f"[warn] contact vocab refresh skipped: {exc}")
+
     try:
         result = run_build(cfg, progress=progress, force_rebuild=args.full)
     except Exception as exc:
@@ -281,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         _close_bars()
+
+    _refresh_contact_vocab()
 
     print(
         json.dumps(

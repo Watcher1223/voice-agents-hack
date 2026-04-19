@@ -133,21 +133,59 @@ class AppleScriptExecutor:
             )
         return result
 
-    def send_imessage(self, contact: str, body: str):
+    def send_imessage(
+        self,
+        contact: str,
+        body: str,
+        attachments: list[str] | None = None,
+    ):
         """
-        Send an iMessage to a phone number or email address.
+        Send an iMessage to a phone number or email address. If
+        ``attachments`` is provided, each absolute path is sent as a
+        separate iMessage file attachment after the text body. Bad paths
+        (non-absolute, missing, or containing unsafe quotes) are skipped
+        with a console warning so the text body still lands.
         """
         # Escape quotes in body
         safe_body = body.replace('"', '\\"')
-        script = f"""
-        tell application "Messages"
-            set targetService to 1st account whose service type = iMessage
-            set targetBuddy to participant "{contact}" of targetService
-            send "{safe_body}" to targetBuddy
-        end tell
-        """
-        _run_applescript(script)
-        print(f"[messages] Sent iMessage to {contact}: {body}")
+        if safe_body:
+            script = f"""
+            tell application "Messages"
+                set targetService to 1st account whose service type = iMessage
+                set targetBuddy to participant "{contact}" of targetService
+                send "{safe_body}" to targetBuddy
+            end tell
+            """
+            _run_applescript(script)
+            print(f"[messages] Sent iMessage to {contact}: {body}")
+
+        validated: list[str] = []
+        for raw in attachments or []:
+            if not isinstance(raw, str) or not raw:
+                continue
+            path = Path(raw).expanduser()
+            if not path.is_absolute() or not path.exists():
+                print(f"[messages] skipping attachment (not an absolute existing path): {raw!r}")
+                continue
+            if '"' in str(path):
+                print(f"[messages] skipping attachment (unsafe quote in path): {raw!r}")
+                continue
+            validated.append(str(path))
+
+        for abs_path in validated:
+            attach_script = f"""
+            tell application "Messages"
+                set targetService to 1st account whose service type = iMessage
+                set targetBuddy to participant "{contact}" of targetService
+                send (POSIX file "{abs_path}") to targetBuddy
+            end tell
+            """
+            try:
+                _run_applescript(attach_script)
+                print(f"[messages] Sent attachment {abs_path} to {contact}")
+            except AppleScriptExecutionError as exc:
+                # Attachment failures shouldn't raise — the body already sent.
+                print(f"[messages] attachment send failed for {abs_path}: {exc}")
 
     def compose_mail(
         self,

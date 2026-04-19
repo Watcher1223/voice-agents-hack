@@ -20,7 +20,7 @@ import shutil
 from urllib.parse import quote_plus
 
 from intent.schema import IntentObject, KnownGoal
-from config.settings import CACTUS_GEMMA4_MODEL, GEMINI_API_KEY
+from config.settings import CACTUS_INTENT_MODEL, GEMINI_API_KEY
 
 
 # #region agent log
@@ -53,6 +53,11 @@ except ImportError:
 CACTUS_CLI = shutil.which("cactus")
 CACTUS_AVAILABLE = CACTUS_CLI is not None
 
+# Sticky: once Gemini says the account is out of quota / over rate limit,
+# skip it for the rest of the session instead of paying the round-trip
+# (and dumping a multi-line error) on every command.
+_GEMINI_DISABLED_THIS_SESSION = False
+
 # ── Prompt ────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an intent classifier for a voice agent called Ali.
 Given a voice transcript, output ONE JSON object with EXACTLY these fields:
@@ -71,12 +76,13 @@ Goal definitions (read carefully — pick the most specific one):
   slots: {"company": str, "role": str?, "batch": str?}
   requires_browser: true, requires_submission: true.
 
-- send_message: send an iMessage/SMS/chat to a specific person (e.g. "text Hanzi I'm late", "message Corinne saying hi").
+- send_message: send an iMessage/SMS/chat to a specific person (e.g. "text Hanzi I'm late", "message Corinne saying hi", "text Hanzi the Q1 Report").
   Trigger words ONLY count when they're verbs ("text X...", "message X..."). NOT for "the next message said...", "text on the slide", "the text of the doc".
-  slots: {"contact": str, "body": str}
-  uses_local_data: ["contacts"], requires_submission: true.
+  slots: {"contact": str, "body": str?, "file_query": str?}
+  If the user references a file to send alongside or instead of a body ("text Hanzi the Q1 Report"), extract the natural-language file name into "file_query".
+  uses_local_data: ["contacts"]; include "attachment" too when a file_query is set. requires_submission: true.
 
-- send_email: compose/send an email, usually with a file attachment (e.g. "email Sam the deck", "send the Q1 doc to my boss").
+- send_email: compose/send an email, usually with a file attachment (e.g. "email Sam the deck", "send the Q1 doc to my boss", "email Hanzi the Q1 Report").
   slots: {"to": str?, "subject": str?, "body": str?, "file_query": str?}
   uses_local_data: include "attachment" when a file is referenced. requires_submission: true.
 
@@ -92,7 +98,7 @@ Goal definitions (read carefully — pick the most specific one):
   "open my <thing>" is find_file when <thing> is a document/file type; it is open_url when <thing> is a web service (linkedin, gmail, github, etc.).
   slots: {"file_query": str}
 
-- capture_meeting: start live transcription/notes so Ali can pick up action items and act on them (e.g. "start meeting capture", "take notes for this meeting", "listen", "just listen", "listen in", "listen up"). Bare "listen" / "listen in" (no tail) is always capture_meeting, NOT send_message. A longer utterance like "listen to my concerns" is NOT capture_meeting — that's conversational, classify as unknown.
+- capture_meeting: start live meeting transcription/notes (e.g. "start meeting capture", "take notes for this meeting", "listen to this meeting").
   slots: {}
 
 - ask_knowledge: the user is asking a question that should be answered from their local files/identity/notes (e.g. "who am I", "what's my email", "when did I last update my resume", "summarize my OKR notes", "what did my contract say about termination").
@@ -120,6 +126,9 @@ Transcript: "the next message says the deadline is Friday"
 Transcript: "text Corinne I'll be ten minutes late"
 {"goal":"send_message","target":{"type":"contact","value":"Corinne"},"uses_local_data":["contacts"],"requires_browser":false,"requires_submission":true,"slots":{"contact":"Corinne","body":"I'll be ten minutes late"}}
 
+Transcript: "text hanzi the Q1 Report"
+{"goal":"send_message","target":{"type":"contact","value":"hanzi"},"uses_local_data":["contacts","attachment"],"requires_browser":false,"requires_submission":true,"slots":{"contact":"hanzi","file_query":"Q1 Report"}}
+
 Transcript: "schedule a meeting with Sam Tuesday at 3"
 {"goal":"add_calendar_event","target":{"type":"calendar","value":""},"uses_local_data":["calendar"],"requires_browser":false,"requires_submission":true,"slots":{"title":"Meeting with Sam","when":"Tuesday at 3","attendees":["Sam"]}}
 
@@ -129,19 +138,13 @@ Transcript: "open my resume"
 Transcript: "open my linkedin"
 {"goal":"open_url","target":{"type":"url","value":"https://www.linkedin.com"},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{"url":"https://www.linkedin.com"}}
 
-Transcript: "email me the Q1 deck"
-{"goal":"send_email","target":{"type":"contact","value":""},"uses_local_data":["attachment"],"requires_browser":false,"requires_submission":true,"slots":{"file_query":"Q1 deck"}}
+Transcript: "email hanzi the Q1 Report"
+{"goal":"send_email","target":{"type":"contact","value":"hanzi"},"uses_local_data":["attachment"],"requires_browser":false,"requires_submission":true,"slots":{"to":"hanzi","subject":"Q1 Report","file_query":"Q1 Report"}}
 
 Transcript: "who am I"
 {"goal":"ask_knowledge","target":{"type":"question","value":"who am I"},"uses_local_data":["index"],"requires_browser":false,"requires_submission":false,"slots":{"question":"who am I"}}
 
 Transcript: "start meeting capture"
-{"goal":"capture_meeting","target":{},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{}}
-
-Transcript: "listen"
-{"goal":"capture_meeting","target":{},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{}}
-
-Transcript: "just listen"
 {"goal":"capture_meeting","target":{},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{}}
 
 Output ONLY the JSON object. No prose, no markdown fences, no explanation."""
@@ -156,7 +159,8 @@ async def parse_intent(transcript: str) -> IntentObject:
       2. Cactus  — on-device fallback when Gemini is unavailable
       3. Rule-based  — last-ditch offline fallback (keyword heuristics)
     """
-    if GEMINI_AVAILABLE:
+    global _GEMINI_DISABLED_THIS_SESSION
+    if GEMINI_AVAILABLE and not _GEMINI_DISABLED_THIS_SESSION:
         try:
             gem = await _parse_with_gemini(transcript)
             # #region agent log
@@ -169,12 +173,18 @@ async def parse_intent(transcript: str) -> IntentObject:
             # #endregion
             return gem
         except Exception as e:
-            print(f"[intent] Gemini failed ({e}), trying Cactus")
+            err_str = str(e)
+            if "RESOURCE_EXHAUSTED" in err_str or "429" in err_str or "quota" in err_str.lower():
+                _GEMINI_DISABLED_THIS_SESSION = True
+                print("[intent] Gemini quota exhausted → Cactus for rest of session")
+            else:
+                print(f"[intent] Gemini failed ({e}), trying Cactus")
             # #region agent log
             _dlog(
                 "intent:parse_intent:gemini_error",
                 "gemini parse failed",
-                {"transcript": transcript, "err": str(e)[:180]},
+                {"transcript": transcript, "err": err_str[:180],
+                 "disabled_session": _GEMINI_DISABLED_THIS_SESSION},
                 "H12",
             )
             # #endregion
@@ -235,7 +245,7 @@ async def _parse_with_gemini(transcript: str) -> IntentObject:
     return _parse_json_response(raw, transcript)
 
 
-_CACTUS_TIMEOUT_S = float(os.environ.get("ALI_CACTUS_TIMEOUT_S", "8"))
+_CACTUS_PARSE_TIMEOUT_S = float(os.environ.get("ALI_CACTUS_INTENT_TIMEOUT_S", "8.0"))
 
 
 async def _parse_with_cactus(transcript: str) -> IntentObject:
@@ -243,28 +253,26 @@ async def _parse_with_cactus(transcript: str) -> IntentObject:
     # Keep CLI args minimal for broad cactus version compatibility.
     # Some installs reject "--max-tokens"/"--temperature" for `cactus run`.
     proc = await asyncio.create_subprocess_exec(
-        CACTUS_CLI, "run", CACTUS_GEMMA4_MODEL, "--prompt", prompt,
+        CACTUS_CLI, "run", CACTUS_INTENT_MODEL, "--prompt", prompt,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=_CACTUS_TIMEOUT_S
+            proc.communicate(), timeout=_CACTUS_PARSE_TIMEOUT_S
         )
     except asyncio.TimeoutError:
-        # Cactus is stuck (model not pulled, CLI prompting, stalled
-        # generation). Kill the subprocess and raise so parse_intent
-        # falls through to the rule-based parser — which feeds the
-        # unknown→browser fallback in main._handle_transcript.
+        # Cactus on CPU with a 2B model can take 30s+. Kill and fall through
+        # to the rule-based parser so the user gets *something* quickly.
         try:
             proc.kill()
-        except ProcessLookupError:
+            await proc.wait()
+        except Exception:
             pass
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=1.0)
-        except (asyncio.TimeoutError, ProcessLookupError):
-            pass
-        raise RuntimeError(f"timed out after {_CACTUS_TIMEOUT_S}s")
+        raise RuntimeError(
+            f"cactus timed out after {_CACTUS_PARSE_TIMEOUT_S:.0f}s "
+            f"(model={CACTUS_INTENT_MODEL})"
+        )
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode().strip())
     return _parse_json_response(stdout.decode(), transcript)
@@ -547,15 +555,11 @@ def _extract_flight_slots(transcript: str) -> dict:
 
     slots: dict = {"origin": origin, "destination": destination}
 
-    # Date phrase: scan for any chunk that _parse_when_phrase can handle.
-    # Fine if nothing matches — date is optional.
-    d = re.search(
-        r"\b(tomorrow|next\s+weekend|in\s+\d+\s+(?:day|days|week|weeks)|"
-        r"(?:on\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?)\b",
-        t,
-    )
+    # Date phrase: grab what follows "on"/"next"/"tomorrow"/"in" and hand to
+    # the parser. Fine if nothing matches — date is optional.
+    d = re.search(r"(?:\b(?:on|next|tomorrow|in this|in)\b\s*)([a-z0-9\s]+?)(?:[,.?!]|$)", t)
     if d:
-        date_str = _parse_when_phrase(d.group(1), datetime.date.today())
+        date_str = _parse_when_phrase(d.group(0).strip(), datetime.date.today())
         if date_str:
             slots["depart_date"] = date_str
 
@@ -591,19 +595,11 @@ def _rule_based_parse(transcript: str) -> IntentObject:
             raw_transcript=transcript,
         )
 
-    # Exact-match whitelist for short `listen`-style triggers. Substring
-    # matching would false-fire on natural speech ("listen to my concerns",
-    # "listen to this song"), so we require an exact normalised form.
-    _listen_triggers = {
-        "listen", "listen in", "listen up", "just listen",
-        "listen and note", "start listening", "listen to this",
-    }
-    _t_norm = t.strip().rstrip(".!?").strip()
     if any(kw in t for kw in [
         "start meeting", "capture meeting", "meeting capture",
         "listen to meeting", "take notes", "record meeting",
         "start capture", "capture this",
-    ]) or _t_norm in _listen_triggers:
+    ]):
         return IntentObject(
             goal=KnownGoal.CAPTURE_MEETING,
             target={},

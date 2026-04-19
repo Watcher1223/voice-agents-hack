@@ -18,10 +18,19 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shutil
 from dataclasses import dataclass, field
 from typing import Any
 
-from config.settings import GEMINI_API_KEY
+from config.settings import (
+    AMBIENT_ANALYSE_RETRIES,
+    AMBIENT_CACTUS_FALLBACK,
+    AMBIENT_CACTUS_MODEL,
+    AMBIENT_CACTUS_TIMEOUT_S,
+    GEMINI_API_KEY,
+)
+
+_CACTUS_CLI = shutil.which("cactus")
 
 try:
     from google import genai as _genai  # type: ignore
@@ -31,56 +40,43 @@ except ImportError:
 
 
 _SYSTEM = """\
-You are an ambient AI assistant listening to the user's conversation. Your
-job is to turn what's said into things the user actually benefits from —
-answers, definitions, or tasks they can review later. Works the same
-whether it's a sales call, a planning meeting, or casual chat: you look at
-what's on the table and pull out what's useful.
+You are an ambient AI assistant. You see a rolling transcript of what the
+user is saying (and people they're talking to) and decide whether to
+surface a short helpful note — or stay silent.
 
-You see a rolling transcript (the user plus whoever they're talking to)
-and a screenshot of whatever they have on screen. Use both. On every
-turn, pick the single MOST VALUABLE thing to surface, using the tiers
-below. Stop at the first tier that fires.
+Apply this decision hierarchy IN ORDER. Stop at the first tier that fires.
 
-  TIER 1 — answer a recent factual question.
-    Triggers when someone says something like "what is IRR again?",
-    "when did OpenAI raise Series C?", "who founded YC?". Give the
-    concrete answer in `detail`; the headline is the short form.
+  TIER 1 — answer a recent question.
+    If the transcript contains an unanswered factual question the user
+    would benefit from an answer to right now. Example triggers:
+      - "what is IRR again?"
+      - "when did OpenAI raise their Series C?"
+      - "who founded YC?"
 
-  TIER 2 — define a recent proper noun, acronym, or jargon.
-    Triggers when a non-obvious term appeared and the surrounding
-    transcript doesn't already explain it. "Constitutional AI", "LTV
-    over CAC", "Series C", "RLHF" if unexplained. Prefer surfacing
-    over silence when a real term shows up.
+  TIER 2 — define a recent proper noun or jargon term.
+    The term has to be non-obvious and freshly introduced. Prefer to
+    surface over staying silent when a real term appeared. Examples that
+    should fire tier 2:
+      - "constitutional AI" (technique)
+      - "Series C" if introduced without context
+      - any acronym whose meaning isn't in the transcript
 
-  TIER 3 — capture a concrete task the user (or someone they're
-    talking to on the user's behalf) implied. Be AGGRESSIVE about
-    tier 3: if the conversation includes a commitment, a follow-up,
-    a reminder, a scheduling decision, or a lookup the user will
-    benefit from, emit it. Examples that SHOULD fire tier 3:
-      "I'll send Hanzi the deck tonight"          → compose_mail
-      "remind me to ping Ethan about the API"     → send_imessage
-      "let's put lunch with Korin on the calendar for Friday"
-                                                  → create_calendar_event
-      "pull up the recent news on Stripe"         → opencli google news
-      "what's on Hacker News"                     → opencli hackernews top
-      "find the pitch deck I worked on last week" → find_file
-      "open the YC application page"              → open_url
+  TIER 3 — suggest one or more concrete actions.
+    The conversation implies the user should do something NOW. Emit
+    every distinct action you hear. A single utterance like "email
+    Hanzi that I want to book a trip to Hawaii" naturally contains TWO
+    distinct actions:
+      1. compose_mail → Hanzi: "I want to book a trip to Hawaii"
+      2. browser_task → "book a flight to Hawaii"
+    Both MUST appear in the `actions` array below — do not collapse
+    them into one row, and do not drop the second one.
 
-    Capture OWNER and DEADLINE in action_slots whenever the
-    transcript supplies them. Example: if someone says "Hanzi will
-    own the deck, due Friday", the compose_mail slots should carry
-    to=<hanzi's email> and subject should reference the Friday
-    deadline. Missing details are fine — don't invent them, just
-    leave the slot empty.
+    Available action kinds:
 
-    Emit tier 3 ONLY when the action maps to one of the ways we can
-    actually execute:
-
-    (A) kind='opencli' — read-only lookups, run automatically as safe
-        actions. action_text is the space-separated command:
+    (A) kind='opencli' — read-only lookups. `text` is the space-
+        separated command. Available adapters:
           hackernews top | hackernews search <query>
-          google search <query> | google news <query>
+          google search <query> | google news
           wikipedia search <query>
           producthunt today
           reddit hot
@@ -88,86 +84,92 @@ below. Stop at the first tier that fires.
           arxiv search <query>
 
     (B) kind='local' — local desktop actions via AppleScript /
-        Spotlight. Set action_text to exactly one of:
-          compose_mail           opens Mail.app draft. slots: to,
-                                 subject, body. (User clicks Send.)
-          send_imessage          sends iMessage. slots: contact, body.
-          create_calendar_event  slots: title, date, time, attendees.
-          find_file              slots: file_query.
-          open_url               slots: url.
+        Spotlight. `text` must be exactly one of:
+          compose_mail           — opens Mail.app with a draft (does
+                                    NOT auto-send; user clicks Send).
+                                    slots: to, subject, body,
+                                           file_query (OPTIONAL: natural-
+                                           language name of a local file
+                                           to attach, e.g. "Q1 Report",
+                                           "resume", "pitch deck").
+          send_imessage          — sends an iMessage now (IS
+                                    auto-sent). slots: contact, body,
+                                           file_query (OPTIONAL: same
+                                           rules as compose_mail; set
+                                           this whenever the user names
+                                           a file to send like "text
+                                           Hanzi the Q1 Report").
+          create_calendar_event  — creates a Calendar event.
+                                    slots: title, date, time,
+                                    attendees (list, optional).
+          find_file              — Spotlight search.
+                                    slots: file_query.
+          open_url               — opens a URL in default browser.
+                                    slots: url.
 
-    If the right answer is outside that list (post on LinkedIn,
-    reply to a specific Gmail thread, update a Notion page), emit
-    tier 4. Do not invent capabilities — the user is going to
-    approve these cards and we need to actually deliver.
+    (C) kind='browser_task' — a real-world task best handled by a
+        browser agent we will run later. Use this for booking
+        flights/hotels, applying to jobs, anything that needs a real
+        web session. `text` should be a natural-language goal (no
+        slots required). Examples:
+          text="book a flight from SFO to Cancun for next Tuesday"
+          text="find a one-bedroom Airbnb in Lisbon under $150/night"
+          text="apply to the Anthropic product engineer role"
+
+    If an action doesn't map to A/B/C, simply omit it — do not
+    fabricate capabilities. But if *any* action fits, emit the
+    analysis as tier-3, even if other mentioned actions don't.
 
   TIER 4 — stay silent.
-    Emit tier 4 only when (a) nothing above genuinely fires, or (b)
-    surfacing would repeat what you already surfaced in the
-    previous analysis. Do not use tier 4 as a hedge; if a real
-    question/term/action is there, surface it.
+    Nothing above fires, or every candidate action is already on the
+    checklist.
 
-CONTEXT YOU HAVE
-  - A short list of KNOWN CONTACTS with their emails / iMessage
-    addresses. Prefer emitting the CONCRETE address in action_slots
-    rather than a raw name so execution doesn't need fuzzy matching.
-  - The user's active app + window title + a screenshot. If the
-    user asks "what does this mean?" while reading a page, reference
-    what's on screen. If they say "the pitch deck I have open",
-    resolve it via the window title when possible.
-  - Fuzzy STT is common — names may be misheard ("hamsi" → "Hanzi",
-    "corn" → "Korin"). Resolve to the closest known contact rather
-    than rejecting the turn.
-  - Turns may be prefixed with a SPEAKER TAG:
-      `[Me]`, `[Me-S0]`, `[Me-S1]`      — picked up by the user's mic
-                                           (i.e. the user or someone
-                                           physically with them).
-      `[Remote]`, `[Remote-S0]`, `[Remote-S1]`
-                                         — picked up from the Mac's
-                                           system audio output, i.e.
-                                           the OTHER side of a
-                                           FaceTime / Zoom / Meet call.
-    Use these to attribute commitments correctly:
-      "[Me] I'll email the deck"           → the user committed
-      "[Remote] can you send me the link"  → the other party is asking
-                                             the user to do something,
-                                             still valid tier 3.
-      "[Remote-S1] I'll merge the PR"      → remote participant
-                                             committed to do it — may
-                                             still be useful context
-                                             for a reminder, but do NOT
-                                             emit a compose_mail
-                                             pretending the user
-                                             committed.
-    `[Me-S0]` is usually the user (whoever owns the laptop talks
-    first), `[Me-S1]+` are people in the same room. Do NOT include any
-    of these tags in headlines, detail, or action_slots — strip them
-    when referencing transcript content.
-
-OUTPUT SCHEMA — a single JSON object. No prose, no markdown fences.
+OUTPUT SCHEMA — emit a SINGLE JSON object. No prose. No markdown fences.
+Required keys:
   tier:        integer 1-4
-  headline:    <=100 chars, user-facing. Non-empty for tiers 1-3,
-               empty string for tier 4.
-  detail:      1-2 sentences. Non-empty for tiers 1-2, may be
-               empty for tiers 3/4.
-  action_kind: "opencli" | "local" | "none". "none" for tiers 1/2/4.
-  action_text: the command / action name. "" when kind="none".
-  action_slots: object. Examples:
-     {"to":"hanzi@example.com","subject":"Re: pitch deck",
-      "body":"Sending tonight — out Friday EOD."}     (compose_mail)
-     {"contact":"Hanzi","body":"running 10 late"}    (send_imessage)
-     {"title":"Pitch review","date":"2026-04-22","time":"15:00",
-      "attendees":["korin@yc.com"]}                  (create_calendar_event)
-     {"file_query":"pitch deck pdf"}                  (find_file)
-     {"url":"https://news.ycombinator.com"}           (open_url)
+  headline:    string, <=100 chars. Short summary of what's happening.
+               MUST be non-empty for tiers 1-3, empty string for tier 4.
+  detail:      string, 1-2 sentences. MUST be non-empty for tiers 1-2,
+               may be empty for tiers 3/4.
+  actions:     array — ZERO or MORE action objects. Each object is
+                 {"kind": "opencli"|"local"|"browser_task",
+                  "text": "<command-or-goal>",
+                  "slots": { ... per-kind, see above ... },
+                  "label": "<<=60 char user-facing task label>"}
+               The `label` is what the user sees on their checklist
+               row. Use a verb phrase like "Email Hanzi about Hawaii
+               trip" or "Book flight to Hawaii". Omit `actions` (or
+               leave it empty) for tiers 1/2/4.
 
-RULES
-  - Do NOT repeat anything in the previous analysis. Prefer tier 4
-    over repetition.
-  - Headlines are user-facing. No filler ("I think…", "It seems…").
-  - Resolve names to the email/phone in KNOWN CONTACTS when possible.
-  - Capture the concrete owner + deadline + subject when the
-    transcript provides them. Empty is better than hallucinated."""
+Example for "email Hanzi that I want to book a grad trip to Hawaii":
+{
+  "tier": 3,
+  "headline": "Email Hanzi + book Hawaii flight",
+  "detail": "",
+  "actions": [
+    {"kind":"local","text":"compose_mail",
+     "slots":{"to":"Hanzi","subject":"Grad trip to Hawaii",
+              "body":"I want to book a grad trip to Hawaii."},
+     "label":"Email Hanzi about Hawaii grad trip"},
+    {"kind":"browser_task","text":"book a flight to Hawaii for the grad trip",
+     "slots":{}, "label":"Book flight to Hawaii"}
+  ]
+}
+
+File-attachment note: whenever the user names a file to send ("the
+pitch deck", "the onboarding doc", "the revenue report"), echo that
+exact phrase into `file_query` on the send_imessage / compose_mail
+action. Do NOT invent file paths — the agent resolves the phrase to a
+local path later.
+
+Rules:
+- TASKS ALREADY ON CHECKLIST lists rows the user has not yet executed.
+  Do not re-emit those exact items. Any *new* distinct action still
+  surfaces.
+- PREVIOUS SURFACED ANALYSIS is for context; avoid re-emitting the
+  same action but feel free to surface *new* ones.
+- Headlines are user-facing. No filler.
+- Keep output compact JSON."""
 
 
 @dataclass
@@ -175,15 +177,137 @@ class AmbientAnalysis:
     tier: int = 4
     headline: str = ""
     detail: str = ""
-    action: dict[str, Any] | None = None
+    # Zero or more actions. A single utterance can produce multiple
+    # (e.g. "email Hanzi + book a flight" → compose_mail + browser_task).
+    actions: list[dict[str, Any]] = field(default_factory=list)
     raw_json: str = ""
+
+    @property
+    def action(self) -> dict[str, Any] | None:
+        """Back-compat accessor — first action, or None. Callers that
+        iterate use .actions; the checklist-execution path recreates an
+        AmbientAnalysis per Task with a single action in the list."""
+        return self.actions[0] if self.actions else None
 
     def should_surface(self) -> bool:
         return self.tier in (1, 2, 3) and bool(self.headline.strip())
 
 
-_PREVIOUS_JSON_PREAMBLE = "PREVIOUS ANALYSIS (do not repeat):"
-_HISTORY_PREAMBLE       = "ROLLING TRANSCRIPT (oldest → newest):"
+_PREVIOUS_JSON_PREAMBLE = "PREVIOUS SURFACED ANALYSIS (avoid repeating this exact action only):"
+_CHECKLIST_PREAMBLE = (
+    "TASKS ALREADY ON THE USER'S CHECKLIST — pending, not yet executed "
+    "(do not duplicate these rows; new distinct actions still surface):"
+)
+_HISTORY_PREAMBLE = "ROLLING TRANSCRIPT (oldest → newest):"
+
+
+def _is_quota_error(exc: BaseException) -> bool:
+    """Hard quota exhaustion — retries won't help, escalate to Cactus."""
+    msg = str(exc).lower()
+    name = type(exc).__name__.lower()
+    needles = (
+        "resource_exhausted",
+        "resource exhausted",
+        "quota exceeded",
+        "quotafailure",
+        "free_tier_requests",
+        "exceeded your current quota",
+    )
+    if any(n in msg for n in needles):
+        return True
+    if "resourceexhausted" in name:
+        return True
+    return False
+
+
+async def _run_cactus_analyse(prompt: str) -> str:
+    """Invoke `cactus run <model> --prompt <prompt>` and return the
+    Assistant block from stdout. Mirrors the pattern in
+    intent/parser.py and executors/local/disk_index/answer.py so a
+    single codepath in the Cactus workflow stays consistent."""
+    if not _CACTUS_CLI:
+        return ""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            _CACTUS_CLI,
+            "run",
+            AMBIENT_CACTUS_MODEL,
+            "--prompt",
+            prompt,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=b"exit\n"),
+            timeout=AMBIENT_CACTUS_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        print(
+            f"[ambient] cactus fallback timed out after "
+            f"{AMBIENT_CACTUS_TIMEOUT_S:.0f}s (model={AMBIENT_CACTUS_MODEL})"
+        )
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return ""
+    except (OSError, asyncio.CancelledError) as exc:
+        print(f"[ambient] cactus subprocess failed: {exc}")
+        return ""
+    if proc.returncode != 0:
+        err = stderr.decode("utf-8", errors="ignore").strip()[:240]
+        print(f"[ambient] cactus rc={proc.returncode} stderr={err}")
+        return ""
+    raw = stdout.decode("utf-8", errors="ignore")
+    return _extract_cactus_reply(raw)
+
+
+def _extract_cactus_reply(output: str) -> str:
+    """Pull the 'Assistant:' block out of cactus's chat-style stdout.
+    Duplicated here (rather than imported) so the module doesn't take a
+    hard dep on disk_index, which pulls in sentence-transformers."""
+    if not output:
+        return ""
+    marker = "Assistant:"
+    idx = output.find(marker)
+    tail = output[idx + len(marker):] if idx >= 0 else output
+    lines: list[str] = []
+    for raw in tail.splitlines():
+        stripped = raw.strip()
+        # Stop at the token-stats line, e.g. "[66 tokens | latency: …]".
+        if stripped.startswith("[") and "tokens" in stripped:
+            break
+        if stripped.lower().startswith("you:"):
+            break
+        lines.append(raw)
+    return "\n".join(lines).strip()
+
+
+def _is_retryable_gemini_error(exc: BaseException) -> bool:
+    """503 / overload / rate-limit — worth sleeping and retrying."""
+    msg = str(exc).lower()
+    name = type(exc).__name__.lower()
+    needles = (
+        "503",
+        "429",
+        "unavailable",
+        "overloaded",
+        "deadline exceeded",
+        "try again",
+        "resource exhausted",
+        "rate limit",
+        "temporarily",
+        "high demand",
+        "503 unavailable",
+    )
+    if any(n in msg for n in needles):
+        return True
+    if any(n in name for n in ("resourceexhausted", "serviceunavailable", "deadline", "aborted")):
+        return True
+    return False
 
 
 def _best_effort_json(raw: str) -> tuple[dict[str, Any] | None, str]:
@@ -215,24 +339,18 @@ def _best_effort_json(raw: str) -> tuple[dict[str, Any] | None, str]:
     return None, cleaned
 
 
-def _contacts_block() -> str:
-    """List the user's known contacts so Gemini can emit emails / iMessage
-    addresses directly in action_slots instead of names that later need
-    fuzzy matching. Loaded from config.resources.KNOWN_CONTACTS."""
+def _format_pending_checklist_block() -> str:
+    """Surface pending checklist rows so Gemini won't re-suggest duplicates
+    but still allows *new* distinct tier-3 actions."""
     try:
-        from config.resources import KNOWN_CONTACTS
-        items = []
-        seen: set[str] = set()
-        for name, addr in KNOWN_CONTACTS.items():
-            if addr in seen:
-                continue  # skip secondary alias rows
-            items.append(f"- {name.title()} → {addr}")
-            seen.add(addr)
-        if items:
-            return "KNOWN CONTACTS (prefer emitting the email in action_slots):\n" + "\n".join(items)
+        from observer.task_checklist import checklist
+
+        pending = checklist().pending()
+        if not pending:
+            return "(none)"
+        return "\n".join(f"- {t.label[:200]}" for t in pending[:20])
     except Exception:
-        pass
-    return "KNOWN CONTACTS: (none configured)"
+        return "(none)"
 
 
 def _assemble_prompt(
@@ -241,27 +359,189 @@ def _assemble_prompt(
     screen_app: str = "",
     screen_window_title: str = "",
 ) -> str:
-    hist_block = "\n".join(f"- {line}" for line in history) or "(empty)"
+    from intent.pronoun_rewrite import rewrite_self_pronouns
+
+    rewritten = [rewrite_self_pronouns(line) for line in history]
+    hist_block = "\n".join(f"- {line}" for line in rewritten) or "(empty)"
     prev_block = previous.raw_json if (previous and previous.raw_json) else "(none)"
+    checklist_block = _format_pending_checklist_block()
     screen_block = "(none)"
     if screen_app or screen_window_title:
         screen_block = (
             f"Active app: {screen_app or 'unknown'}\n"
             f"Window title: {screen_window_title or 'unknown'}\n"
-            "A screenshot of the user's current screen is attached. "
-            "Reference it when it directly helps answer a question, "
-            "define a term the user can see, or suggest an action about "
-            "what's open."
+            "A screenshot of the user's current screen is attached to this "
+            "request. Feel free to reference what's visible on it when it "
+            "directly helps answer a question, define a term the user can "
+            "see, or suggest an action about what's open."
         )
-    parts = [
-        _SYSTEM,
-        _contacts_block(),
-        f"{_HISTORY_PREAMBLE}\n{hist_block}",
-        f"CURRENT SCREEN CONTEXT:\n{screen_block}",
-        f"{_PREVIOUS_JSON_PREAMBLE}\n{prev_block}",
-        "Emit your JSON object now.",
-    ]
-    return "\n\n".join(parts)
+    return (
+        f"{_SYSTEM}\n\n"
+        f"{_HISTORY_PREAMBLE}\n{hist_block}\n\n"
+        f"CURRENT SCREEN CONTEXT:\n{screen_block}\n\n"
+        f"{_PREVIOUS_JSON_PREAMBLE}\n{prev_block}\n\n"
+        f"{_CHECKLIST_PREAMBLE}\n{checklist_block}\n\n"
+        "Emit your JSON object now."
+    )
+
+
+# Compact prompt for the small-model fallback (1B Gemma class). No
+# few-shot example — smaller models parrot names and places from
+# examples into outputs. Skips the screen block (Cactus is text-only).
+_CACTUS_SYSTEM = """\
+Read the CURRENT TRANSCRIPT at the bottom and output ONE JSON object
+describing what (if anything) the user just said they need to do.
+
+Rules:
+1. Output ONLY valid JSON. No prose, no markdown, no fences.
+2. Only use names, places, topics, and words that appear in the
+   CURRENT TRANSCRIPT. Do not invent details. Do not use names from
+   these instructions.
+3. If the transcript describes a task the user should do, set tier=3.
+   Otherwise set tier=4.
+
+JSON keys:
+  tier:      integer, 3 or 4.
+  headline:  short summary, empty string if tier=4.
+  detail:    empty string.
+  actions:   array of action objects (empty array if tier=4).
+
+Each action object:
+  {"kind": <"local"|"opencli"|"browser_task">,
+   "text": <see below>,
+   "slots": <see below>,
+   "label": <short verb phrase for the task>}
+
+kind="local" — text is one of:
+  compose_mail           slots: {"to":<name>, "subject":<topic>, "body":<message>, "file_query":<file name, optional>}
+  send_imessage          slots: {"contact":<name>, "body":<message>, "file_query":<file name, optional>}
+  create_calendar_event  slots: {"title":<what>, "date":<YYYY-MM-DD>, "time":<HH:MM>}
+  find_file              slots: {"file_query":<query>}
+  open_url               slots: {"url":<url>}
+
+If the user says to send/text/email a file ("text Hanzi the Q1 Report"),
+put the file name into `file_query` on that action so the agent can
+attach it. The file name is the phrase the user said, NOT a path.
+
+kind="opencli" — text is an opencli command (hackernews top, google search X, wikipedia search Y, arxiv search Z). slots: {}.
+
+kind="browser_task" — text is a natural-language web goal (book flight, apply to job, research company). slots: {}.
+
+A single sentence can contain multiple actions. Each distinct action
+becomes its own entry in the actions array. Only include an action if
+the transcript actually implies it.
+
+If an action matching the transcript already appears under TASKS
+ALREADY ON CHECKLIST, do not re-emit it."""
+
+
+def _assemble_cactus_prompt(
+    history: list[str], previous: AmbientAnalysis | None
+) -> str:
+    from intent.pronoun_rewrite import rewrite_self_pronouns
+
+    # Only the most recent few turns — the 1B model tends to over-weight
+    # older lines when the context gets long, and the interesting signal
+    # is always in the last utterance or two.
+    tail = [rewrite_self_pronouns(line) for line in (history[-4:] if history else [])]
+    hist_block = "\n".join(f"- {line}" for line in tail) or "(empty)"
+    checklist_block = _format_pending_checklist_block()
+    return (
+        f"{_CACTUS_SYSTEM}\n\n"
+        f"TASKS ALREADY ON CHECKLIST:\n{checklist_block}\n\n"
+        f"CURRENT TRANSCRIPT:\n{hist_block}\n\n"
+        "JSON output:"
+    )
+
+
+async def _analyse_with_gemini(
+    prompt: str, screen_image_bytes: bytes
+) -> tuple[dict[str, Any] | None, str, BaseException | None]:
+    """Call Gemini with retries. Returns (parsed, cleaned_text, last_exc).
+    On quota-exhausted / repeated transient errors the caller escalates
+    to Cactus."""
+    loop = asyncio.get_event_loop()
+
+    def _call() -> str:
+        client = _genai.Client(api_key=GEMINI_API_KEY)
+        contents: list = [prompt]
+        if screen_image_bytes:
+            contents.append(
+                _genai.types.Part.from_bytes(
+                    data=screen_image_bytes,
+                    mime_type="image/jpeg",
+                )
+            )
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=_genai.types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=2048,
+                response_mime_type="application/json",
+            ),
+        )
+        return (resp.text or "").strip()
+
+    raw = ""
+    last_exc: BaseException | None = None
+    for attempt in range(AMBIENT_ANALYSE_RETRIES):
+        try:
+            raw = await loop.run_in_executor(None, _call)
+            data, cleaned = _best_effort_json(raw)
+            if data is None:
+                raise ValueError("no parseable JSON object in response")
+            return data, cleaned, None
+        except Exception as e:
+            last_exc = e
+            # Hard quota → don't waste more attempts here; jump to Cactus.
+            if _is_quota_error(e):
+                snippet = (raw[:160] if raw else "").replace("\n", " ")
+                print(
+                    f"[ambient] gemini quota exhausted: {type(e).__name__} "
+                    f"— falling through to on-device fallback. raw={snippet!r}"
+                )
+                return None, "", e
+            if attempt < AMBIENT_ANALYSE_RETRIES - 1 and _is_retryable_gemini_error(e):
+                delay = min(12.0, 1.25 * (2**attempt))
+                print(
+                    f"[ambient] analyse retry {attempt + 1}/{AMBIENT_ANALYSE_RETRIES} "
+                    f"after {e!s} — sleeping {delay:.1f}s",
+                    flush=True,
+                )
+                await asyncio.sleep(delay)
+                continue
+            snippet = (raw[:160] if raw else "").replace("\n", " ")
+            print(f"[ambient] analyse failed: {e} — raw={snippet!r}")
+            return None, "", e
+
+    return None, "", last_exc
+
+
+async def _analyse_with_cactus(
+    history: list[str],
+    previous: AmbientAnalysis | None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Run the ambient analysis locally via the Cactus CLI with a lean
+    prompt tuned for the 270M function-gemma model. Returns (parsed,
+    cleaned_text) or (None, '') on failure. Never raises."""
+    if not AMBIENT_CACTUS_FALLBACK or not _CACTUS_CLI:
+        return None, ""
+    print(
+        f"[ambient] cactus fallback running (model={AMBIENT_CACTUS_MODEL}, "
+        f"timeout={AMBIENT_CACTUS_TIMEOUT_S:.0f}s)…",
+        flush=True,
+    )
+    prompt = _assemble_cactus_prompt(history, previous)
+    raw = await _run_cactus_analyse(prompt)
+    if not raw:
+        return None, ""
+    data, cleaned = _best_effort_json(raw)
+    if data is None:
+        snippet = raw[:160].replace("\n", " ")
+        print(f"[ambient] cactus fallback: unparseable JSON — raw={snippet!r}")
+        return None, cleaned
+    return data, cleaned
 
 
 async def analyse(
@@ -275,77 +555,89 @@ async def analyse(
     a tier-4 (silent) result on any error so the caller never has to
     exception-handle — ambient must fail quiet.
 
-    Screen context is optional. When provided, the prompt tells the model
-    that the image + app name + window title are the user's current focus;
-    this lets tier 1-3 reference on-screen details ('the Gmail compose
-    window', 'the arxiv paper you're reading').
+    Priority order: Gemini Flash (fast, multimodal) → Cactus CLI on-device
+    (slower, no image support) → tier-4 silent. The Cactus fallback keeps
+    the checklist flowing when Gemini's free-tier quota is exhausted.
     """
-    if not _AVAILABLE or not history:
+    if not history:
+        return AmbientAnalysis()
+    if not _AVAILABLE and not (AMBIENT_CACTUS_FALLBACK and _CACTUS_CLI):
         return AmbientAnalysis()
 
     prompt = _assemble_prompt(history, previous, screen_app, screen_window_title)
-    loop = asyncio.get_event_loop()
 
-    def _call() -> str:
-        client = _genai.Client(api_key=GEMINI_API_KEY)
-        contents: list = [prompt]
-        if screen_image_bytes:
-            # google-genai Part with inline bytes + mime type. Gemini Flash
-            # handles JPEG natively; no need to upload first.
-            contents.append(
-                _genai.types.Part.from_bytes(
-                    data=screen_image_bytes,
-                    mime_type="image/jpeg",
-                )
-            )
-        cfg = _genai.types.GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=2048,
-            response_mime_type="application/json",
-        )
-        # Free-tier gemini-2.5-flash caps at 20 req/day/project; once we
-        # exhaust it the API returns 429 RESOURCE_EXHAUSTED. Fall through
-        # to gemini-2.5-flash-lite (1500/day free) so the assistant stays
-        # live even after the preferred model runs out.
-        for model in ("gemini-2.5-flash", "gemini-2.5-flash-lite"):
-            try:
-                resp = client.models.generate_content(
-                    model=model, contents=contents, config=cfg,
-                )
-                return (resp.text or "").strip()
-            except Exception as e:
-                msg = str(e)
-                if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
-                    # Try the next model in the list.
-                    print(f"[ambient] {model} exhausted — falling back")
-                    continue
-                raise
-        # Both models exhausted — let the outer handler produce a silent tier-4.
-        raise RuntimeError("all Gemini models exhausted (429)")
+    data: dict[str, Any] | None = None
+    cleaned = ""
+    last_exc: BaseException | None = None
+    if _AVAILABLE:
+        data, cleaned, last_exc = await _analyse_with_gemini(prompt, screen_image_bytes)
 
-    try:
-        raw = await loop.run_in_executor(None, _call)
-        data, cleaned = _best_effort_json(raw)
-        if data is None:
-            raise ValueError("no parseable JSON object in response")
-    except Exception as e:
-        snippet = (raw[:160] if "raw" in locals() else "").replace("\n", " ")
-        print(f"[ambient] analyse failed: {e} — raw={snippet!r}")
+    # Escalate to Cactus when Gemini is unavailable OR when it failed
+    # (quota / repeated transient / parse). Cactus uses a leaner prompt
+    # tuned for the small function-gemma model — assembled internally,
+    # not the full multimodal prompt above.
+    if data is None and AMBIENT_CACTUS_FALLBACK and _CACTUS_CLI:
+        cactus_data, cactus_cleaned = await _analyse_with_cactus(history, previous)
+        if cactus_data is not None:
+            data = cactus_data
+            cleaned = cactus_cleaned
+
+    if data is None:
+        # Surface an explicit hint when Gemini quota hit and the local
+        # fallback is off — otherwise the checklist silently stops
+        # filling and the user has no idea why.
+        if last_exc is not None and _is_quota_error(last_exc):
+            if not AMBIENT_CACTUS_FALLBACK:
+                print(
+                    "[ambient] Gemini quota exhausted and local fallback is "
+                    "OFF. Set VOICE_AGENT_AMBIENT_CACTUS_FALLBACK=1 to use "
+                    "Cactus on-device (slower, sometimes noisy), upgrade the "
+                    "Gemini key, or wait for the daily quota reset."
+                )
+        elif last_exc is not None:
+            print(f"[ambient] no analysis produced (last error: {last_exc!s})")
         return AmbientAnalysis()
 
     tier = int(data.get("tier", 4))
     headline = str(data.get("headline") or "").strip()
     detail = str(data.get("detail") or "").strip()
-    kind = str(data.get("action_kind") or "none").strip().lower()
-    action_text = str(data.get("action_text") or "").strip()
-    slots = data.get("action_slots") if isinstance(data.get("action_slots"), dict) else {}
-    action: dict[str, Any] | None = None
-    if kind != "none" and action_text:
-        action = {"kind": kind, "text": action_text, "slots": slots or {}}
+
+    # Preferred: new-schema `actions` array. Fallback: legacy
+    # single-action fields. Keep the fallback because older cached
+    # prompts and rare one-shot outputs still use the old shape.
+    actions: list[dict[str, Any]] = []
+    raw_actions = data.get("actions")
+    if isinstance(raw_actions, list):
+        for a in raw_actions:
+            if not isinstance(a, dict):
+                continue
+            kind = str(a.get("kind") or "").strip().lower()
+            text = str(a.get("text") or "").strip()
+            slots = a.get("slots") if isinstance(a.get("slots"), dict) else {}
+            label = str(a.get("label") or "").strip()
+            if not kind or kind == "none" or not text:
+                continue
+            actions.append(
+                {"kind": kind, "text": text, "slots": slots or {}, "label": label}
+            )
+    if not actions:
+        legacy_kind = str(data.get("action_kind") or "none").strip().lower()
+        legacy_text = str(data.get("action_text") or "").strip()
+        legacy_slots = data.get("action_slots") if isinstance(data.get("action_slots"), dict) else {}
+        if legacy_kind != "none" and legacy_text:
+            actions.append(
+                {
+                    "kind": legacy_kind,
+                    "text": legacy_text,
+                    "slots": legacy_slots or {},
+                    "label": headline,
+                }
+            )
+
     return AmbientAnalysis(
         tier=tier if 1 <= tier <= 4 else 4,
         headline=headline,
         detail=detail,
-        action=action,
+        actions=actions,
         raw_json=cleaned,
     )

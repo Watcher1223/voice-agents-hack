@@ -376,7 +376,15 @@ function waitForSessionTerminal(sessionId: string, timeoutMs: number = TASK_TIME
 const EXTENSION_URL = "https://chromewebstore.google.com/detail/hanzi-browse/iklpkemlmbhemkiojndpbhoakgikpmcd";
 
 function openInBrowser(url: string): void {
-  const cmd = process.platform === "win32" ? "start" : process.platform === "darwin" ? "open" : "xdg-open";
+  // On darwin, force Chrome so the browser-agent extension is the one that
+  // loads the page. Plain `open "$url"` follows the system default browser,
+  // which on dev machines is sometimes Safari — and then the extension
+  // can't drive the tab.
+  if (process.platform === "darwin") {
+    exec(`open -a "Google Chrome" "${url}"`);
+    return;
+  }
+  const cmd = process.platform === "win32" ? "start" : "xdg-open";
   exec(`${cmd} "${url}"`);
 }
 

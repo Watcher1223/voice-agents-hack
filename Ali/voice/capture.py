@@ -16,6 +16,8 @@ from typing import AsyncGenerator, Callable
 import pyaudio  # pyright: ignore[reportMissingModuleSource]
 from pynput import keyboard  # pyright: ignore[reportMissingModuleSource]
 
+from voice.mic import get_pinned_input_device_index
+
 # #region agent log
 def _dlog(loc: str, msg: str, data: dict, hid: str = "H6") -> None:
     try:
@@ -105,7 +107,13 @@ _next_session_conversational = False
 CONV_RMS_THRESHOLD = 180.0
 CONV_SILENCE_SEC = 0.88
 CONV_MIN_VOICE_SEC = 0.38
-CONV_MAX_SEC = 10.0
+# Hands-free capture after wake / backtick: max seconds of audio before hard stop.
+CONV_MAX_SEC = float(os.environ.get("ALI_CONV_MAX_SEC", "10.0"))
+# Abort early if the user never starts speaking after a wake trigger.
+# Happens when wake-word fires on a fragment (e.g. "open my") of an
+# utterance the user has already finished — we'd otherwise sit silent
+# for the full CONV_MAX_SEC.
+CONV_NO_VOICE_GRACE_SEC = 2.5
 
 
 def _pcm16_rms(data: bytes) -> float:
@@ -149,6 +157,11 @@ def _record_conversational(
             if (now - voice_since) >= CONV_MIN_VOICE_SEC and (now - last_loud) >= CONV_SILENCE_SEC:
                 end_reason = "silence_after_voice"
                 break
+        elif (now - t0) >= CONV_NO_VOICE_GRACE_SEC:
+            # Nothing said in the grace window — bail so Ali doesn't
+            # sit frozen after a stray wake trigger.
+            end_reason = "no_voice_start"
+            break
     # #region agent log
     _dlog(
         "capture:_record_conversational",
@@ -211,15 +224,16 @@ async def listen_for_command(
              second pynput listener (macOS often SIGTRAPs with two listeners).
     """
     audio = pyaudio.PyAudio()
-    input_device = _get_active_input_device(audio)
-    if input_device:
+    pinned_index = get_pinned_input_device_index(audio)
+    try:
+        pinned_info = audio.get_device_info_by_index(pinned_index)
         print(
             "[voice] Active mic: "
-            f'#{input_device["index"]} "{input_device["name"]}" '
-            f'({int(input_device["defaultSampleRate"])} Hz)'
+            f'#{pinned_index} "{pinned_info.get("name", "unknown")}" '
+            f'({int(pinned_info.get("defaultSampleRate", 0))} Hz) [pinned]'
         )
-    else:
-        print("[voice] Active mic: unknown (could not read PyAudio default input device)")
+    except Exception:
+        print(f"[voice] Active mic: #{pinned_index} [pinned]")
 
     # threading.Events work across threads; asyncio.Events don't
     global _ptt_start_flag
@@ -348,6 +362,7 @@ async def listen_for_command(
                 channels=CHANNELS,
                 rate=SAMPLE_RATE,
                 input=True,
+                input_device_index=pinned_index,
                 frames_per_buffer=CHUNK,
             )
 
@@ -405,18 +420,3 @@ def _frames_to_wav(frames: list[bytes]) -> bytes:
     return buf.getvalue()
 
 
-def _get_active_input_device(audio: pyaudio.PyAudio) -> dict | None:
-    """
-    Return the current default input device reported by PortAudio.
-    This mirrors the mic the app will use when opening input=True stream
-    without an explicit device index.
-    """
-    try:
-        info = audio.get_default_input_device_info()
-        return {
-            "index": int(info.get("index", -1)),
-            "name": str(info.get("name", "unknown")),
-            "defaultSampleRate": float(info.get("defaultSampleRate", 0.0)),
-        }
-    except Exception:
-        return None

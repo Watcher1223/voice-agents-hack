@@ -23,7 +23,14 @@ DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 CACTUS_API_KEY = os.environ.get("CACTUS_API_KEY", "")
 
 # ── Cactus / Gemma 4 ─────────────────────────────────────────────────────────
-CACTUS_GEMMA4_MODEL = "google/gemma-4-E2B-it"
+# General-purpose on-device model used by RAG, file resolution, and the
+# visual planner. Powerful but slow — ~30s/call on M2 without dedicated ANE.
+CACTUS_GEMMA4_MODEL = os.getenv("CACTUS_GEMMA4_MODEL", "google/gemma-4-E2B-it")
+
+# Intent classification is a tight JSON-shaped task that doesn't need the
+# 2B model. functiongemma-270m-it is purpose-built for function-calling /
+# structured output and runs ~20x faster (~1.5s/call) on ANE.
+CACTUS_INTENT_MODEL = os.getenv("CACTUS_INTENT_MODEL", "google/functiongemma-270m-it")
 
 # Route specific ambient-pipeline decisions through the local Gemma-4 sidecar
 # instead of the default (keyword heuristic for mode, always-call-Gemini for
@@ -63,9 +70,10 @@ AGENT_NODE_BIN     = os.getenv("AGENT_NODE_BIN",     "node")
 ROUTE_OPENCLI_ENABLED     = os.environ.get("VOICE_AGENT_ROUTE_OPENCLI", "1").lower() in {"1", "true", "yes"}
 ROUTE_BROWSER_TASK_ENABLED = os.environ.get("VOICE_AGENT_ROUTE_BROWSER_TASK", "1").lower() in {"1", "true", "yes"}
 # Ambient mode: run Deepgram from boot + glass-style intent detection that
-# surfaces suggestions every 5 final transcripts (not 12s wall-clock). Off
-# by default so push-to-talk keeps working without a live mic stream.
-AMBIENT_ENABLED = os.environ.get("VOICE_AGENT_AMBIENT", "0").lower() in {"1", "true", "yes"}
+# surfaces suggestions every 5 final transcripts (not 12s wall-clock). On
+# by default because the task checklist (loose utterances → tickable rows)
+# depends on it; set VOICE_AGENT_AMBIENT=0 to use PTT-only.
+AMBIENT_ENABLED = os.environ.get("VOICE_AGENT_AMBIENT", "1").lower() in {"1", "true", "yes"}
 # Event-driven screen context: snap when focus changes or screen is stale.
 # Passed as an image + app/title to the ambient analyser so tier 1-3 can
 # reference what's on screen. On by default when ambient is on.
@@ -78,6 +86,54 @@ AMBIENT_SCREEN_ENABLED = os.environ.get(
 AMBIENT_SPEAK_ENABLED = os.environ.get(
     "VOICE_AGENT_AMBIENT_SPEAK", "0"
 ).lower() in {"1", "true", "yes"}
+# How many Deepgram finals before one Gemini ambient analysis. Lower =
+# faster checklist updates (more API calls). Default 5.
+try:
+    AMBIENT_TRIGGER_EVERY_FINALS = max(
+        1, int(os.environ.get("VOICE_AGENT_AMBIENT_TRIGGER_FINALS", "5"))
+    )
+except ValueError:
+    AMBIENT_TRIGGER_EVERY_FINALS = 5
+# Transient Gemini errors (503, overload) — retry before giving up.
+try:
+    AMBIENT_ANALYSE_RETRIES = max(
+        1, int(os.environ.get("VOICE_AGENT_AMBIENT_ANALYSE_RETRIES", "4"))
+    )
+except ValueError:
+    AMBIENT_ANALYSE_RETRIES = 4
+# Idle-flush window — after the last final, if no new final arrives
+# within this many seconds and >=1 final is buffered, fire an analysis
+# anyway. Prevents a single complete sentence ("email Hanzi about
+# Hawaii") from sitting in the buffer forever when the user stops
+# talking before the 5-final trigger. Set to 0 to disable.
+try:
+    AMBIENT_IDLE_FLUSH_S = max(
+        0.0, float(os.environ.get("VOICE_AGENT_AMBIENT_IDLE_FLUSH_S", "3.5"))
+    )
+except ValueError:
+    AMBIENT_IDLE_FLUSH_S = 3.5
+# Ambient Cactus fallback: when Gemini returns 429 / RESOURCE_EXHAUSTED or
+# the retry budget is blown, run the analysis locally via the Cactus
+# CLI. OFF by default because the small on-device models we can afford
+# to call per utterance (gemma-3-1b-it, functiongemma-270m) aren't
+# reliable enough on this schema — they hallucinate names and drop
+# slots, which makes bad checklist rows that are worse than silent
+# failures. gemma-4-E2B-it is reliable but ~30-60s cold / ~3-5s warm,
+# which only makes sense behind a persistent sidecar server
+# (scripts/cactus_server.py). Flip VOICE_AGENT_AMBIENT_CACTUS_FALLBACK=1
+# to opt in and pick a model via VOICE_AGENT_AMBIENT_CACTUS_MODEL.
+AMBIENT_CACTUS_FALLBACK = os.environ.get(
+    "VOICE_AGENT_AMBIENT_CACTUS_FALLBACK", "0"
+).lower() in {"1", "true", "yes"}
+try:
+    AMBIENT_CACTUS_TIMEOUT_S = max(
+        5.0, float(os.environ.get("VOICE_AGENT_AMBIENT_CACTUS_TIMEOUT_S", "25"))
+    )
+except ValueError:
+    AMBIENT_CACTUS_TIMEOUT_S = 25.0
+AMBIENT_CACTUS_MODEL = os.environ.get(
+    "VOICE_AGENT_AMBIENT_CACTUS_MODEL", "google/gemma-3-1b-it"
+)
 # OpenCLI requires Node >= 22.19. Bypass the shebang and invoke node+entry
 # directly so a stale `env node` in PATH can't resolve to an older version.
 # Defaults are derived from `which node` so this works on any dev's machine

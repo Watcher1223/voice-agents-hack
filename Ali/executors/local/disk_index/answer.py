@@ -89,17 +89,30 @@ _SYSTEM = (
     "through their profile (macOS account info, Contacts, resume snippets) "
     "and through snippets retrieved from their files / calendar / messages.\n"
     "\n"
+    "The user's utterance can be either a QUESTION or a STATEMENT. Treat "
+    "statements as factual claims you should verify against the EXCERPTS.\n"
+    "\n"
     "Rules:\n"
-    "• Answer in ONE or TWO natural spoken sentences — no lists, no markdown, "
+    "• Reply in ONE or TWO natural spoken sentences — no lists, no markdown, "
     "  no preamble like \"based on the context\".\n"
+    "• FACT-CHECK: if the user states a fact and the EXCERPTS clearly show a "
+    "  different value, correct them directly and confidently. Lead with "
+    "  \"Actually, …\" and give the right value from the excerpts. Do NOT "
+    "  ask a clarifying question and do NOT hedge with \"I don't see an "
+    "  answer\" when the excerpts contain the correct figure. Example: user "
+    "  says \"Q1 revenue was $2M\", excerpts show Q1 revenue of $1 — reply "
+    "  \"Actually, Q1 revenue was $1, not $2 million.\"\n"
+    "• If the user's statement matches the excerpts, briefly confirm "
+    "  (\"That's right — …\").\n"
     "• For identity questions (who am I, my name, my email, where I live, "
     "  where I work, my phone number): the USER PROFILE is authoritative. "
     "  Use it directly and confidently.\n"
     "• For questions about files, notes, events, conversations: use the "
     "  EXCERPTS. Cite information only if it's actually there.\n"
     "• Never say \"the context does not contain…\" or similar. If you truly "
-    "  can't answer, say what you'd need (e.g. \"I don't see an answer in "
-    "  your recent files — try giving me a filename\").\n"
+    "  can't answer and the excerpts don't cover it, say what you'd need "
+    "  (e.g. \"I don't see an answer in your recent files — try giving me a "
+    "  filename\").\n"
     "• Prefer profile facts over excerpts when they conflict."
 )
 
@@ -134,8 +147,11 @@ def _build_prompt(
         parts.append("EXCERPTS: (no matching excerpts for this question)")
         parts.append("")
 
-    parts.append(f"Question: {transcript}")
-    parts.append("Answer:")
+    parts.append(f"User said: {transcript}")
+    parts.append(
+        "Reply (fact-check against the excerpts — correct the user if their "
+        "claim is wrong):"
+    )
     return _sanitize_for_argv("\n".join(parts))
 
 
@@ -346,9 +362,15 @@ def _clean_reply(raw: str) -> str:
     text = text.strip()
     # 3) Strip markdown code fences the model sometimes adds.
     text = re.sub(r"^```(?:json|text)?|```$", "", text, flags=re.MULTILINE).strip()
-    # 4) Some Cactus builds prepend the prompt — drop up to "Answer:".
-    if "Answer:" in text:
-        text = text.split("Answer:", 1)[1].strip()
+    # 4) Some Cactus builds prepend the prompt — drop up to the reply cue.
+    #    We now use a "Reply (...):" cue instead of "Answer:"; match both so
+    #    older sessions keep working.
+    cue_re = re.compile(r"(?:Answer|Reply)\s*(?:\([^)]*\))?\s*:", re.IGNORECASE)
+    cue_match = None
+    for m in cue_re.finditer(text):
+        cue_match = m
+    if cue_match:
+        text = text[cue_match.end():].strip()
     # 5) Spoken: first two sentences only.
     sentences = re.split(r"(?<=[.!?])\s+", text)
     if len(sentences) > 2:

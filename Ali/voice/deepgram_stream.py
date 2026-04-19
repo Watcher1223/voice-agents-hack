@@ -14,6 +14,7 @@ from typing import Callable
 import pyaudio
 
 from config.settings import DEEPGRAM_API_KEY
+from voice.mic import get_pinned_input_device_index
 
 SAMPLE_RATE = 16000
 CHANNELS    = 1
@@ -59,11 +60,13 @@ def stream_transcription_sync(
     dg = DeepgramClient(api_key=DEEPGRAM_API_KEY)
 
     audio  = pyaudio.PyAudio()
+    pinned_index = get_pinned_input_device_index(audio)
     stream = audio.open(
         format=FORMAT,
         channels=CHANNELS,
         rate=SAMPLE_RATE,
         input=True,
+        input_device_index=pinned_index,
         frames_per_buffer=CHUNK,
     )
 

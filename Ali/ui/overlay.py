@@ -83,17 +83,15 @@ class _MacGlobalHotkeyBridge(QObject):
 
 # Citation chip geometry (used by the disk-index answer panel).
 CITATION_ROW_H = 26
-# Tasks render in a column on the RIGHT of the conversation when present.
-TASKS_COL_W    = 320   # width of the tasks column
-TASKS_COL_GAP  = 12    # gap between conversation column and tasks column
-TASK_HEADER_H  = 26
-TASK_CARD_H    = 82
-TASK_CARD_GAP  = 8
-TASK_BTN_W     = 44
-TASK_BTN_H     = 22
-TASK_BTN_GAP   = 6
 CITATION_CHIP_PAD_X = 10
 CITATION_CHIP_GAP = 8
+
+# Checklist (tick-to-execute) geometry.
+CHECKLIST_ROW_H = 36
+CHECKLIST_PAD_TOP = 6
+CHECKLIST_HEADER_H = 22
+CHECKLIST_CHECKBOX_SIZE = 16
+CHECKLIST_MAX_VISIBLE = 6
 
 # ── Design tokens (lifted from VoiceInk NotchRecorderView + MiniRecorderView,
 #    and boring.notch sizing/matters.swift) ────────────────────────────────────
@@ -419,14 +417,6 @@ class TranscriptionOverlay(QWidget):
         # mousePressEvent to open the underlying file when clicked.
         self._citations: list[dict] = []
         self._citation_hit_rects: list[tuple[QRect, str]] = []
-        # Inline Tasks section, rendered below the conversation history.
-        # Main.py sets _tasks_store + callbacks; paintEvent renders each
-        # pending task as a card, and mousePressEvent hit-tests the
-        # approve/dismiss buttons against _task_hit_rects.
-        self._tasks_store = None        # type: ignore[assignment]
-        self._on_task_approve: Callable[[str], None] | None = None
-        self._on_task_dismiss: Callable[[str], None] | None = None
-        self._task_hit_rects: list[tuple[QRect, str, str]] = []
         self._drag_offset: QPoint | None = None
         self._pulse_on = True
         self._recording = False
@@ -461,10 +451,16 @@ class TranscriptionOverlay(QWidget):
         # right-click dismisses. Main.py registers the callbacks via
         # set_pending_confirm(); we clear on click or ambient_ack push.
         self._pending_confirm_cbs: tuple[Callable[[], None], Callable[[], None]] | None = None
-        # Double-click the pill anywhere (outside close/citations) to
-        # trigger push-to-talk — works without macOS Accessibility or
-        # Input Monitoring permissions, unlike the backtick hotkey.
-        self._on_double_click_ptt: Callable[[], None] | None = None
+
+        # Persistent task checklist (ambient-mode suggestions). Each entry is
+        # {"id": str, "label": str, "status": "pending|running|done|failed|skipped"}.
+        # main.py replaces the full list via the `checklist_set` state and
+        # patches individual rows via `checklist_update`. Clicking a row's
+        # checkbox calls back into the registered handler (main.py wires this
+        # at startup) so the user can tick tasks to execute them.
+        self._checklist: list[dict[str, str]] = []
+        self._checklist_hit_rects: list[tuple[QRect, str, str]] = []  # (rect, task_id, kind)
+        self._checklist_click_handler: Callable[[str, str], None] | None = None
 
         self._font_label = QFont(".AppleSystemUIFont", 15, QFont.Weight.Bold)
         self._font_body  = QFont(".AppleSystemUIFont", 14)
@@ -652,46 +648,6 @@ class TranscriptionOverlay(QWidget):
 
     # ── Input ────────────────────────────────────────────────────────────────
 
-    def set_tasks_source(
-        self,
-        store,
-        on_approve: Callable[[str], None],
-        on_dismiss: Callable[[str], None],
-    ) -> None:
-        """Attach the shared TasksStore + approve/dismiss callbacks.
-        Tasks render as cards below the conversation history in the same
-        overlay window."""
-        self._tasks_store = store
-        self._on_task_approve = on_approve
-        self._on_task_dismiss = on_dismiss
-
-    def refresh_tasks(self) -> None:
-        """Thread-safe: request a repaint on the next poll tick so new
-        tasks show up immediately without waiting for the next push()."""
-        self._q.put(("__refresh__", ""))
-
-    def set_on_double_click_ptt(self, fn: Callable[[], None]) -> None:
-        """Register a handler that fires when the user double-clicks the
-        pill (anywhere that isn't a close button or citation chip).
-        Zero-permissions alternative to the backtick hotkey."""
-        self._on_double_click_ptt = fn
-
-    def mouseDoubleClickEvent(self, e) -> None:  # type: ignore[override]
-        if e.button() != Qt.MouseButton.LeftButton:
-            return
-        x, y = e.position().x(), e.position().y()
-        if self._hit_close(x, y):
-            return
-        # Skip if clicking a citation chip.
-        for rect, _ in self._citation_hit_rects:
-            if rect.contains(int(x), int(y)):
-                return
-        if self._on_double_click_ptt is not None:
-            try:
-                self._on_double_click_ptt()
-            except Exception:
-                pass
-
     def set_pending_confirm(
         self,
         on_confirm: Callable[[], None],
@@ -704,6 +660,21 @@ class TranscriptionOverlay(QWidget):
 
     def clear_pending_confirm(self) -> None:
         self._pending_confirm_cbs = None
+
+    def set_checklist_click_handler(
+        self, handler: Callable[[str, str], None]
+    ) -> None:
+        """Register a callback invoked when the user clicks a checklist
+        row. The handler receives ``(task_id, kind)`` where ``kind`` is
+        ``"run"`` (checkbox clicked → execute) or ``"skip"`` (× glyph
+        clicked → hard-delete from the list)."""
+        self._checklist_click_handler = handler
+
+    def _hit_checklist(self, x: float, y: float) -> tuple[str, str] | None:
+        for rect, task_id, kind in self._checklist_hit_rects:
+            if rect.contains(int(x), int(y)):
+                return task_id, kind
+        return None
 
     def mousePressEvent(self, e) -> None:  # type: ignore[override]
         # Click-to-confirm takes precedence over drag + close.
@@ -742,19 +713,15 @@ class TranscriptionOverlay(QWidget):
                 if rect.contains(int(x), int(y)):
                     _open_citation_target(path)
                     return
-            # Task card buttons (Approve / Dismiss) — hit-test in the
-            # inline Tasks section.
-            for rect, task_id, action in self._task_hit_rects:
-                if rect.contains(int(x), int(y)):
-                    cb = self._on_task_approve if action == "approve" else self._on_task_dismiss
-                    if cb is not None:
-                        try:
-                            cb(task_id)
-                        except Exception:
-                            pass
-                    # Trigger a refresh so the card disappears right away.
-                    self.refresh_tasks()
-                    return
+            # Checklist row clicks: checkbox → run, × glyph → skip.
+            hit = self._hit_checklist(x, y)
+            if hit is not None and self._checklist_click_handler is not None:
+                task_id, kind = hit
+                try:
+                    self._checklist_click_handler(task_id, kind)
+                except Exception:
+                    pass
+                return
             self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent_cursor_hint(self, x: float, y: float) -> None:
@@ -932,15 +899,6 @@ class TranscriptionOverlay(QWidget):
         self._autohide_timer.stop()
         self._pulse_timer.stop()
 
-        # Task list changed — repaint/resize without touching conversation
-        # history. Triggered from refresh_tasks() (thread-safe queue push).
-        if state == "__refresh__":
-            if self._history or self._has_pending_tasks():
-                self._set_size(self._calc_width(), self._calc_height())
-                self._present()
-                self.update()
-            return
-
         if state == "hidden":
             self._dock_mode = DOCK_TOP
             self._do_hide()
@@ -1103,35 +1061,50 @@ class TranscriptionOverlay(QWidget):
             # a path (not clickable, kept for backward compatibility).
             self._citations = [{"label": text, "path": ""}]
             self._citation_hit_rects = []
+        elif state == "checklist_set":
+            # Full replace. Payload is JSON: [{"id", "label", "status"}, ...].
+            import json as _json
+            try:
+                items = _json.loads(text or "[]")
+            except _json.JSONDecodeError:
+                items = []
+            self._checklist = [
+                {
+                    "id": str(i.get("id", "")),
+                    "label": str(i.get("label", "")),
+                    "status": str(i.get("status", "pending")),
+                }
+                for i in items
+                if isinstance(i, dict) and i.get("id")
+            ]
+            print(
+                f"[overlay] checklist_set n={len(self._checklist)} "
+                f"visible={self.isVisible()} dock={self._dock_mode}",
+                flush=True,
+            )
+            # Force right-dock so the checklist sits out of the way.
+            if self._checklist:
+                self._dock_mode = DOCK_RIGHT
+        elif state == "checklist_update":
+            # Patch one row: "task_id|status[:result]"
+            if "|" in text:
+                task_id, rest = text.split("|", 1)
+                status = rest.split(":", 1)[0].strip()
+                for row in self._checklist:
+                    if row["id"] == task_id:
+                        row["status"] = status or row.get("status", "pending")
+                        break
+        elif state == "checklist_clear":
+            self._checklist = []
         else:
             self._history.append((text, FG, "assistant"))
 
         self._history = self._history[-MAX_HIST:]
-        self._set_size(self._calc_width(), self._calc_height())
+        self._set_size(W_FULL, self._calc_height())
         self._present()
         self.update()
 
-    def _has_pending_tasks(self) -> bool:
-        if self._tasks_store is None:
-            return False
-        try:
-            return bool(self._tasks_store.pending())
-        except Exception:
-            return False
-
-    def _calc_width(self) -> int:
-        """Pill widens when the tasks column is visible."""
-        if self._has_pending_tasks():
-            return W_FULL + TASKS_COL_GAP + TASKS_COL_W
-        return W_FULL
-
     def _calc_height(self) -> int:
-        """Max of conversation column height and tasks column height."""
-        conv_h = self._calc_conv_height()
-        tasks_h = self._calc_tasks_height()
-        return min(MAX_H, max(H_PILL, conv_h, tasks_h))
-
-    def _calc_conv_height(self) -> int:
         PAD_TOP = 18
         PAD_BOT = 18
         SEP = 10      # separator under user transcript
@@ -1147,15 +1120,11 @@ class TranscriptionOverlay(QWidget):
         if self._citations:
             # Citation chips render in one horizontal row under the body.
             h += CITATION_ROW_H + 6
+        if self._checklist:
+            visible = min(len(self._checklist), CHECKLIST_MAX_VISIBLE)
+            h += CHECKLIST_PAD_TOP + CHECKLIST_HEADER_H + visible * CHECKLIST_ROW_H + 6
         h += PAD_BOT
-        return h
-
-    def _calc_tasks_height(self) -> int:
-        if not self._has_pending_tasks():
-            return 0
-        pending = self._tasks_store.pending()  # type: ignore[union-attr]
-        # Pad top + header + cards (including gaps) + pad bottom
-        return 18 + TASK_HEADER_H + len(pending) * (TASK_CARD_H + TASK_CARD_GAP) + 18
+        return min(MAX_H, max(H_PILL, h))
 
     def _set_size(self, w: int, h: int, *, animated: bool = True) -> None:
         self._reposition(w, h, animated=animated)
@@ -1529,19 +1498,18 @@ class TranscriptionOverlay(QWidget):
             )
 
     def _paint_expanded(self, p: QPainter) -> None:
-        h = self.height()
+        w, h = self.width(), self.height()
         pad = PAD_H_EXPANDED
-        # Conversation occupies the LEFT column (fixed W_FULL wide);
-        # tasks occupy the right column if present. Width here is the
-        # conversation column width, not self.width().
-        conv_w = W_FULL
 
-        # Subtle × button at the right edge of the CONVERSATION column.
+        # Subtle × button
         p.setPen(FAINT)
         p.setFont(self._font_close)
-        p.drawText(QRect(conv_w - 30, 8, 20, 20), Qt.AlignmentFlag.AlignCenter, "×")
+        p.drawText(QRect(w - 30, 8, 20, 20), Qt.AlignmentFlag.AlignCenter, "×")
 
-        if not self._history:
+        # Reset hit-rect caches on every paint; subsequent passes repopulate.
+        self._checklist_hit_rects = []
+
+        if not self._history and not self._checklist:
             return
 
         y = 16
@@ -1555,13 +1523,13 @@ class TranscriptionOverlay(QWidget):
                 if len(display) > 58:
                     display = display[:55] + "…"
                 p.drawText(
-                    QRect(pad, y, conv_w - pad * 2 - 24, 20),
+                    QRect(pad, y, w - pad * 2 - 24, 20),
                     int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
                     display,
                 )
                 y += 24
                 p.setPen(QPen(DIVIDER_C, 0.8))
-                p.drawLine(QPoint(pad, y), QPoint(conv_w - pad, y))
+                p.drawLine(QPoint(pad, y), QPoint(w - pad, y))
                 y += 12
             else:
                 lines = max(1, (len(text) + 46) // 47)
@@ -1569,7 +1537,7 @@ class TranscriptionOverlay(QWidget):
                 p.setPen(colour)
                 p.setFont(self._font_body)
                 _flags = int(Qt.TextFlag.TextWordWrap) | int(Qt.AlignmentFlag.AlignLeft)
-                p.drawText(QRect(pad, y, conv_w - pad * 2, th), _flags, text)
+                p.drawText(QRect(pad, y, w - pad * 2, th), _flags, text)
                 y += th + 8
 
         # Clickable citation chips — painted as pill-shaped links after the
@@ -1588,92 +1556,201 @@ class TranscriptionOverlay(QWidget):
         else:
             self._citation_hit_rects = []
 
-        # Tasks render in the RIGHT column of the overlay (when present).
-        # Hit rects stash into self._task_hit_rects for mousePressEvent.
-        self._task_hit_rects = []
-        if self._has_pending_tasks():
-            self._paint_tasks_right_column(p)
+        # Checklist — ambient-suggested tasks awaiting a tick. Painted under
+        # any active history / citations so ongoing work sits above pending
+        # work. Hit rects are stashed for click-to-run / click-to-skip.
+        if self._checklist:
+            self._paint_checklist(p, pad_left=pad, y=y, width=w - pad * 2)
 
-    def _paint_tasks_right_column(self, p: QPainter) -> None:
-        """Render tasks as a vertical stack of cards in the right column.
-        Column spans (W_FULL+GAP) to self.width() horizontally, top of
-        the overlay to self.height() vertically."""
-        pending = self._tasks_store.pending()  # type: ignore[union-attr]
-        col_x = W_FULL + TASKS_COL_GAP
-        col_w = TASKS_COL_W
-        pad = 14
-        y = 16
-
-        # Subtle vertical divider between conversation and tasks
+    def _paint_checklist(
+        self,
+        p: QPainter,
+        *,
+        pad_left: int,
+        y: int,
+        width: int,
+    ) -> None:
+        """Render the persistent task checklist — a list of tick-to-run
+        rows. Each row: [checkbox] label … [status] [× skip glyph].
+        Populates ``self._checklist_hit_rects`` with the on-screen rects
+        used by mousePressEvent to route checkbox / × clicks back to
+        main.py."""
+        # Section divider + header
         p.setPen(QPen(DIVIDER_C, 0.8))
-        p.drawLine(QPoint(W_FULL + 3, 18), QPoint(W_FULL + 3, self.height() - 18))
+        p.drawLine(QPoint(pad_left, y + 2), QPoint(pad_left + width, y + 2))
+        y += CHECKLIST_PAD_TOP
 
-        # Header
+        pending_n = sum(1 for r in self._checklist if r.get("status") == "pending")
+        header = (
+            f"TASKS  ·  {pending_n} pending"
+            if pending_n
+            else "TASKS"
+        )
         p.setPen(DIM)
         p.setFont(self._font_small)
         p.drawText(
-            QRect(col_x + pad, y, col_w - pad * 2, TASK_HEADER_H),
-            int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
-            f"Tasks  ·  {len(pending)} pending",
+            QRect(pad_left, y, width - 80, CHECKLIST_HEADER_H),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            header,
         )
-        y += TASK_HEADER_H
+        p.setPen(FAINT)
+        p.drawText(
+            QRect(pad_left, y, width, CHECKLIST_HEADER_H),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            "tick or say “run 1”",
+        )
+        y += CHECKLIST_HEADER_H
 
-        # Cards
-        from ui.tasks_panel import _slot_preview      # reuse the formatter
-        card_w = col_w - pad * 2
-        for task in pending:
-            card_rect = QRect(col_x + pad, y, card_w, TASK_CARD_H)
-            p.setBrush(QColor(35, 35, 42, 230))
+        rows = self._checklist[-CHECKLIST_MAX_VISIBLE:]
+        for idx, row in enumerate(rows, start=1):
+            task_id = row.get("id", "")
+            label = row.get("label", "")
+            status = row.get("status", "pending")
+            self._paint_checklist_row(
+                p,
+                pad_left=pad_left,
+                y=y,
+                width=width,
+                index=idx,
+                task_id=task_id,
+                label=label,
+                status=status,
+            )
+            y += CHECKLIST_ROW_H
+
+    def _paint_checklist_row(
+        self,
+        p: QPainter,
+        *,
+        pad_left: int,
+        y: int,
+        width: int,
+        index: int,
+        task_id: str,
+        label: str,
+        status: str,
+    ) -> None:
+        row_rect = QRect(pad_left, y + 2, width, CHECKLIST_ROW_H - 6)
+
+        # Subtle row background to separate entries visually.
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 12))
+        p.drawRoundedRect(row_rect, 10, 10)
+
+        # ── Checkbox (left) ────────────────────────────────────────────
+        cb_size = CHECKLIST_CHECKBOX_SIZE
+        cb_x = pad_left + 10
+        cb_y = y + (CHECKLIST_ROW_H - cb_size) // 2
+        cb_rect = QRect(cb_x, cb_y, cb_size, cb_size)
+
+        sl = status.lower()
+        if sl == "done":
             p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(card_rect, 10, 10)
-            # Headline — allow wrapping for long task names
-            p.setPen(FG)
-            p.setFont(self._font_label)
-            p.drawText(
-                QRect(card_rect.x() + 12, card_rect.y() + 8, card_w - 24, 22),
-                int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
-                self._truncate_label((task.headline or "").strip(), 34),
-            )
-            # Slot preview — two lines, wrapped
-            p.setPen(DIM)
-            p.setFont(self._font_small)
-            sub = _slot_preview(task.action_text, task.slots)
-            p.drawText(
-                QRect(card_rect.x() + 12, card_rect.y() + 28, card_w - 24, 32),
-                int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignTop)
-                | int(Qt.TextFlag.TextWordWrap),
-                self._truncate_label(sub, 80),
-            )
-            # Buttons anchored to the bottom-right of each card
-            btn_y = card_rect.y() + card_rect.height() - TASK_BTN_H - 8
-            approve = QRect(
-                card_rect.x() + card_w - (TASK_BTN_W * 2 + TASK_BTN_GAP) - 12,
-                btn_y, TASK_BTN_W, TASK_BTN_H,
-            )
-            dismiss = QRect(
-                card_rect.x() + card_w - TASK_BTN_W - 12,
-                btn_y, TASK_BTN_W, TASK_BTN_H,
-            )
             p.setBrush(GREEN)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(approve, 6, 6)
-            p.setPen(Qt.GlobalColor.white)
-            p.setFont(self._font_label)
-            p.drawText(approve, Qt.AlignmentFlag.AlignCenter, "✓")
-            p.setBrush(QColor(50, 50, 58, 230))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(dismiss, 6, 6)
-            p.setPen(DIM)
-            p.drawText(dismiss, Qt.AlignmentFlag.AlignCenter, "✗")
+            p.drawRoundedRect(cb_rect, 4, 4)
+            p.setPen(QPen(QColor(0, 0, 0), 2))
+            p.drawLine(
+                QPoint(cb_x + 3, cb_y + cb_size // 2),
+                QPoint(cb_x + cb_size // 2 - 1, cb_y + cb_size - 4),
+            )
+            p.drawLine(
+                QPoint(cb_x + cb_size // 2 - 1, cb_y + cb_size - 4),
+                QPoint(cb_x + cb_size - 3, cb_y + 3),
+            )
+        elif sl == "failed":
+            p.setPen(QPen(ERR, 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(cb_rect, 4, 4)
+            p.drawLine(
+                QPoint(cb_x + 4, cb_y + 4),
+                QPoint(cb_x + cb_size - 4, cb_y + cb_size - 4),
+            )
+            p.drawLine(
+                QPoint(cb_x + cb_size - 4, cb_y + 4),
+                QPoint(cb_x + 4, cb_y + cb_size - 4),
+            )
+        elif sl == "running":
+            # Pulsing ring while the task is executing
+            breath = 0.55 + 0.45 * (
+                0.5 + 0.5 * math.sin(time.monotonic() * 3.2)
+            )
+            ring = QColor(BLUE)
+            ring.setAlphaF(breath)
+            p.setPen(QPen(ring, 2))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(cb_rect, 4, 4)
+        elif sl == "skipped":
+            p.setPen(QPen(FAINT, 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(cb_rect, 4, 4)
+        else:  # pending
+            p.setPen(QPen(QColor(255, 255, 255, 130), 1.4))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(cb_rect, 4, 4)
 
-            self._task_hit_rects.append((approve, task.id, "approve"))
-            self._task_hit_rects.append((dismiss, task.id, "dismiss"))
-            y += TASK_CARD_H + TASK_CARD_GAP
+        # Register the checkbox hit rect (only tickable while pending).
+        if sl == "pending":
+            # Slightly inflated rect so clicks don't need pixel accuracy.
+            hit = QRect(
+                cb_x - 6,
+                cb_y - 6,
+                cb_size + 12,
+                cb_size + 12,
+            )
+            self._checklist_hit_rects.append((hit, task_id, "run"))
 
-    @staticmethod
-    def _truncate_label(s: str, n: int) -> str:
-        s = (s or "").strip()
-        return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+        # ── Status label (right) ───────────────────────────────────────
+        status_map = {
+            "pending": ("Pending", DIM),
+            "running": ("Running…", BLUE),
+            "done": ("✓ Done", GREEN),
+            "failed": ("✗ Failed", ERR),
+            "skipped": ("Skipped", FAINT),
+        }
+        status_text, status_col = status_map.get(sl, (status[:16], DIM))
+
+        # × glyph on the far right for every row (pending, done, failed,
+        # skipped, even running). Clicking it hard-deletes the row from
+        # the checklist — useful for tidying up completed tasks too.
+        right_edge = pad_left + width - 10
+        glyph_x = right_edge - 12
+        glyph_y = y + CHECKLIST_ROW_H // 2
+        p.setPen(FAINT)
+        p.setFont(self._font_small)
+        p.drawText(
+            QRect(glyph_x - 6, glyph_y - 9, 18, 18),
+            Qt.AlignmentFlag.AlignCenter,
+            "×",
+        )
+        skip_hit = QRect(glyph_x - 12, glyph_y - 12, 24, 24)
+        self._checklist_hit_rects.append((skip_hit, task_id, "skip"))
+        status_right = glyph_x - 14
+
+        p.setPen(status_col)
+        p.setFont(self._font_small)
+        p.drawText(
+            QRect(status_right - 80, y, 80, CHECKLIST_ROW_H),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            status_text,
+        )
+
+        # ── Label (middle) ─────────────────────────────────────────────
+        # Prefix with "1." / "2." so voice commands ("run 1") feel
+        # natural. Note: the index reflects the visible row order, not
+        # the pending-only order — close enough for a handful of items.
+        label_x = cb_x + cb_size + 10
+        label_w = (status_right - 80 - 6) - label_x
+        label_text = f"{index}. {label}" if label else f"{index}."
+        label_col = FG if sl == "pending" else DIM
+        if sl == "done":
+            label_col = QColor(180, 200, 190, 200)
+        p.setPen(label_col)
+        p.setFont(self._font_small)
+        p.drawText(
+            QRect(label_x, y, label_w, CHECKLIST_ROW_H),
+            int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
+            label_text,
+        )
 
     # ── Timers ────────────────────────────────────────────────────────────────
 

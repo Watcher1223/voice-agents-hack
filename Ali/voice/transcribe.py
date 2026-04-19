@@ -20,10 +20,36 @@ import asyncio
 import json
 import os
 import shutil
+import ssl
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+
+try:
+    import certifi  # type: ignore
+    _CERTIFI_AVAILABLE = True
+except ImportError:
+    _CERTIFI_AVAILABLE = False
+
+# Sticky: once Deepgram fails in a way that won't self-heal (SSL,
+# auth, or persistent network), skip it for the rest of the session
+# so we don't eat a ~15s timeout on every command.
+_DEEPGRAM_DISABLED_THIS_SESSION = False
+
+
+def _deepgram_ssl_context() -> ssl.SSLContext:
+    """
+    Build an SSL context that works on macOS Python.org installs, which
+    don't ship a system CA bundle. Prefers certifi's bundle; falls back
+    to the default context.
+    """
+    if _CERTIFI_AVAILABLE:
+        try:
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            pass
+    return ssl.create_default_context()
 
 try:
     from faster_whisper import WhisperModel  # type: ignore
@@ -76,7 +102,7 @@ async def transcribe(audio_bytes: bytes) -> str:
 
     loop = asyncio.get_event_loop()
 
-    if DEEPGRAM_API_KEY:
+    if DEEPGRAM_API_KEY and not _DEEPGRAM_DISABLED_THIS_SESSION:
         try:
             result = await loop.run_in_executor(
                 None, _transcribe_deepgram, audio_bytes
@@ -142,18 +168,30 @@ def _transcribe_deepgram(audio_bytes: bytes) -> str | None:
         },
         method="POST",
     )
+    global _DEEPGRAM_DISABLED_THIS_SESSION
+    ctx = _deepgram_ssl_context()
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        # Print the response body so the operator can see Deepgram's
-        # actual error (unsupported model, bad audio, param conflict…).
         body = ""
         try:
             body = e.read().decode("utf-8", errors="replace")[:400]
         except Exception:
             pass
         print(f"[stt] Deepgram HTTP {e.code}: {body or e.reason}")
+        # Auth/quota errors won't fix themselves mid-session.
+        if e.code in (401, 402, 403):
+            _DEEPGRAM_DISABLED_THIS_SESSION = True
+            print("[stt] Deepgram unavailable this session → using Whisper")
+        return None
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        is_ssl = isinstance(reason, ssl.SSLError) or "CERTIFICATE_VERIFY_FAILED" in str(reason)
+        print(f"[stt] Deepgram REST error: {reason}")
+        if is_ssl:
+            _DEEPGRAM_DISABLED_THIS_SESSION = True
+            print("[stt] Deepgram unavailable this session → using Whisper")
         return None
     except Exception as e:
         print(f"[stt] Deepgram REST error: {e}")

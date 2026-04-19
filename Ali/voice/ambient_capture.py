@@ -1,7 +1,8 @@
 """Ambient listen loop — glass-style.
 
-Always-on Deepgram stream. After every `AMBIENT_TRIGGER_EVERY_FINALS` final
-transcripts arrive, runs `ambient_analysis.analyse` over the rolling
+Always-on Deepgram stream. After every N final transcripts (see
+`VOICE_AGENT_AMBIENT_TRIGGER_FINALS`, default 5), runs
+`ambient_analysis.analyse` over the rolling
 window. If the LLM decides to surface something (tier 1-3), the supplied
 callback fires. Tier 4 (stay silent) produces no callback.
 
@@ -21,59 +22,9 @@ from collections import deque
 from typing import Callable
 
 from observer.agent_log import log as _agent_log
+from config.settings import AMBIENT_IDLE_FLUSH_S, AMBIENT_TRIGGER_EVERY_FINALS
 
-
-AMBIENT_TRIGGER_EVERY_FINALS = 5
 AMBIENT_HISTORY_TURNS = 30
-# Debounce raw Deepgram finals: if another final arrives <N seconds
-# after the last one, merge them into a single turn. Ported from glass
-# (src/features/listen/stt/sttService.js:COMPLETION_DEBOUNCE_MS=2000).
-# Gives the speaker time to finish a thought before the analyzer counts
-# it as a completed utterance.
-DEBOUNCE_SECONDS = 2.0
-# Silence-based trigger: if the user has committed at least one turn
-# since the last analysis AND goes quiet for N seconds, fire analysis
-# anyway even if we haven't hit the 5-turn threshold. Prevents 3-sentence
-# thoughts from sitting unprocessed while the user moves on to other
-# things. 8s is long enough to avoid mid-sentence-pause false fires.
-SILENCE_TRIGGER_SECONDS = 8.0
-
-# Turns that begin with any of these direct-address prefixes skip the
-# 5-final wait and fire a focused single-turn analysis immediately —
-# the "Ali, do X" voice shortcut. Works without macOS Accessibility
-# permissions because it's just substring-matching on Deepgram text.
-import re as _re
-# Direct address: must have "ali" token, optionally prefixed by a
-# greeting. Earlier version allowed "hey" alone which fired on every
-# sentence starting with "Hey so …".
-_DIRECT_ADDRESS_RE = _re.compile(
-    r"^\s*(?:hey\s+|ok\s+|okay\s+)?ali\s*[,:\s]+(.+)$",
-    _re.IGNORECASE,
-)
-# Matches a turn that is JUST "Ali" / "Hey Ali" / "Okay Ali" (no body).
-# When heard, we arm the next non-empty turn as direct-address for
-# DIRECT_ADDRESS_ARM_SECONDS so natural flow "Ali… [pause] …what is X?"
-# works the same as "Ali, what is X?".
-_BARE_DIRECT_ADDRESS_RE = _re.compile(
-    r"^\s*(?:hey\s+|ok\s+|okay\s+)?ali\s*[.!?,:]*\s*$",
-    _re.IGNORECASE,
-)
-DIRECT_ADDRESS_ARM_SECONDS = 8.0
-
-
-def _strip_direct_address(text: str) -> str | None:
-    """If `text` begins with an 'Ali, …' / 'hey Ali …' prefix, return the
-    command body with the wake phrase stripped. Otherwise return None."""
-    m = _DIRECT_ADDRESS_RE.match(text or "")
-    if not m:
-        return None
-    body = (m.group(1) or "").strip()
-    return body or None
-
-
-def _is_bare_direct_address(text: str) -> bool:
-    """True if the whole turn is just 'Ali' / 'Hey Ali' / 'OK Ali.' etc."""
-    return bool(_BARE_DIRECT_ADDRESS_RE.match(text or ""))
 
 
 def _log(tag: str, text: str) -> None:
@@ -111,18 +62,13 @@ class AmbientCapture:
         self._analysis_in_flight = False
         self._previous = None  # type: ignore[assignment]
         self._loop: asyncio.AbstractEventLoop | None = None
-        # Debounce buffer for Deepgram finals. Accessed only on the
-        # asyncio loop so no lock is needed.
-        self._pending_parts: list[str] = []
-        self._debounce_handle: asyncio.TimerHandle | None = None
-        # Silence-based trigger timer. Reset every time a turn is
-        # committed; fires SILENCE_TRIGGER_SECONDS after the most recent
-        # commit if there's anything un-analysed.
-        self._silence_handle: asyncio.TimerHandle | None = None
-        # Epoch time (monotonic) until which the NEXT turn should be
-        # treated as direct-address because the user just said a bare
-        # "Ali" to get the agent's attention.
-        self._direct_armed_until: float = 0.0
+        # Idle-flush: when the user stops talking mid-buffer, we still
+        # want to analyse the partial sentence rather than wait for
+        # N=AMBIENT_TRIGGER_EVERY_FINALS finals that may never arrive.
+        # _idle_flush_handle is a TimerHandle scheduled on the asyncio
+        # loop; each new final cancels the prior one and schedules a
+        # fresh one.
+        self._idle_flush_handle: asyncio.TimerHandle | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -133,7 +79,6 @@ class AmbientCapture:
             start_meeting_audio,
             stop_meeting_audio,
         )
-        from config.settings import SYS_AUDIO_ENABLED
 
         self._loop = asyncio.get_event_loop()
         start_meeting_audio()
@@ -143,35 +88,37 @@ class AmbientCapture:
                 self._loop.call_soon_threadsafe(self._on_interim, text)
 
         def _final(text: str) -> None:
-            # Don't commit this final immediately. Glass-style debounce:
-            # buffer it and start a timer. If another final arrives before
-            # DEBOUNCE_SECONDS elapse, merge them. Only when N seconds of
-            # silence pass do we commit the accumulated text as one turn.
-            if self._loop is None:
-                return
-            self._loop.call_soon_threadsafe(self._ingest_final, text)
+            with self._lock:
+                self._history.append(text)
+                self._finals_since_trigger += 1
+                count = self._finals_since_trigger
+                total = len(self._history)
+                should_trigger = (
+                    count >= AMBIENT_TRIGGER_EVERY_FINALS
+                    and not self._analysis_in_flight
+                )
+                if should_trigger:
+                    self._finals_since_trigger = 0
+            # One line per final utterance so the user can see the loop
+            # is alive, how close we are to the next analysis, and what
+            # was actually heard.
+            marker = "↳ firing analysis" if should_trigger else f"({count}/{AMBIENT_TRIGGER_EVERY_FINALS} until next analysis)"
+            _log("final", f"{total:>2}: \"{text[:120]}\" {marker}")
+            if self._loop:
+                self._loop.call_soon_threadsafe(self._on_final, text)
+            if should_trigger and self._loop:
+                self._loop.call_soon_threadsafe(self._schedule_analysis)
+            elif self._loop and AMBIENT_IDLE_FLUSH_S > 0:
+                # No trigger yet, but arm the idle-flush so a complete
+                # short utterance still gets analysed after a pause.
+                self._loop.call_soon_threadsafe(self._arm_idle_flush)
 
-        mic_thread = threading.Thread(
+        stream_thread = threading.Thread(
             target=stream_transcription_sync,
             args=(self._stop_event, _interim, _final),
             daemon=True,
         )
-        mic_thread.start()
-
-        # Parallel system-audio stream: captures the Mac's output (remote
-        # FaceTime/Zoom voices) via ScreenCaptureKit. Shares the same
-        # debounce buffer so both mic and system turns interleave into one
-        # rolling transcript.
-        sys_thread: threading.Thread | None = None
-        if SYS_AUDIO_ENABLED:
-            from voice.sysaudio_stream import stream_sysaudio_transcription_sync
-            sys_thread = threading.Thread(
-                target=stream_sysaudio_transcription_sync,
-                args=(self._stop_event, _interim, _final),
-                daemon=True,
-            )
-            sys_thread.start()
-            _log("sysaudio", "started (ScreenCaptureKit → Deepgram)")
+        stream_thread.start()
 
         try:
             while not self._stop_event.is_set():
@@ -179,213 +126,55 @@ class AmbientCapture:
         finally:
             self._stop_event.set()
             stop_meeting_audio()
-            mic_thread.join(timeout=3.0)
-            if sys_thread is not None:
-                sys_thread.join(timeout=3.0)
-
-    def _ingest_final(self, text: str) -> None:
-        """Append a raw Deepgram final to the pending buffer + restart the
-        debounce timer. Runs on the asyncio loop — no threading concerns.
-
-        We INTENTIONALLY do NOT push intermediate previews to the overlay
-        anymore — that caused the pill to stack a new line for every
-        Deepgram partial ('are you using cats', 'are you using cats yes',
-        'are you using cats yes and this'…). The overlay only sees the
-        committed turn once silence elapses."""
-        text = (text or "").strip()
-        if not text:
-            return
-        self._pending_parts.append(text)
-        # Restart the silence timer.
-        if self._debounce_handle is not None:
-            self._debounce_handle.cancel()
-        if self._loop is not None:
-            self._debounce_handle = self._loop.call_later(
-                DEBOUNCE_SECONDS, self._commit_pending_turn
-            )
-
-    def _commit_pending_turn(self) -> None:
-        """Silence-gap has elapsed — merge the buffered finals into one
-        turn and (maybe) trigger analysis."""
-        self._debounce_handle = None
-        if not self._pending_parts:
-            return
-        turn = " ".join(self._pending_parts).strip()
-        self._pending_parts = []
-        # Now that the turn is committed, surface it once to the overlay.
-        try:
-            self._on_final(turn)
-        except Exception:
-            pass
-
-        # Direct-address fast path: "Ali, do X" / "Hey Ali what is IRR"
-        # fires a focused single-turn analysis right now, no 5-wait.
-        # Also: bare "Ali" with nothing after primes the NEXT turn to
-        # count as direct-address within DIRECT_ADDRESS_ARM_SECONDS.
-        import time as _time
-        direct_body: str | None = _strip_direct_address(turn)
-
-        if direct_body is None and _is_bare_direct_address(turn):
-            self._direct_armed_until = _time.monotonic() + DIRECT_ADDRESS_ARM_SECONDS
-            with self._lock:
-                self._history.append(turn)
-            _log(
-                "direct-arm",
-                f"heard '{turn[:40]}' — next turn within {int(DIRECT_ADDRESS_ARM_SECONDS)}s treated as direct",
-            )
-            return
-
-        if direct_body is None and _time.monotonic() < self._direct_armed_until:
-            # Disarm and treat this turn as direct-address.
-            self._direct_armed_until = 0.0
-            direct_body = turn
-
-        if direct_body:
-            with self._lock:
-                # Still add to history so the next passive analysis can
-                # reference it, but reset the trigger counter — otherwise
-                # every direct address would eat a slot toward the
-                # next 5-turn window.
-                self._history.append(turn)
-                total = len(self._history)
-                self._finals_since_trigger = 0
-                in_flight = self._analysis_in_flight
-            _log("direct", f'{total:>2}: "{direct_body[:120]}" ↳ direct-address fast path')
-            if not in_flight:
-                self._schedule_direct_analysis(direct_body)
-            return
-
-        with self._lock:
-            self._history.append(turn)
-            self._finals_since_trigger += 1
-            count = self._finals_since_trigger
-            total = len(self._history)
-            should_trigger = (
-                count >= AMBIENT_TRIGGER_EVERY_FINALS
-                and not self._analysis_in_flight
-            )
-            if should_trigger:
-                self._finals_since_trigger = 0
-        marker = "↳ firing analysis" if should_trigger else (
-            f"({count}/{AMBIENT_TRIGGER_EVERY_FINALS} until next analysis)"
-        )
-        _log("final", f'{total:>2}: "{turn[:120]}" {marker}')
-        if should_trigger:
-            self._schedule_analysis()
-        else:
-            # Arm silence trigger so we don't leave the user hanging if
-            # they stop talking after 3 sentences.
-            self._reset_silence_timer()
-
-    def _reset_silence_timer(self) -> None:
-        """Start/restart the silence trigger. Fires after
-        SILENCE_TRIGGER_SECONDS if there are un-analysed finals."""
-        if self._silence_handle is not None:
-            self._silence_handle.cancel()
-            self._silence_handle = None
-        if self._loop is None:
-            return
-        with self._lock:
-            if self._finals_since_trigger == 0 or self._analysis_in_flight:
-                return
-        self._silence_handle = self._loop.call_later(
-            SILENCE_TRIGGER_SECONDS, self._fire_silence_trigger
-        )
-
-    def _fire_silence_trigger(self) -> None:
-        self._silence_handle = None
-        with self._lock:
-            if self._finals_since_trigger == 0 or self._analysis_in_flight:
-                return
-            count = self._finals_since_trigger
-            self._finals_since_trigger = 0
-        _log("silence-trigger", f"↳ firing analysis after {SILENCE_TRIGGER_SECONDS:.0f}s silence ({count} turns pending)")
-        self._schedule_analysis()
-
-    def _schedule_direct_analysis(self, body: str) -> None:
-        """Fire focused analysis on JUST the direct-address turn."""
-        if self._analysis_in_flight:
-            return
-        self._analysis_in_flight = True
-        if self._loop:
-            self._loop.create_task(self._do_direct_analysis(body))
-
-    async def _do_direct_analysis(self, body: str) -> None:
-        """Same pipeline as _do_analysis but the 'history' is just the
-        single direct-address utterance. The ambient_analysis prompt
-        works fine on a one-line history — tier 1/2/3 routes identically."""
-        from intent.ambient_analysis import analyse
-
-        try:
-            screen_app, screen_title, image = "", "", b""
-            if self._screen_observer is not None:
-                ctx = self._screen_observer.latest_context()
-                screen_app = ctx.app
-                screen_title = ctx.window_title
-                image = ctx.image_bytes
-            result = await analyse(
-                [body],
-                self._previous,
-                screen_app=screen_app,
-                screen_window_title=screen_title,
-                screen_image_bytes=image,
-            )
-            if result.should_surface():
-                self._previous = result
-                _log("direct:surface", f"tier-{result.tier}: {result.headline[:100]}")
-                if result.detail:
-                    _log("direct:detail", result.detail[:240])
-                if result.action:
-                    _log("direct:action", str(result.action)[:240])
-                self._on_suggestion(result)
-            else:
-                _log("direct:silent", f"tier-{result.tier} (no answer for {body[:80]!r})")
-        except Exception as e:
-            _log("direct:error", str(e)[:240])
-        finally:
-            self._analysis_in_flight = False
+            stream_thread.join(timeout=3.0)
 
     def _schedule_analysis(self) -> None:
         # Run in background; buffer continues to receive finals meanwhile.
-        # Also cancel any pending silence trigger — we're firing now.
-        if self._silence_handle is not None:
-            self._silence_handle.cancel()
-            self._silence_handle = None
         if self._analysis_in_flight:
             return
+        # Cancel any pending idle-flush — we're firing analysis *now*.
+        if self._idle_flush_handle is not None:
+            self._idle_flush_handle.cancel()
+            self._idle_flush_handle = None
         self._analysis_in_flight = True
         if self._loop:
             self._loop.create_task(self._do_analysis())
 
+    def _arm_idle_flush(self) -> None:
+        """Reset the idle-flush timer. Called on every new final so only
+        a *stretch of silence* fires the analysis early."""
+        if self._loop is None or AMBIENT_IDLE_FLUSH_S <= 0:
+            return
+        if self._idle_flush_handle is not None:
+            self._idle_flush_handle.cancel()
+        self._idle_flush_handle = self._loop.call_later(
+            AMBIENT_IDLE_FLUSH_S, self._idle_flush
+        )
+
+    def _idle_flush(self) -> None:
+        """Fire an analysis if the buffer has content and nothing else
+        is in flight. Called by the TimerHandle armed in _arm_idle_flush."""
+        self._idle_flush_handle = None
+        with self._lock:
+            pending = self._finals_since_trigger
+            in_flight = self._analysis_in_flight
+            total = len(self._history)
+            if pending <= 0 or in_flight:
+                return
+            self._finals_since_trigger = 0
+        _log(
+            "idle-flush",
+            f"silence for {AMBIENT_IDLE_FLUSH_S:.1f}s — firing on {pending} buffered final(s) "
+            f"(history={total})",
+        )
+        self._schedule_analysis()
+
     async def _do_analysis(self) -> None:
         from intent.ambient_analysis import analyse
-        from config.settings import GEMMA_SILENCE_ENABLED
 
         try:
             with self._lock:
                 history_snapshot = list(self._history)
-                total = len(history_snapshot)
-            # Optional local pre-gate (VOICE_AGENT_GEMMA_SILENCE=1): run
-            # Gemma first to decide whether anything in the window is worth
-            # surfacing. If it says 'silent', skip the cloud Gemini call
-            # entirely. Eval: skips 53% of Gemini calls, 5% FN on windows
-            # that DID contain signal. Any sidecar failure → fall through.
-            if GEMMA_SILENCE_ENABLED:
-                try:
-                    from intent.gemma_classifier import should_surface_gemma
-                    verdict = should_surface_gemma(history_snapshot)
-                    if verdict is False:
-                        _log("gemma-gate", f"silent (skipped Gemini call, {total} turns)")
-                        return
-                    if verdict is True:
-                        _log("gemma-gate", f"surface (forwarding to Gemini)")
-                    else:
-                        # Gemma returned None — sidecar unreachable, timed
-                        # out, or emitted unparseable output. Continue to
-                        # Gemini so we never drop signal on an infra hiccup.
-                        _log("gemma-gate-fallback", "no verdict (forwarding to Gemini)")
-                except Exception as e:
-                    _log("gemma-gate-error", str(e)[:160])
             screen_app, screen_title, image = "", "", b""
             if self._screen_observer is not None:
                 ctx = self._screen_observer.latest_context()

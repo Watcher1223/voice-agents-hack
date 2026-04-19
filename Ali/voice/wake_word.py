@@ -6,6 +6,7 @@ Falls back gracefully if the library isn't installed.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Callable
@@ -31,6 +32,20 @@ recording_active = threading.Event()
 _WAKE_COOLDOWN_SEC = 4.0
 _wake_lock = threading.Lock()
 _last_wake_mono: float | None = None
+
+
+def try_acquire_wake_dispatch() -> bool:
+    """Return True if a wake dispatch may proceed (not within cooldown).
+
+    Shared by Google wake STT and ambient Deepgram finals so duplicate
+    triggers from both paths do not double-fire."""
+    global _last_wake_mono
+    with _wake_lock:
+        now = time.monotonic()
+        if _last_wake_mono is not None and (now - _last_wake_mono) < _WAKE_COOLDOWN_SEC:
+            return False
+        _last_wake_mono = now
+        return True
 _INLINE_COMMAND_PREFIXES = (
     "open ",
     "find ",
@@ -68,6 +83,10 @@ def start_wake_word_listener(callback: Callable[[str], None]) -> None:
 
     def _check(recognizer, audio, audio_end_mono: float) -> None:
         global _last_wake_mono
+        # Bail if a PTT session began while this chunk was in-flight — that
+        # chunk will contain the user's PTT speech, not a fresh wake utterance.
+        if recording_active.is_set():
+            return
         try:
             frame_data = getattr(audio, "frame_data", b"") or b""
             rms = _rms16(frame_data)
@@ -82,23 +101,36 @@ def start_wake_word_listener(callback: Callable[[str], None]) -> None:
             t0 = time.monotonic()
             text = recognizer.recognize_google(audio).lower()
             google_ms = int((time.monotonic() - t0) * 1000)
+            # Last-chance guard: ignore Google results that came back after
+            # PTT started.
+            if recording_active.is_set():
+                return
             print(f"[wake_word] Heard: \"{text}\" ({google_ms}ms)")
             words = {w.strip(".,!?").lower() for w in text.split()}
             has_wake = any(w in _WAKE_ALIASES for w in words)
-            has_wake_like_prefix = any(w.startswith("al") for w in words if len(w) >= 2)
-            has_wake = has_wake or has_wake_like_prefix
-            inline_command = text.startswith(_INLINE_COMMAND_PREFIXES) and len(text.split()) >= 2
+            # Inline-command fallback (e.g. "open my resume" with a missed
+            # wake word) was added for PTT-only mode. When ambient is on,
+            # loose utterances MUST flow through ambient → tier-3 → task
+            # checklist; letting the inline fallback trigger here would
+            # hijack them into immediate execution and bypass the list.
+            # Keep the fallback only when ambient is off.
+            try:
+                from config.settings import AMBIENT_ENABLED as _AMBIENT_ON
+            except Exception:
+                _AMBIENT_ON = False
+            inline_command = (
+                not _AMBIENT_ON
+                and text.startswith(_INLINE_COMMAND_PREFIXES)
+                and len(text.split()) >= 2
+            )
             if not has_wake and not inline_command:
                 # #region agent log
                 _dlog("wake_word:_check:no_ali", "google returned but no ali",
                       {"text": text, "google_ms": google_ms}, "H1")
                 # #endregion
                 return
-            with _wake_lock:
-                now = time.monotonic()
-                if _last_wake_mono is not None and (now - _last_wake_mono) < _WAKE_COOLDOWN_SEC:
-                    return
-                _last_wake_mono = now
+            if not try_acquire_wake_dispatch():
+                return
             post_speech_ms = int((time.monotonic() - audio_end_mono) * 1000)
             print(f"[wake_word] Heard: '{text}' → triggering")
             # #region agent log
@@ -112,7 +144,10 @@ def start_wake_word_listener(callback: Callable[[str], None]) -> None:
         except Exception as e:
             err_type = type(e).__name__
             if "UnknownValueError" in err_type:
-                print("[wake_word] Google: couldn't understand audio")
+                # Common and uninteresting — used to dominate the terminal.
+                # Keep it in the debug log but not on stdout.
+                _dlog("wake_word:_check:unknown_value", "google couldn't understand audio",
+                      {}, "H1")
             elif "RequestError" in err_type:
                 print(f"[wake_word] Google API error (no internet?): {e}")
             else:
@@ -170,14 +205,34 @@ def start_wake_word_listener(callback: Callable[[str], None]) -> None:
                 continue
             try:
                 listen_started = time.monotonic()
+                saw_recording = recording_active.is_set()
+                phrase_limit = float(os.environ.get("ALI_WAKE_PHRASE_LIMIT_S", "10.0"))
                 with mic as source:
-                    audio = r.listen(source, timeout=2, phrase_time_limit=2.4)
+                    audio = r.listen(source, timeout=2, phrase_time_limit=phrase_limit)
                 audio_end_mono = time.monotonic()
                 timeout_count = 0
+                # Drop any chunk that overlapped a PTT session — that audio
+                # is the user's command, not a wake utterance.
+                if saw_recording or recording_active.is_set():
+                    _dlog("wake_word:_run:drop_stale",
+                          "dropped wake chunk that overlapped PTT",
+                          {"saw_recording": saw_recording,
+                           "recording_now": recording_active.is_set()}, "H1")
+                    continue
                 frame_bytes = len(getattr(audio, "frame_data", b"") or b"")
+                frame_data = getattr(audio, "frame_data", b"") or b""
+                rms = _rms16(frame_data)
+                # Gate: short speech ("Ali") can be ~0.2s (~19kB @ 48kHz mono s16).
+                # Require enough energy that it's plausibly speech; too low
+                # still kills the per-cycle "couldn't understand audio" spam.
+                if frame_bytes < 18_000 or rms < r.energy_threshold * 0.8:
+                    _dlog("wake_word:_run:gated",
+                          "skipping recognize_google: too quiet/short",
+                          {"bytes": frame_bytes, "rms": round(rms, 2),
+                           "threshold": round(r.energy_threshold, 1)}, "H1")
+                    continue
                 print(f"[wake_word] Audio captured ({frame_bytes} bytes) — sending to Google…")
-                if not recording_active.is_set():
-                    threading.Thread(target=_check, args=(r, audio, audio_end_mono), daemon=True).start()
+                threading.Thread(target=_check, args=(r, audio, audio_end_mono), daemon=True).start()
             except Exception as e:
                 err_type = type(e).__name__
                 now_mono = time.monotonic()

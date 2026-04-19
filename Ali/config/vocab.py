@@ -31,9 +31,25 @@ ACRONYMS: list[str] = [
 ]
 
 
+# Hard cap on the merged bias list so we stay under Deepgram's ~100 keyterm
+# ceiling. Leaves room for ACRONYMS + the static CONTACTS without truncation.
+_KEYTERMS_MAX = 95
+
+
 def keyterms() -> list[str]:
-    """All terms Deepgram Nova-3 should bias toward as `keyterm` params."""
-    return list(dict.fromkeys(CONTACTS + ACRONYMS))
+    """All terms Deepgram Nova-3 should bias toward as `keyterm` params.
+
+    Merge order: static CONTACTS first (never dropped), then contact-derived
+    unusual names (auto-pruned at 80), then ACRONYMS. Order-preserved dedupe
+    so the cap trims low-priority tail entries, not hand-curated ones.
+    """
+    extra: list[str] = []
+    try:
+        from config.contact_vocab import get_unusual_first_names
+        extra = get_unusual_first_names()
+    except Exception as exc:  # contacts permission denied, osascript failure, …
+        print(f"[vocab] contact-derived bias unavailable: {exc}")
+    return list(dict.fromkeys(CONTACTS + extra + ACRONYMS))[:_KEYTERMS_MAX]
 
 # Context-qualified corrections. For each tuple:
 #   - `wrong` is the set of mis-hearings (lowercase, whole-word)
@@ -74,17 +90,39 @@ def _has_any(text_lower: str, hints: Iterable[str]) -> bool:
     return any(h in text_lower for h in hints)
 
 
+def _all_corrections() -> list[_Correction]:
+    """Static hand-curated rules plus auto-derived ones from Contacts.
+
+    Auto-derived rules carry an empty `hints` set, which `apply_corrections`
+    treats as "fire unconditionally" — safe because the canonical RHS is
+    always a proper noun we've opted-in to recognise.
+    """
+    rules: list[_Correction] = list(CORRECTIONS)
+    try:
+        from config.contact_vocab import get_mis_split_rules
+        rules.extend(get_mis_split_rules())
+    except Exception as exc:
+        print(f"[vocab] contact-derived corrections unavailable: {exc}")
+    return rules
+
+
 def apply_corrections(text: str) -> str:
     """
     Replace mis-heard tokens with canonical forms when context supports it.
     Idempotent — safe to call on already-correct text.
+
+    Rules with a non-empty `hints` set only fire when at least one hint
+    token is present in the transcript (prevents e.g. "Alex" -> "LAX"
+    outside a travel context). Rules with an empty `hints` set fire
+    unconditionally — reserved for proper-noun corrections derived from
+    the user's own Contacts.
     """
     if not text:
         return text
     lower = text.lower()
     out = text
-    for wrong_set, right, hints in CORRECTIONS:
-        if not _has_any(lower, hints):
+    for wrong_set, right, hints in _all_corrections():
+        if hints and not _has_any(lower, hints):
             continue
         for w in wrong_set:
             # Whole-word, case-insensitive replace.

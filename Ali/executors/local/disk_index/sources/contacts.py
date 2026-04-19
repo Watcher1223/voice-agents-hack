@@ -36,56 +36,75 @@ on textify(lst, sep)
     return out
 end textify
 
-on record_for(p)
-    set nm to ""
-    try
-        set nm to (name of p) as text
-    end try
-    set org to ""
-    try
-        set org to (organization of p) as text
-    end try
-    set jt to ""
-    try
-        set jt to (job title of p) as text
-    end try
-    set nt to ""
-    try
-        set nt to (note of p) as text
-    end try
+on pad2(n)
+    set s to (n as integer) as text
+    if (length of s) is 1 then return "0" & s
+    return s
+end pad2
 
-    set emails to {}
-    try
-        repeat with e in emails of p
-            set end of emails to (value of e) as text
-        end repeat
-    end try
+on iso_date(d)
+    -- Hand-rolled ISO-8601 (no timezone). Avoids the `«class isot»` coercion
+    -- which osascript -e mishandles across macOS versions. Python-side
+    -- `_parse_apple_iso` accepts the naive form as a fallback.
+    set y to (year of d) as text
+    set mo to my pad2((month of d) as integer)
+    set dy to my pad2(day of d)
+    set hh to my pad2(hours of d)
+    set mm to my pad2(minutes of d)
+    set ss to my pad2(seconds of d)
+    return y & "-" & mo & "-" & dy & "T" & hh & ":" & mm & ":" & ss
+end iso_date
 
-    set phones to {}
-    try
-        repeat with ph in phones of p
-            set end of phones to (value of ph) as text
-        end repeat
-    end try
-
-    set theId to ""
-    try
-        set theId to (id of p) as text
-    end try
-
-    set mdate to ""
-    try
-        set mdate to ((modification date of p) as «class isot» as string)
-    end try
-
-    set parts to {theId, nm, org, jt, my textify(emails, ","), my textify(phones, ","), mdate, nt}
-    return my textify(parts, "§FIELD§")
-end record_for
-
+-- Everything that touches Contacts terminology (`emails`, `phones`, …) must
+-- live inside a `tell application "Contacts"` block, otherwise the handler
+-- runs in the bare script scope and those identifiers fail to resolve —
+-- surfacing as a misleading "Expected ',' but found identifier" syntax error.
 tell application "Contacts"
     set out to ""
     repeat with p in people
-        set out to out & my record_for(p) & "§REC§"
+        set nm to ""
+        try
+            set nm to (name of p) as text
+        end try
+        set orgTxt to ""
+        try
+            set orgTxt to (organization of p) as text
+        end try
+        set jt to ""
+        try
+            set jt to (job title of p) as text
+        end try
+        set nt to ""
+        try
+            set nt to (note of p) as text
+        end try
+
+        set emailList to {}
+        try
+            repeat with e in (emails of p)
+                set end of emailList to (value of e) as text
+            end repeat
+        end try
+
+        set phoneList to {}
+        try
+            repeat with ph in (phones of p)
+                set end of phoneList to (value of ph) as text
+            end repeat
+        end try
+
+        set theId to ""
+        try
+            set theId to (id of p) as text
+        end try
+
+        set mdate to ""
+        try
+            set mdate to my iso_date(modification date of p)
+        end try
+
+        set parts to {theId, nm, orgTxt, jt, my textify(emailList, ","), my textify(phoneList, ","), mdate, nt}
+        set out to out & my textify(parts, "§FIELD§") & "§REC§"
     end repeat
     return out & "§END§"
 end tell
