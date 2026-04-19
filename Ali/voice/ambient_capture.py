@@ -16,13 +16,32 @@ Design choices (from glass + our constraints):
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
+import time
 from collections import deque
+from pathlib import Path
 from typing import Callable
 
 
 AMBIENT_TRIGGER_EVERY_FINALS = 5
 AMBIENT_HISTORY_TURNS = 30
+
+# Persistent log so we can inspect what happened after the fact. One line
+# per event — finals, triggers, tier outcomes — JSONL-ish plain text.
+_AMBIENT_LOG_PATH = Path(
+    os.environ.get("VOICE_AGENT_AMBIENT_LOG", "~/.ali/ambient.log")
+).expanduser()
+
+
+def _log(tag: str, text: str) -> None:
+    try:
+        _AMBIENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _AMBIENT_LOG_PATH.open("a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [{tag}] {text}\n")
+    except Exception:
+        pass
+    print(f"[ambient][{tag}] {text}")
 
 
 class AmbientCapture:
@@ -88,7 +107,7 @@ class AmbientCapture:
             # is alive, how close we are to the next analysis, and what
             # was actually heard.
             marker = "↳ firing analysis" if should_trigger else f"({count}/{AMBIENT_TRIGGER_EVERY_FINALS} until next analysis)"
-            print(f"[ambient] final {total:>2}: \"{text[:120]}\" {marker}")
+            _log("final", f"{total:>2}: \"{text[:120]}\" {marker}")
             if self._loop:
                 self._loop.call_soon_threadsafe(self._on_final, text)
             if should_trigger and self._loop:
@@ -138,13 +157,17 @@ class AmbientCapture:
             )
             if result.should_surface():
                 self._previous = result
-                print(f"[ambient] ✓ tier-{result.tier} surfaced: {result.headline[:100]}")
+                _log("surface", f"tier-{result.tier}: {result.headline[:100]}")
+                if result.detail:
+                    _log("detail", result.detail[:240])
+                if result.action:
+                    _log("action", str(result.action)[:240])
                 self._on_suggestion(result)
             else:
                 # Tier-4: stay silent, but keep the prior non-silent result
                 # so next round still knows what NOT to repeat.
-                print(f"[ambient] tier-{result.tier} — staying silent (nothing worth surfacing)")
+                _log("silent", f"tier-{result.tier} (nothing worth surfacing)")
         except Exception as e:
-            print(f"[ambient] analysis loop error: {e}")
+            _log("error", str(e)[:240])
         finally:
             self._analysis_in_flight = False
