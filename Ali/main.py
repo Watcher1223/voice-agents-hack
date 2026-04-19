@@ -12,6 +12,7 @@ The TranscriptionOverlay bridges the two via queue.Queue.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import faulthandler
 import os
@@ -31,6 +32,7 @@ try:
 except Exception:
     pass
 
+from config.index_bootstrap import ensure_index
 from config.preflight import run_preflight_checks
 
 
@@ -133,10 +135,41 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     agent_loop.create_task(_run_meeting_capture(overlay, menu_bar))
                     return
 
+                if intent.goal.value == "ask_knowledge":
+                    from executors.local.disk_index import answer_question
+                    from voice.speak import speak
+                    print("[2.5/3] Knowledge question → retrieving from disk index...")
+                    result = await answer_question(transcript)
+                    print(f'      ← "{result.text}" (backend={result.backend}, '
+                          f'snippets={result.snippets_used})')
+                    overlay.push("assistant", result.text or "I don't have that.")
+                    if result.cited_paths:
+                        cited = ", ".join(
+                            os.path.basename(p) for p in result.cited_paths[:3]
+                        )
+                        overlay.push("cited", cited)
+                    speak(result.text or "I don't have that.")
+                    return
+
                 if intent.goal.value == "unknown":
+                    from executors.local.disk_index import answer_question, index_exists
                     from intent.chat import chat_reply
                     from voice.speak import speak
                     print("[2.5/3] Unknown intent → conversational reply...")
+                    reply = ""
+                    if index_exists():
+                        rag = await answer_question(transcript)
+                        if rag.snippets_used > 0 and rag.text:
+                            reply = rag.text
+                            overlay.push("assistant", reply)
+                            if rag.cited_paths:
+                                cited = ", ".join(
+                                    os.path.basename(p) for p in rag.cited_paths[:3]
+                                )
+                                overlay.push("cited", cited)
+                            speak(reply)
+                            print(f'      ← "{reply}" (rag backend={rag.backend})')
+                            return
                     reply = await chat_reply(transcript)
                     print(f'      ← "{reply}"')
                     # #region agent log
@@ -565,8 +598,37 @@ def _run_agent(overlay: "TranscriptionOverlay") -> None:
 
 # ── Main (Qt on main thread) ──────────────────────────────────────────────────
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="ali", add_help=True)
+    parser.add_argument(
+        "--rebuild-index",
+        action="store_true",
+        help="force a rebuild of the laptop-wide disk index at startup",
+    )
+    return parser.parse_args(argv)
+
+
+def _warmup_disk_index_embedder() -> None:
+    """Warm the MiniLM encoder on a background thread (safe to call even if
+    the index doesn't yet exist — sentence-transformers just downloads the
+    weights once)."""
+    try:
+        from executors.local.disk_index import warmup_embedder
+
+        warmup_embedder()
+    except Exception as exc:
+        print(f"[index] embedder warmup skipped: {exc}")
+
+
 def main() -> None:
+    args = _parse_args()
+
     run_preflight_checks()
+    ensure_index(force_rebuild=args.rebuild_index)
+
+    threading.Thread(
+        target=_warmup_disk_index_embedder, daemon=True, name="index-warmup"
+    ).start()
 
     overlay, run_ui = _build_overlay()
 

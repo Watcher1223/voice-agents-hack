@@ -185,6 +185,31 @@ python main.py
 
 Hold **Option** (or click the menu bar button) and speak your command.
 
+On **first launch**, Ali builds a laptop-wide disk index (~1–5 min depending on
+how much is in your home directory). The index lives at `~/.cache/ali/index/`
+and is reused on subsequent runs. To force a rebuild:
+
+```bash
+python main.py --rebuild-index
+```
+
+…or click **Rebuild Index…** in the menu bar.
+
+With the index in place Ali can answer questions grounded in your files,
+entirely on-device via Gemma 4 (Cactus):
+
+- "Who am I?" → answered from your macOS user info + Contacts Me card.
+- "What's my email?"
+- "When did I last update my resume?"
+- "What does my contract say about termination?"
+- "Summarize my notes about OKRs."
+
+Cloud fallback (Gemini) is opt-in:
+
+```bash
+export ALI_ALLOW_CLOUD_FALLBACK=1
+```
+
 ---
 
 ## Safety / Dry Run

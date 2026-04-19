@@ -119,3 +119,30 @@ FILE_WALK_MAX_FILES = _env_int("VOICE_AGENT_FILE_WALK_MAX_FILES", 500)
 FILE_WALK_MAX_DEPTH = _env_int("VOICE_AGENT_FILE_WALK_MAX_DEPTH", 4)
 
 FILE_RESOLVE_DEBUG = _env_bool("VOICE_AGENT_FILE_RESOLVE_DEBUG", False)
+
+# ── Disk index (laptop-wide content + embeddings) ────────────────────────────
+# Local-first retrieval-augmented Q&A over the user's files. Default config
+# scans the whole home directory + /Applications with a deny-list for
+# caches, node_modules, Library, etc. The index lives under ~/.cache/ali.
+
+INDEX_DIR: Path = Path(os.path.expanduser(
+    os.environ.get("ALI_INDEX_DIR", "~/.cache/ali/index")
+))
+
+INDEX_SCAN_ROOTS: list[Path] = _parse_search_roots(
+    os.environ.get(
+        "ALI_INDEX_SCAN_ROOTS",
+        "~,/Applications",
+    )
+)
+
+INDEX_MAX_FILE_BYTES = _env_int("ALI_INDEX_MAX_FILE_BYTES", 5_000_000)
+INDEX_EMBED_MODEL = os.environ.get(
+    "ALI_INDEX_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+)
+INDEX_CHUNK_TOKENS = _env_int("ALI_INDEX_CHUNK_TOKENS", 400)
+INDEX_ENABLE_EMBEDDINGS = _env_bool("ALI_INDEX_EMBEDDINGS", True)
+
+# Local-first RAG. Default: 100% on-device via Cactus/Gemma 4. Set to 1 to
+# allow falling back to Gemini if Cactus is unavailable for answer generation.
+ALI_ALLOW_CLOUD_FALLBACK = _env_bool("ALI_ALLOW_CLOUD_FALLBACK", False)
