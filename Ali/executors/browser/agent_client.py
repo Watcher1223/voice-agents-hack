@@ -19,6 +19,18 @@ from typing import Any, Literal
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+# Load Ali/.env so GEMINI_API_KEY and friends propagate to the Node
+# subprocess (which uses them to push LLM config to the extension).
+# Safe no-op if dotenv/.env are absent.
+try:
+    from dotenv import load_dotenv  # type: ignore
+    from pathlib import Path as _Path
+    _ENV_PATH = _Path(__file__).resolve().parents[2] / ".env"
+    if _ENV_PATH.exists():
+        load_dotenv(_ENV_PATH)
+except Exception:
+    pass
+
 
 TaskState = Literal[
     "running",

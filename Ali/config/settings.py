@@ -23,8 +23,7 @@ DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 CACTUS_API_KEY = os.environ.get("CACTUS_API_KEY", "")
 
 # ── Cactus / Gemma 4 ─────────────────────────────────────────────────────────
-# CACTUS_GEMMA4_MODEL = "google/gemma-4-E2B-it"
-CACTUS_GEMMA4_MODEL = "google/functiongemma-270m-it"
+CACTUS_GEMMA4_MODEL = "google/gemma-4-E2B-it"
 
 # ── Cactus VL (browser sub-agent) ────────────────────────────────────────────
 # The browser sub-agent runs inside a Chrome extension whose LLM is configured

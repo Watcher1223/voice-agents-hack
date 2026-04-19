@@ -181,6 +181,33 @@ async function send(message: NativeMessage): Promise<void> {
   await connection.send(message);
 }
 
+// Push LLM config (API key + provider settings) to the extension via the
+// relay. Sourced from the env the parent process handed us — in practice
+// Ali/.env → Python LocalAgentClient → spawn(node). Lets users rotate keys
+// without touching chrome.storage.local directly.
+async function pushLlmConfig(): Promise<void> {
+  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+  if (!apiKey) {
+    console.error("[MCP] No GEMINI_API_KEY in env — skipping config push (extension uses its stored key)");
+    return;
+  }
+  const payload = {
+    provider: "google",
+    apiBaseUrl: "https://generativelanguage.googleapis.com/v1beta/models",
+    model: process.env.LLM_MODEL || "gemini-2.5-flash",
+    maxTokens: 8192,
+    apiKey,
+  };
+  try {
+    await send({ type: "mcp_save_config", payload } as any);
+    console.error(
+      `[MCP] Pushed LLM config to extension (provider=google, model=${payload.model}, apiKey=…${apiKey.slice(-4)})`,
+    );
+  } catch (err: any) {
+    console.error(`[MCP] pushLlmConfig failed: ${err.message}`);
+  }
+}
+
 async function callTextModel(systemText: string, userText: string, maxTokens = 700): Promise<string> {
   const response = await callLLM({
     messages: [{ role: "user", content: userText }],
@@ -450,6 +477,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
+        // Sync config on every start so a rotated key (Ali/.env) takes effect
+        // without restarting the server or touching chrome.storage.local.
+        await pushLlmConfig();
+
         // Check concurrency
         const activeCount = [...sessions.values()].filter((s) => s.status === "running").length;
         if (activeCount >= MAX_CONCURRENT) {
@@ -627,6 +658,7 @@ async function main() {
   try {
     if (await checkExtensionOnce()) {
       console.error("[MCP] Extension connected — ready for tasks");
+      await pushLlmConfig();
     } else {
       console.error("[MCP] Extension not connected — will retry when tasks arrive");
     }

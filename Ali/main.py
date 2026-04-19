@@ -99,6 +99,26 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 print("\n─── New command ───────────────────────────────")
                 overlay.push("transcript", f'"{transcript}"')
 
+                # 0 — Session-reset phrases end the active browser session,
+                #     if any, and return. Otherwise fall through.
+                if _is_session_reset(transcript):
+                    from voice.speak import speak
+                    if _browser_handle is not None:
+                        print("[browser] ■ session cancelled by user")
+                        await _reset_browser_session(orchestrator)
+                    overlay.push("done")
+                    speak("Okay, stopped.")
+                    return
+
+                # 1 — If a browser session is active, every utterance extends
+                #     it — no classification. This is what gives chained
+                #     commands the CLI feel ("open linkedin" → "now show my
+                #     inbox" → "reply to hanzi").
+                if _browser_handle is not None:
+                    print(f"[browser] extending session {_browser_handle} — skipping classifier")
+                    await _route_to_browser(transcript, orchestrator, overlay, menu_bar)
+                    return
+
                 # 2 — Parse intent
                 menu_bar.set_status("parsing intent")
                 print("[2/3] Parsing intent...")
@@ -163,10 +183,12 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 menu_bar.set_status("running")
                 overlay.push("action", f"Running: {goal_label}…")
 
-                if intent.goal.value == "open_url":
-                    from voice.speak import speak
-                    url = _intent_url(intent) or "https://mail.google.com"
-                    _open_url_local(url)
+                # Browser-shaped intents (open_url, apply_to_job, anything the
+                # parser flagged requires_browser=True) all enter the same
+                # persistent session. Intent metadata is used only to route;
+                # the agent receives the raw transcript so it can interpret
+                # "open my linking" as "linkedin" itself.
+                if _is_browser_intent(intent):
                     # #region agent log
                     try:
                         import json as _j, os as _o, time as _t
@@ -174,17 +196,15 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                         _o.makedirs(_o.path.dirname(_p), exist_ok=True)
                         with open(_p, "a") as _f:
                             _f.write(_j.dumps({"sessionId":"4ea166","hypothesisId":"H11",
-                                "location":"main:open_url_local",
-                                "message":"opened URL locally (no vision planner)",
-                                "data":{"url": url},
+                                "location":"main:browser_session_dispatch",
+                                "message":"routing utterance to persistent browser session",
+                                "data":{"goal": intent.goal.value, "cold_start": not _browser_active},
                                 "timestamp": int(_t.time()*1000)})+"\n")
                             _f.flush()
                     except Exception:
                         pass
                     # #endregion
-                    print(f"      ✓ Opened {url}")
-                    overlay.push("done")
-                    speak("Opened.")
+                    await _route_to_browser(transcript, orchestrator, overlay, menu_bar)
                     return
 
                 revealed_name: str | None = None
@@ -324,6 +344,113 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
 
 
 _active_meeting: "MeetingCapture | None" = None  # type: ignore[name-defined]
+
+# Persistent browser sub-agent session. One session spans many voice
+# utterances so follow-ups ("now open my inbox", "reply to this person")
+# reuse the existing agent loop + tab state, mirroring llm-in-chrome's CLI.
+# The MCP server generates its own session id on browser_start — we capture
+# it from the returned status and reuse it for subsequent browser_message
+# calls until the session ends or the user says a reset phrase.
+_browser_handle: str | None = None
+
+_SESSION_RESET_PHRASES = {
+    "stop", "stop it", "cancel", "cancel that",
+    "never mind", "nevermind",
+    "new task", "new command", "new session",
+    "start over", "restart",
+    "done", "that's all", "thats all", "that is all",
+}
+
+
+def _is_session_reset(transcript: str) -> bool:
+    t = (transcript or "").strip().lower().rstrip(".!?")
+    return t in _SESSION_RESET_PHRASES
+
+
+def _is_browser_intent(intent) -> bool:
+    """Cold-start heuristic: does this utterance belong to the browser session?"""
+    from intent.schema import KnownGoal
+    if getattr(intent, "requires_browser", False):
+        return True
+    return intent.goal in {KnownGoal.OPEN_URL, KnownGoal.APPLY_TO_JOB}
+
+
+async def _route_to_browser(transcript: str, orchestrator, overlay, menu_bar) -> None:
+    """Start or continue the persistent browser session with the given utterance.
+
+    The MCP server's browser_start/browser_message both block until the
+    session reaches a terminal state (complete, awaiting_confirmation,
+    error, cancelled, timeout). So each call is one round-trip; we don't
+    poll. After `complete`, the session stays alive so the next voice
+    command can extend it via browser_message.
+    """
+    global _browser_handle
+    from voice.speak import speak
+    from ui.confirmation import ask_confirmation
+
+    client = orchestrator._browser_agent
+    menu_bar.set_status("running")
+    overlay.push("action", "Browsing…")
+
+    async def _turn(text: str):
+        """One round-trip: start a new session or push a message to the
+        existing one. Returns the terminal TaskStatus for this turn."""
+        global _browser_handle
+        if _browser_handle is None:
+            print(f"[browser] ▶ start: {text[:120]}")
+            status = await client.run_task(task=text, session_id="")
+            _browser_handle = status.id
+            return status
+        print(f"[browser] ↪ continue {_browser_handle}: {text[:120]}")
+        status = await client.send_message(_browser_handle, text)
+        # Session disappeared between turns (server restart, prior cancel).
+        # Start fresh with the same utterance so the user doesn't notice.
+        if status.state == "error" and "not found" in (status.error or "").lower():
+            print(f"[browser] session {_browser_handle} missing — restarting")
+            _browser_handle = None
+            status = await client.run_task(task=text, session_id="")
+            _browser_handle = status.id
+        return status
+
+    try:
+        status = await _turn(transcript)
+        while status.state == "awaiting_confirmation":
+            summary = status.confirmation.summary if status.confirmation else "Proceed?"
+            payload = status.confirmation.payload if status.confirmation else {}
+            detail = "\n".join(f"  {k}: {v}" for k, v in (payload or {}).items())
+            approved = await ask_confirmation(f"{summary}\n{detail}\n\nProceed?")
+            status = await _turn("yes, proceed" if approved else "no, cancel")
+            if not approved:
+                overlay.push("done")
+                return
+
+        if status.state == "complete":
+            answer = (status.answer or "").strip() or "Done."
+            print(f"[browser] ✓ session={_browser_handle} answer={answer[:200]}")
+            overlay.push("assistant", answer[:400])
+            speak(answer[:400])
+            # Keep _browser_handle set; next utterance extends the session.
+            return
+
+        # error / cancelled / timeout — session is terminal.
+        print(f"[browser] session {_browser_handle} ended: {status.state} {status.error!r}")
+        _browser_handle = None
+        overlay.push("error", status.error or f"Browser {status.state}")
+        speak("Something went wrong.")
+    except Exception:
+        _browser_handle = None
+        raise
+
+
+async def _reset_browser_session(orchestrator) -> None:
+    global _browser_handle
+    if _browser_handle is None:
+        return
+    try:
+        await orchestrator._browser_agent.cancel(_browser_handle)
+    except Exception:
+        pass
+    _browser_handle = None
 
 
 async def _run_meeting_capture(overlay, menu_bar) -> None:
