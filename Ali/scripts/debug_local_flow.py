@@ -280,9 +280,7 @@ async def main() -> int:
             orchestrator_module.ask_confirmation = _always_approve
             print("[debug] Confirmation gate: auto-approve enabled")
         print("[debug] Executing orchestrator...")
-        orchestrator = Orchestrator(
-            vision_loop_enabled=not args.no_vision_loop,
-        )
+        orchestrator = Orchestrator()
         await orchestrator.run(intent)
     else:
         print("[debug] Skipping execution (pass --execute to run orchestrator).")

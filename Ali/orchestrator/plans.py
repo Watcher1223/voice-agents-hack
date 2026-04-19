@@ -82,11 +82,24 @@ PLANS: dict[str, list[dict]] = {
 
     KnownGoal.ADD_CALENDAR_EVENT: [
         {
+            # Note: calendar attachments are not wired via AppleScript today.
+            # A future integration should use EventKit for attachment support.
             "name": "Create calendar event",
             "executor": "local",
             "action": "create_calendar_event",
             "params": {"title": "$title", "date": "$date", "time": "$time", "attendees": "$attendees"},
             "confirm": True,
+            "on_failure": "ask_user",
+        },
+    ],
+
+    KnownGoal.FIND_FILE: [
+        {
+            "name": "Reveal file in Finder",
+            "executor": "local",
+            "action": "run_script",
+            "params": {"name": "reveal_in_finder", "args": {"path": "$found"}},
+            "confirm": False,
             "on_failure": "ask_user",
         },
     ],
@@ -113,6 +126,10 @@ VISION_GOAL_HINTS: dict[str, dict] = {
     KnownGoal.ADD_CALENDAR_EVENT: {
         "target_app": "Calendar",
         "irreversible_action": "create_calendar_event",
+    },
+    KnownGoal.FIND_FILE: {
+        "target_app": "Finder",
+        "preferred_script": "reveal_in_finder",
     },
 }
 

@@ -37,11 +37,14 @@ Given a voice transcript, output a JSON object with EXACTLY these fields:
 {
   "goal": one of [apply_to_job, send_message, send_email, add_calendar_event, open_url, find_file, unknown],
   "target": {"type": "url_or_search|contact|file", "value": "..."},
-  "uses_local_data": ["resume" | "cover_letter" | "contacts" | "calendar" | ...],
+  "uses_local_data": ["resume" | "cover_letter" | "attachment" | "document" | "deck" | "contacts" | "calendar" | ...],
   "requires_browser": true|false,
   "requires_submission": true|false,
-  "slots": { ...goal-specific key-value pairs extracted from the transcript... }
+  "slots": { ...goal-specific key-value pairs extracted from the transcript, including "file_query" when the user references a file... }
 }
+Use "find_file" for requests like "find my resume", "where is X", "open my deck".
+Include "attachment" / "document" / "deck" in uses_local_data whenever the
+user asks to attach, send, or email a file.
 Output ONLY the JSON. No explanation."""
 
 
@@ -172,6 +175,37 @@ def _extract_contact_and_body(transcript: str) -> tuple[str, str]:
     return contact, body
 
 
+_FIND_FILE_TRIGGERS = (
+    "find my ",
+    "find the ",
+    "where is my ",
+    "where's my ",
+    "show me my ",
+    "open my ",
+    "reveal my ",
+    "locate my ",
+)
+
+_ATTACHMENT_TRIGGERS = (
+    "attach ",
+    "attachment",
+    "send me the ",
+    "email me the ",
+    "email me my ",
+    "send the file",
+)
+
+
+def _extract_file_query(transcript: str, trigger: str) -> str:
+    lower = transcript.lower()
+    idx = lower.find(trigger)
+    if idx < 0:
+        return transcript.strip()
+    tail = transcript[idx + len(trigger) :].strip()
+    # Trim trailing punctuation.
+    return tail.rstrip(".?! ").strip() or transcript.strip()
+
+
 def _rule_based_parse(transcript: str) -> IntentObject:
     """Keyword fallback covering the three core demo flows."""
     t = transcript.lower()
@@ -186,6 +220,19 @@ def _rule_based_parse(transcript: str) -> IntentObject:
             slots={"company": "YC", "batch": "Fall 2026"},
             raw_transcript=transcript,
         )
+
+    for trigger in _FIND_FILE_TRIGGERS:
+        if trigger in t:
+            query = _extract_file_query(transcript, trigger)
+            return IntentObject(
+                goal=KnownGoal.FIND_FILE,
+                target={"type": "file", "value": query},
+                uses_local_data=[],
+                requires_browser=False,
+                requires_submission=False,
+                slots={"file_query": query},
+                raw_transcript=transcript,
+            )
 
     if any(kw in t for kw in ["text", "message", "imessage"]):
         contact, body = _extract_contact_and_body(transcript)
@@ -207,6 +254,22 @@ def _rule_based_parse(transcript: str) -> IntentObject:
             requires_browser=False,
             requires_submission=True,
             slots={"title": transcript},
+            raw_transcript=transcript,
+        )
+
+    if any(kw in t for kw in ["email", "mail"]) and any(trig in t for trig in _ATTACHMENT_TRIGGERS):
+        file_query = transcript.strip()
+        for trig in _ATTACHMENT_TRIGGERS:
+            if trig in t:
+                file_query = _extract_file_query(transcript, trig)
+                break
+        return IntentObject(
+            goal=KnownGoal.SEND_EMAIL,
+            target={"type": "contact", "value": ""},
+            uses_local_data=["attachment"],
+            requires_browser=False,
+            requires_submission=True,
+            slots={"file_query": file_query},
             raw_transcript=transcript,
         )
 
