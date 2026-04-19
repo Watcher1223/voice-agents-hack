@@ -530,41 +530,110 @@ async def _run_ambient_capture(overlay) -> None:
 
 async def _execute_ambient_action(analysis, overlay) -> None:
     """Route a confirmed (or safe) ambient tier-3 action through the
-    existing execution paths: opencli for adapters, browser_task for
-    browser utterances, orchestrator for local goals."""
+    TWO paths we actually ship: opencli adapters + local AppleScript /
+    filesystem. No browser_task here — ambient only promises what we
+    can deliver reliably."""
     from observer.agent_log import log as agent_log
     action = analysis.action or {}
     kind = action.get("kind", "").lower()
     text = action.get("text", "").strip()
+    slots = action.get("slots") or {}
     headline = analysis.headline.strip()
-    agent_log("ambient:exec", f"kind={kind} text={text[:80]} head={headline[:80]}")
+    detail = (analysis.detail or "").strip()
+    agent_log("ambient:exec", f"kind={kind} text={text[:80]} slots={list(slots)[:6]}")
 
     try:
         if kind == "opencli":
             await _execute_ambient_opencli(text, overlay, headline)
             return
-        if kind == "browser_task":
-            from orchestrator.orchestrator import Orchestrator
-            orchestrator = Orchestrator()
-            await _route_to_browser(text, orchestrator, overlay, None)
-            return
         if kind == "local":
-            from intent.meeting_intelligence import item_to_intent
-            from orchestrator.orchestrator import Orchestrator
-            orchestrator = Orchestrator()
-            intent = item_to_intent({"task": headline, "type": text, "slots": {}})
-            if intent.goal.value == "unknown":
-                overlay.push("ambient_ack", f"✗ could not map {text!r} to a local goal")
-                agent_log("ambient:exec", f"unmapped local goal {text!r}")
-                return
-            await orchestrator.run(intent)
-            overlay.push("ambient_ack", f"✓ {headline[:160]}")
-            agent_log("ambient:exec", f"done {headline[:120]}")
+            await _execute_ambient_local(text, slots, headline, detail, overlay)
             return
-        overlay.push("ambient_ack", f"✗ unknown action kind {kind!r}")
+        overlay.push("ambient_ack", f"✗ unsupported action kind {kind!r}")
+        agent_log("ambient:exec", f"unsupported kind={kind}")
     except Exception as e:
         agent_log("ambient:exec", f"FAILED {headline[:80]}: {e}")
         overlay.push("ambient_ack", f"✗ {headline[:140]}: {e}")
+
+
+async def _execute_ambient_local(
+    text: str, slots: dict, headline: str, detail: str, overlay
+) -> None:
+    """Direct dispatch from ambient action_text → AppleScript / filesystem.
+    Skips the vision planner + orchestrator.run, which would otherwise
+    route most goals to the browser sub-agent."""
+    from executors.local.applescript import AppleScriptExecutor
+    from executors.local.filesystem import FilesystemExecutor
+    from observer.agent_log import log as agent_log
+    import subprocess
+
+    applescript = AppleScriptExecutor()
+
+    if text == "compose_mail":
+        to = str(slots.get("to", "")).strip()
+        subject = str(slots.get("subject", headline[:80])).strip()
+        body = str(slots.get("body", detail or "")).strip()
+        # If there's no recipient, still open Mail.app with subject/body so
+        # the user can type the To: field. compose_mail defaults send=False,
+        # which just activates the draft window — the user reviews + sends.
+        applescript.compose_mail(to=to, subject=subject, body=body, send=False)
+        overlay.push("ambient_ack", f"✓ Mail draft: {subject[:80] or 'new message'}")
+        agent_log("ambient:local:done", f"compose_mail to={to!r} subject={subject[:60]!r}")
+        return
+
+    if text == "send_imessage":
+        contact = str(slots.get("contact", "")).strip()
+        body = str(slots.get("body", detail or headline)).strip()
+        if not contact:
+            overlay.push("ambient_ack", "✗ send_imessage: missing contact")
+            return
+        resolved = applescript.resolve_contact(contact) or contact
+        applescript.send_imessage(contact=resolved, body=body)
+        overlay.push("ambient_ack", f"✓ iMessage sent to {contact}")
+        agent_log("ambient:local:done", f"send_imessage to={contact!r}")
+        return
+
+    if text == "create_calendar_event":
+        title = str(slots.get("title", headline[:80])).strip()
+        date = str(slots.get("date", "")).strip()
+        time_ = str(slots.get("time", "")).strip()
+        attendees = slots.get("attendees") or []
+        if not isinstance(attendees, list):
+            attendees = []
+        if not date:
+            overlay.push("ambient_ack", "✗ calendar: no date inferred")
+            return
+        applescript.create_calendar_event(
+            title=title, date=date, time=time_, attendees=attendees
+        )
+        overlay.push("ambient_ack", f"✓ calendar: {title[:80]} · {date} {time_}")
+        agent_log("ambient:local:done", f"calendar title={title!r} {date} {time_}")
+        return
+
+    if text == "find_file":
+        query = str(slots.get("file_query", "")).strip()
+        fs = FilesystemExecutor()
+        path = fs.find_by_alias(query) if query else None
+        if path:
+            subprocess.run(["open", "-R", path], check=False)
+            overlay.push("ambient_ack", f"✓ revealed: {path}")
+            agent_log("ambient:local:done", f"find_file {query!r} → {path}")
+        else:
+            overlay.push("ambient_ack", f"✗ no file for {query!r}")
+        return
+
+    if text == "open_url":
+        url = str(slots.get("url", "")).strip()
+        if not url:
+            overlay.push("ambient_ack", "✗ open_url: no URL")
+            return
+        subprocess.run(["open", url], check=False)
+        overlay.push("ambient_ack", f"✓ opened {url}")
+        agent_log("ambient:local:done", f"open_url {url}")
+        return
+
+    overlay.push("ambient_ack", f"✗ unsupported local goal {text!r}")
+    agent_log("ambient:exec", f"unsupported local goal {text!r}")
 
 
 async def _execute_ambient_opencli(text: str, overlay, headline: str) -> None:

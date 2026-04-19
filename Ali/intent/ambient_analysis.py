@@ -53,27 +53,63 @@ Apply this decision hierarchy IN ORDER. Stop at the first tier that fires.
       - any acronym whose meaning isn't in the transcript
 
   TIER 3 — suggest a concrete action.
-    The conversation implies the user should do something NOW (send an
-    email, open a site, find a file). Proposed action should be
-    executable by one of: opencli adapter, browser task, local desktop.
+    The conversation implies the user should do something NOW. Emit the
+    action ONLY if it maps to one of the two execution paths we ship:
+
+    (A) kind='opencli' — for read-only lookups. action_text is the
+        space-separated command. Available adapters:
+          hackernews top | hackernews search <query>
+          google search <query> | google news
+          wikipedia search <query>
+          producthunt today
+          reddit hot
+          linkedin timeline
+          arxiv search <query>
+
+    (B) kind='local' — for local desktop actions via AppleScript /
+        Spotlight. Set action_text to exactly one of:
+          compose_mail           — opens Mail.app with a draft (does
+                                    NOT auto-send; user clicks Send).
+                                    Emit slots: to, subject, body.
+          send_imessage          — sends an iMessage now (IS
+                                    auto-sent). Emit slots: contact,
+                                    body.
+          create_calendar_event  — creates a Calendar event.
+                                    Emit slots: title, date, time,
+                                    attendees (list, optional).
+          find_file              — Spotlight search. Emit slots:
+                                    file_query.
+          open_url               — opens a URL in default browser.
+                                    Emit slots: url.
+
+    If the right answer is ANYTHING outside that list (post on
+    LinkedIn, reply to a specific Gmail thread, schedule over
+    Calendly, etc.), emit tier 4 instead. Do not invent capabilities
+    we don't have — the demo depends on the agent only promising
+    what it can deliver.
 
   TIER 4 — stay silent.
     Nothing above fires, or you would be repeating yourself.
 
 OUTPUT SCHEMA — emit a SINGLE JSON object. No prose. No markdown fences.
 Required keys:
-  tier:       integer 1-4
-  headline:   string, <=100 chars. MUST be non-empty for tiers 1-3,
-              MUST be empty string for tier 4.
-  detail:     string, 1-2 sentences. MUST be non-empty for tiers 1-2,
-              may be empty for tiers 3/4.
-  action_kind: string — one of "opencli","browser_task","local","none".
-              Use "none" for tiers 1/2/4.
-  action_text: string — the concrete action. For opencli, a space-
-              separated command like "wikipedia search IRR".
-              For browser_task, a one-sentence task.
-              For local, a goal name like "send_email" or "find_file".
-              Empty string when action_kind="none".
+  tier:        integer 1-4
+  headline:    string, <=100 chars. MUST be non-empty for tiers 1-3,
+               MUST be empty string for tier 4.
+  detail:      string, 1-2 sentences. MUST be non-empty for tiers 1-2,
+               may be empty for tiers 3/4.
+  action_kind: string — one of "opencli", "local", "none". Use "none"
+               for tiers 1/2/4.
+  action_text: string — the concrete command/goal as described above.
+               Empty string when action_kind="none".
+  action_slots: object — per-goal parameters. Empty object when not
+               applicable. Examples:
+                 {"to":"hanzi@example.com","subject":"Re: pitch deck",
+                  "body":"Got it, will send tonight."}     (compose_mail)
+                 {"contact":"Hanzi","body":"running late"} (send_imessage)
+                 {"title":"Pitch review","date":"2026-04-20","time":"15:00"}
+                 {"file_query":"pitch deck pdf"}           (find_file)
+                 {"url":"https://news.ycombinator.com"}    (open_url)
 
 Rules:
 - Do NOT repeat anything in the previous analysis if one is provided.
@@ -214,9 +250,10 @@ async def analyse(
     detail = str(data.get("detail") or "").strip()
     kind = str(data.get("action_kind") or "none").strip().lower()
     action_text = str(data.get("action_text") or "").strip()
+    slots = data.get("action_slots") if isinstance(data.get("action_slots"), dict) else {}
     action: dict[str, Any] | None = None
     if kind != "none" and action_text:
-        action = {"kind": kind, "text": action_text}
+        action = {"kind": kind, "text": action_text, "slots": slots or {}}
     return AmbientAnalysis(
         tier=tier if 1 <= tier <= 4 else 4,
         headline=headline,

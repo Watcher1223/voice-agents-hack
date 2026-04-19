@@ -91,11 +91,19 @@ def item_to_intent(item: dict[str, Any]):
     from intent.schema import IntentObject, KnownGoal
 
     type_to_goal = {
-        "draft_email":   KnownGoal.SEND_EMAIL,
-        "send_message":  KnownGoal.SEND_MESSAGE,
-        "find_file":     KnownGoal.FIND_FILE,
-        "open_url":      KnownGoal.OPEN_URL,
-        "book_flight":   KnownGoal.OPEN_URL,
+        # ambient prompt emits snake_case action_text; legacy meeting mode
+        # emitted the longer verbs. Accept both so either path maps.
+        "draft_email":            KnownGoal.SEND_EMAIL,
+        "send_email":             KnownGoal.SEND_EMAIL,
+        "compose_email":          KnownGoal.SEND_EMAIL,
+        "compose_mail":           KnownGoal.SEND_EMAIL,
+        "send_message":           KnownGoal.SEND_MESSAGE,
+        "send_imessage":          KnownGoal.SEND_MESSAGE,
+        "find_file":              KnownGoal.FIND_FILE,
+        "open_url":               KnownGoal.OPEN_URL,
+        "book_flight":            KnownGoal.OPEN_URL,
+        "add_calendar_event":     KnownGoal.ADD_CALENDAR_EVENT,
+        "create_calendar_event":  KnownGoal.ADD_CALENDAR_EVENT,
     }
     goal    = type_to_goal.get(item.get("type", ""), KnownGoal.UNKNOWN)
     task    = item.get("task", "")
