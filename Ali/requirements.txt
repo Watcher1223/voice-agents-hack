@@ -18,6 +18,12 @@ types-pynput>=1.7.6
 # Speech-to-text fallback (used when Cactus STT is unavailable)
 faster-whisper>=1.0.0
 
+# Deepgram streaming STT — used by ambient listen + meeting capture.
+# When missing, the AmbientCapture worker thread dies immediately with
+# `ModuleNotFoundError: No module named 'deepgram'` and the task
+# checklist stays empty.
+deepgram-sdk>=3.0,<5
+
 # Intent parsing — Gemini API (fast text inference; audio STT stays on-device)
 google-genai>=1.0.0
 

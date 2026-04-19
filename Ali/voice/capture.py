@@ -106,6 +106,11 @@ CONV_RMS_THRESHOLD = 180.0
 CONV_SILENCE_SEC = 0.88
 CONV_MIN_VOICE_SEC = 0.38
 CONV_MAX_SEC = 10.0
+# Abort early if the user never starts speaking after a wake trigger.
+# Happens when wake-word fires on a fragment (e.g. "open my") of an
+# utterance the user has already finished — we'd otherwise sit silent
+# for the full CONV_MAX_SEC.
+CONV_NO_VOICE_GRACE_SEC = 2.5
 
 
 def _pcm16_rms(data: bytes) -> float:
@@ -149,6 +154,11 @@ def _record_conversational(
             if (now - voice_since) >= CONV_MIN_VOICE_SEC and (now - last_loud) >= CONV_SILENCE_SEC:
                 end_reason = "silence_after_voice"
                 break
+        elif (now - t0) >= CONV_NO_VOICE_GRACE_SEC:
+            # Nothing said in the grace window — bail so Ali doesn't
+            # sit frozen after a stray wake trigger.
+            end_reason = "no_voice_start"
+            break
     # #region agent log
     _dlog(
         "capture:_record_conversational",

@@ -20,7 +20,7 @@ import shutil
 from urllib.parse import quote_plus
 
 from intent.schema import IntentObject, KnownGoal
-from config.settings import CACTUS_GEMMA4_MODEL, GEMINI_API_KEY
+from config.settings import CACTUS_INTENT_MODEL, GEMINI_API_KEY
 
 
 # #region agent log
@@ -52,6 +52,11 @@ except ImportError:
 
 CACTUS_CLI = shutil.which("cactus")
 CACTUS_AVAILABLE = CACTUS_CLI is not None
+
+# Sticky: once Gemini says the account is out of quota / over rate limit,
+# skip it for the rest of the session instead of paying the round-trip
+# (and dumping a multi-line error) on every command.
+_GEMINI_DISABLED_THIS_SESSION = False
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an intent classifier for a voice agent called Ali.
@@ -146,7 +151,8 @@ async def parse_intent(transcript: str) -> IntentObject:
       2. Cactus  — on-device fallback when Gemini is unavailable
       3. Rule-based  — last-ditch offline fallback (keyword heuristics)
     """
-    if GEMINI_AVAILABLE:
+    global _GEMINI_DISABLED_THIS_SESSION
+    if GEMINI_AVAILABLE and not _GEMINI_DISABLED_THIS_SESSION:
         try:
             gem = await _parse_with_gemini(transcript)
             # #region agent log
@@ -159,12 +165,18 @@ async def parse_intent(transcript: str) -> IntentObject:
             # #endregion
             return gem
         except Exception as e:
-            print(f"[intent] Gemini failed ({e}), trying Cactus")
+            err_str = str(e)
+            if "RESOURCE_EXHAUSTED" in err_str or "429" in err_str or "quota" in err_str.lower():
+                _GEMINI_DISABLED_THIS_SESSION = True
+                print("[intent] Gemini quota exhausted → Cactus for rest of session")
+            else:
+                print(f"[intent] Gemini failed ({e}), trying Cactus")
             # #region agent log
             _dlog(
                 "intent:parse_intent:gemini_error",
                 "gemini parse failed",
-                {"transcript": transcript, "err": str(e)[:180]},
+                {"transcript": transcript, "err": err_str[:180],
+                 "disabled_session": _GEMINI_DISABLED_THIS_SESSION},
                 "H12",
             )
             # #endregion
@@ -225,16 +237,34 @@ async def _parse_with_gemini(transcript: str) -> IntentObject:
     return _parse_json_response(raw, transcript)
 
 
+_CACTUS_PARSE_TIMEOUT_S = float(os.environ.get("ALI_CACTUS_INTENT_TIMEOUT_S", "8.0"))
+
+
 async def _parse_with_cactus(transcript: str) -> IntentObject:
     prompt = f"{SYSTEM_PROMPT}\n\nTranscript: {transcript}"
     # Keep CLI args minimal for broad cactus version compatibility.
     # Some installs reject "--max-tokens"/"--temperature" for `cactus run`.
     proc = await asyncio.create_subprocess_exec(
-        CACTUS_CLI, "run", CACTUS_GEMMA4_MODEL, "--prompt", prompt,
+        CACTUS_CLI, "run", CACTUS_INTENT_MODEL, "--prompt", prompt,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_CACTUS_PARSE_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        # Cactus on CPU with a 2B model can take 30s+. Kill and fall through
+        # to the rule-based parser so the user gets *something* quickly.
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"cactus timed out after {_CACTUS_PARSE_TIMEOUT_S:.0f}s "
+            f"(model={CACTUS_INTENT_MODEL})"
+        )
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode().strip())
     return _parse_json_response(stdout.decode(), transcript)

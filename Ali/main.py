@@ -138,18 +138,63 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
     from voice.capture import listen_for_command, request_ptt_session_from_wake
     from voice.wake_word import start_wake_word_listener
 
+    # Restore persisted checklist state before any listener kicks in.
+    # The click handler is registered unconditionally so the user can
+    # tick leftover tasks even in a PTT-only (ambient-off) session.
+    _hydrate_checklist_on_startup(overlay, agent_loop)
+
     # Ambient listen loop (glass-style) runs in parallel with PTT when the
     # flag is on. It does NOT intercept user commands — it only surfaces
     # suggestions (tier 1-3) into the overlay. PTT still works.
     from config.settings import AMBIENT_ENABLED
     if AMBIENT_ENABLED:
+        print(
+            "[ambient] enabled — loose utterances (no 'Ali' prefix) will be "
+            "parked on the task checklist.",
+            flush=True,
+        )
         agent_loop.create_task(_run_ambient_capture(overlay))
+    else:
+        print(
+            "[ambient] disabled — task checklist will stay empty. Set "
+            "VOICE_AGENT_AMBIENT=1 in .env (or export it) to capture "
+            "loose utterances.",
+            flush=True,
+        )
 
     async def _handle_transcript(transcript: str) -> None:
         async with command_lock:
             try:
                 print("\n─── New command ───────────────────────────────")
                 overlay.push("transcript", f'"{transcript}"')
+
+                # Multi-turn follow-up: if the previous turn asked for a
+                # missing slot (e.g. "What should I say?", "Where to?"),
+                # route this transcript to the stored resume callback
+                # instead of re-classifying it as a new command.
+                global _pending_followup
+                if _pending_followup is not None:
+                    import time as _t_mod
+                    from voice.speak import speak as _speak_fu
+
+                    pend = _pending_followup
+                    if _t_mod.monotonic() > pend["deadline"]:
+                        _pending_followup = None
+                        overlay.push("hidden")
+                    elif _match_any(transcript, _NO_TOKENS):
+                        _pending_followup = None
+                        on_cancel = pend.get("on_cancel")
+                        if on_cancel is not None:
+                            await on_cancel()
+                        else:
+                            overlay.push("done")
+                            _speak_fu("Okay, cancelled.")
+                        return
+                    else:
+                        _pending_followup = None
+                        resume = pend["resume"]
+                        await resume(transcript.strip().rstrip(".!?"))
+                        return
 
                 # 0 — Session-reset phrases end the active browser session,
                 #     if any, and return. Otherwise fall through.
@@ -262,6 +307,26 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     # #endregion
                     overlay.push("assistant", reply or "I didn't catch that.")
                     speak(reply or "I didn't catch that.")
+                    return
+
+                # send_message bypasses the browser sub-agent and the
+                # vision-first orchestrator — it fires an iMessage via
+                # AppleScript directly. Keep this ahead of the
+                # multi-action and browser-routing branches so "text
+                # Hanzi …" always hits the local path.
+                if intent.goal.value == "send_message":
+                    contact_raw = str(intent.slots.get("contact") or "").strip()
+                    body = str(intent.slots.get("body") or "").strip()
+                    if contact_raw.lower() == "unknown":
+                        contact_raw = ""
+                    await _run_send_message_flow(
+                        contact_raw,
+                        body,
+                        goal_label,
+                        overlay,
+                        menu_bar,
+                        request_ptt_session_from_wake,
+                    )
                     return
 
                 # 2.7 — Multi-action quick path. If a single utterance
@@ -462,11 +527,250 @@ _active_meeting: "MeetingCapture | None" = None  # type: ignore[name-defined]
 _ambient_capture: "AmbientCapture | None" = None  # type: ignore[name-defined]
 
 
-_pending_confirmation: dict | None = None  # {"analysis": ..., "deadline": float, "safety": ...}
-_PENDING_CONFIRMATION_WINDOW_S = 10.0
+# Ambient tier-3 suggestions no longer run through an immediate yes/no
+# confirmation pill — they're parked on the persistent task checklist
+# (see observer/task_checklist.py) and the user ticks or says "run 1"
+# to execute. _YES_TOKENS / _NO_TOKENS below are still used by the
+# multi-turn send_message follow-up in the PTT path.
+
+# Generic follow-up prompt framework. Any intent handler that needs a
+# missing slot (recipient, body, destination, date …) can push a prompt
+# via `_ask_followup`; the next transcript is routed to the stored
+# `resume` coroutine instead of being re-classified as a new command.
+# This keeps the "what should I say?" / "where to?" pattern consistent
+# across send_message, send_email, book_flight, add_calendar_event, etc.
+_pending_followup: dict | None = None
+# {
+#   "prompt": str,
+#   "resume": Callable[[str], Awaitable[None]],   # called with the answer
+#   "on_cancel": Callable[[], Awaitable[None]] | None,
+#   "deadline": float,                             # monotonic seconds
+#   "label": str,                                  # for logs
+# }
+_PENDING_FOLLOWUP_WINDOW_S = 30.0
 
 _YES_TOKENS = {"yes", "yeah", "yep", "sure", "do it", "go ahead", "confirm", "ok", "okay", "please", "please do"}
 _NO_TOKENS  = {"no", "nope", "skip", "not now", "cancel", "ignore", "never mind", "nevermind", "stop"}
+
+
+def _ask_followup(
+    prompt: str,
+    resume,
+    *,
+    overlay,
+    request_ptt,
+    on_cancel=None,
+    label: str = "followup",
+) -> None:
+    """Store a pending follow-up prompt and auto-start a PTT capture for
+    the answer. When the next transcript arrives, `_handle_transcript`
+    consumes the pending state and awaits `resume(transcript)`."""
+    import time as _t_mod
+
+    from voice.speak import speak
+
+    global _pending_followup
+    _pending_followup = {
+        "prompt": prompt,
+        "resume": resume,
+        "on_cancel": on_cancel,
+        "deadline": _t_mod.monotonic() + _PENDING_FOLLOWUP_WINDOW_S,
+        "label": label,
+    }
+    overlay.push("assistant", prompt)
+    speak(prompt)
+    request_ptt(overlay)
+
+
+async def _run_send_message_flow(
+    contact: str,
+    body: str,
+    goal_label: str,
+    overlay,
+    menu_bar,
+    request_ptt_session_from_wake,
+) -> None:
+    """Send an iMessage end-to-end. Prompts for missing contact/body and
+    auto-relistens via PTT so the user can just speak the answer. If the
+    body answer contains additional action verbs (e.g. "I'll be late,
+    and also book me a flight"), we let the multi-action extractor pull
+    out the extra items and run them alongside the iMessage."""
+    from executors.local.applescript import (
+        AppleScriptExecutionError,
+        AppleScriptExecutor,
+    )
+    from voice.speak import speak
+
+    contact = (contact or "").strip()
+    body = (body or "").strip()
+
+    if not contact:
+        async def _resume_contact(answer: str) -> None:
+            await _run_send_message_flow(
+                answer, body, goal_label, overlay, menu_bar,
+                request_ptt_session_from_wake,
+            )
+
+        _ask_followup(
+            "Who should I message?",
+            _resume_contact,
+            overlay=overlay,
+            request_ptt=request_ptt_session_from_wake,
+            label="send_message:contact",
+        )
+        return
+
+    if not body:
+        async def _resume_body(answer: str) -> None:
+            # If the body reply bundles extra actions ("I'll be late,
+            # and book me a flight to LA"), peel them off so we don't
+            # silently drop them.
+            extra_body = await _split_body_and_extra_actions(
+                contact, answer, overlay, menu_bar,
+            )
+            await _run_send_message_flow(
+                contact, extra_body, goal_label, overlay, menu_bar,
+                request_ptt_session_from_wake,
+            )
+
+        _ask_followup(
+            "What should I say?",
+            _resume_body,
+            overlay=overlay,
+            request_ptt=request_ptt_session_from_wake,
+            label="send_message:body",
+        )
+        return
+
+    print("[3/3] Executing...")
+    menu_bar.set_status("running")
+    overlay.push("action", f"Running: {goal_label}…")
+
+    applescript = AppleScriptExecutor()
+    address = contact
+    if "@" not in contact and not contact.startswith("+"):
+        try:
+            address = applescript.resolve_contact(contact)
+        except AppleScriptExecutionError as exc:
+            overlay.push("error", str(exc))
+            speak("I couldn't find that contact.")
+            return
+
+    try:
+        applescript.send_imessage(contact=address, body=body)
+    except AppleScriptExecutionError as exc:
+        overlay.push("error", str(exc))
+        speak("I couldn't send that message.")
+        return
+
+    overlay.push("assistant", f"✓ iMessage → {contact}: {body[:140]}")
+    speak("Sent.")
+
+
+async def _split_body_and_extra_actions(
+    contact: str, body_answer: str, overlay, menu_bar,
+) -> str:
+    """If `body_answer` looks like it contains multiple actions, run
+    `extract_action_items` on it to find other tasks; fire those via
+    the multi-action pipeline and return the cleaned message-body
+    (i.e. the send_message item's slots.body or task, or the first
+    clause if the extractor didn't find the message piece).
+
+    Returns `body_answer` unchanged when nothing extra is detected."""
+    if not _is_multi_action_candidate(body_answer):
+        return body_answer
+
+    from intent.meeting_intelligence import extract_action_items
+    # Re-cast the answer so the extractor sees explicit "text <contact>"
+    # framing — otherwise it may not realise the leading clause is a
+    # message body.
+    framed = f"text {contact}: {body_answer}"
+    try:
+        items = await extract_action_items(framed, [])
+    except Exception as exc:
+        print(f"[send_message] multi-action extraction failed: {exc}")
+        return body_answer
+
+    if not items:
+        return body_answer
+
+    message_body = body_answer
+    other_items: list[dict] = []
+    for it in items:
+        itype = str(it.get("type", "")).lower()
+        if itype in ("send_message", "send_imessage", "imessage"):
+            # Prefer the extractor's body slot; fall back to the short task label.
+            slots = it.get("slots") or {}
+            candidate = str(slots.get("body") or slots.get("key_points") or it.get("task") or "").strip()
+            if candidate:
+                message_body = candidate
+        else:
+            other_items.append(it)
+
+    if other_items:
+        print(f"[send_message] body contained {len(other_items)} extra action(s) — dispatching")
+        # Fire-and-forget the extras so we don't block the iMessage.
+        import asyncio as _aio
+        _aio.create_task(
+            _dispatch_extracted_items(other_items, overlay, menu_bar, f"text {contact}: {body_answer}")
+        )
+
+    return message_body
+
+
+async def _dispatch_extracted_items(
+    items: list[dict], overlay, menu_bar, transcript: str,
+) -> None:
+    """Run a pre-extracted list of action items through the same
+    machinery `_run_quick_multi_action` uses. Skips the extractor step
+    since we already have the items."""
+    from executors.meeting_tasks import search_flight, draft_email_in_gmail, TaskResult
+    from voice.speak import speak
+    import asyncio as _aio
+
+    browser_client = _get_meeting_browser_client()
+    browser_lock = _aio.Lock()
+
+    menu_bar.set_status("running")
+    overlay.push("meeting_start")
+    for item in items:
+        overlay.push("meeting_action", item.get("task", ""))
+
+    results_summary: list[str] = []
+
+    async def _run_one(item: dict) -> None:
+        task_label = item.get("task", "")
+        item_type = str(item.get("type", "")).lower()
+        slots = item.get("slots", {})
+        overlay.push("meeting_action_update", f"{task_label}|Running")
+        try:
+            if item_type == "book_flight":
+                dest = slots.get("destination") or "Los Angeles"
+                date = slots.get("date") or "Tuesday"
+                origin = slots.get("origin") or ""
+                result = await search_flight(browser_client, browser_lock, dest, date, origin)
+            elif item_type in ("draft_email", "send_email", "compose_email", "compose_mail"):
+                recipient = slots.get("recipient") or ""
+                subject = slots.get("subject") or "Follow-up"
+                key_points = slots.get("key_points") or ""
+                body = key_points or f"Hi {recipient},\n\nFollowing up per our conversation."
+                result = await draft_email_in_gmail(browser_client, browser_lock, recipient, subject, body)
+            else:
+                result = TaskResult(False, "unsupported", detail=f"type={item_type}")
+        except Exception as exc:
+            print(f"[extra-action] {task_label} failed: {exc}")
+            overlay.push("meeting_action_update", f"{task_label}|error")
+            return
+        overlay.push("meeting_action_update", f"{task_label}|{result.status_label()}")
+        if result.success:
+            results_summary.append(f"{task_label}: {result.summary}")
+
+    await _aio.gather(*(_run_one(it) for it in items))
+    overlay.push("meeting_stop")
+    menu_bar.set_status("ready")
+
+    if results_summary:
+        speak("Also handled " + "; ".join(s.split(":")[0] for s in results_summary) + ".")
 
 
 def _match_any(text: str, tokens: set[str]) -> bool:
@@ -479,14 +783,12 @@ def _match_any(text: str, tokens: set[str]) -> bool:
 
 
 async def _run_ambient_capture(overlay) -> None:
-    global _ambient_capture, _pending_confirmation
+    global _ambient_capture
     from voice.ambient_capture import AmbientCapture
     from voice.speak import speak
     from observer.screen_loop import ScreenObserver
     from observer.agent_log import log as agent_log
-    from intent.action_safety import classify as classify_safety
     from config.settings import AMBIENT_SCREEN_ENABLED, AMBIENT_SPEAK_ENABLED
-    import time
 
     # Voice is off by default. Flip VOICE_AGENT_AMBIENT_SPEAK=1 to re-enable
     # tier 1/2 spoken readback. (Meeting-detect gate removed — too finicky.)
@@ -495,37 +797,20 @@ async def _run_ambient_capture(overlay) -> None:
 
     agent_loop = asyncio.get_running_loop()
 
+    # Click handler for checklist rows is already wired in
+    # _hydrate_checklist_on_startup(); no re-registration needed here.
+
     def _on_interim(text: str) -> None:
         # Partial words only go to the log / console — never the overlay.
         pass
 
     def _on_final(text: str) -> None:
-        # Per feedback: stop flooding the overlay with every utterance.
-        # Finals are written to ~/.ali/agent.log by AmbientCapture already;
-        # the overlay should only show surfaced tiers + action progress,
-        # not a running transcript.
-        # Confirmation listener: if there's a pending action waiting on
-        # "yes" / "no", try to consume this final transcript.
-        global _pending_confirmation
-        pc = _pending_confirmation
-        if pc is None:
-            return
-        if time.monotonic() > pc["deadline"]:
-            _pending_confirmation = None
-            overlay.clear_pending_confirm()
-            overlay.push("ambient_ack", "✗ suggestion expired")
-            agent_log("ambient:expire", "confirmation window elapsed")
-            return
-        if _match_any(text, _YES_TOKENS):
-            agent_log("ambient:confirm", "via voice 'yes'")
-            _pending_confirmation = None
-            overlay.clear_pending_confirm()
-            agent_loop.create_task(_execute_ambient_action(pc["analysis"], overlay))
-        elif _match_any(text, _NO_TOKENS):
-            agent_log("ambient:dismiss", "via voice 'no'")
-            _pending_confirmation = None
-            overlay.clear_pending_confirm()
-            overlay.push("ambient_ack", "✗ dismissed")
+        # Ambient finals no longer flood the overlay. They serve one
+        # purpose now: voice commands to drive the checklist ("run 1",
+        # "run all", "skip 2", "clear tasks"). Everything else is silent.
+        handled = _handle_checklist_voice_command(text, overlay, agent_loop)
+        if handled:
+            agent_log("checklist:voice", f"handled {text!r}")
 
     def _on_suggestion(analysis) -> None:
         tier = analysis.tier
@@ -540,53 +825,18 @@ async def _run_ambient_capture(overlay) -> None:
                 speak(detail[:200])
             return
 
-        # Tier 3 — suggests a concrete action. Safety-check it.
+        # Tier 3 — suggests a concrete action. Rather than auto-exec or
+        # prompt for a "yes", park it on the persistent checklist and let
+        # the user tick it when they're ready. Enrich slots NOW so the
+        # label reads with real values (resolved email, file path, etc.).
         if tier == 3:
-            safety = classify_safety(analysis.action)
-            if safety == "safe":
-                # Auto-execute; no confirmation ceremony.
-                print(f"[ambient] auto-executing SAFE action: {analysis.action}")
-                overlay.push("assistant", f"→ {headline[:180]}")
-                agent_loop.create_task(_execute_ambient_action(analysis, overlay))
-                return
-
-            # NEEDS_CONFIRM — enrich NOW (not at execute time) so the user
-            # sees the resolved recipient, attachment, etc. on the pill
-            # before they commit. Store the enriched analysis in
-            # _pending_confirmation so we don't re-enrich on click.
-            enriched_analysis = _enrich_analysis_for_preview(analysis)
-            preview = _format_action_preview(enriched_analysis)
-
-            global _pending_confirmation
-            _pending_confirmation = {
-                "analysis": enriched_analysis,
-                "deadline": time.monotonic() + _PENDING_CONFIRMATION_WINDOW_S,
-                "safety": safety,
-            }
-            overlay.push("ambient_confirm", preview)
-
-            def _on_click_confirm() -> None:
-                global _pending_confirmation
-                pc = _pending_confirmation
-                if pc is None:
-                    return
-                agent_log("ambient:confirm", "via click")
-                _pending_confirmation = None
-                asyncio.run_coroutine_threadsafe(
-                    _execute_ambient_action(pc["analysis"], overlay),
-                    agent_loop,
-                )
-
-            def _on_click_dismiss() -> None:
-                global _pending_confirmation
-                if _pending_confirmation is None:
-                    return
-                agent_log("ambient:dismiss", "via right-click")
-                _pending_confirmation = None
-                overlay.push("ambient_ack", "✗ dismissed")
-
-            overlay.set_pending_confirm(_on_click_confirm, _on_click_dismiss)
-            agent_log("ambient:await-confirm", f"{headline[:100]} ({safety})")
+            enriched = _enrich_analysis_for_preview(analysis)
+            preview = _format_action_preview(enriched)
+            _add_checklist_task(overlay, enriched, preview)
+            agent_log(
+                "checklist:add",
+                f"{headline[:100]}  kind={(enriched.action or {}).get('kind')!r}",
+            )
             return
 
     screen = None
@@ -664,9 +914,9 @@ def _enrich_analysis_for_preview(analysis):
 
 
 def _format_action_preview(analysis) -> str:
-    """Build the text that goes on the yellow `ambient_confirm` pill.
-    Show exactly what will happen: recipient, subject, body preview,
-    attachment count. Under ~220 chars so it fits the overlay."""
+    """Build a short human-readable description of a tier-3 action. Used
+    as the fallback detail on a checklist row. Under ~220 chars so it
+    fits the overlay."""
     action = analysis.action or {}
     text = action.get("text", "").strip()
     slots = action.get("slots") or {}
@@ -698,7 +948,7 @@ def _format_action_preview(analysis) -> str:
     else:
         preview = head[:180]
 
-    return f"{preview}   · click to confirm · right-click to cancel"
+    return preview
 
 
 def _enrich_local_slots(
@@ -889,6 +1139,307 @@ async def _execute_ambient_opencli(text: str, overlay, headline: str) -> None:
         err = result.error_message()
         overlay.push("ambient_ack", f"✗ {err[:160]}")
         agent_log("tool:opencli:err", err[:160])
+
+
+# ── Task checklist ──────────────────────────────────────────────────────
+# Ambient-mode suggestions no longer execute on the spot. They accumulate
+# on a persistent checklist the user ticks (or speaks) to execute. The
+# functions below bridge the checklist model (observer/task_checklist) to
+# the overlay and the ambient executor.
+
+
+def _clip(s: str, n: int) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def _checklist_label_for(analysis, fallback: str) -> str:
+    """Build a short, actionable label for the checklist row. Falls
+    back to the headline when the action dict doesn't name recipient /
+    subject / etc."""
+    action = (analysis.action or {}) if analysis is not None else {}
+    text = str(action.get("text", "")).strip()
+    slots = action.get("slots") or {}
+    head = (analysis.headline.strip() if analysis else "") or fallback
+
+    if text in ("compose_mail", "send_email"):
+        to = _clip(str(slots.get("to") or "someone"), 40)
+        subj = _clip(str(slots.get("subject") or head), 40)
+        return f"Email {to} · {subj}"
+    if text in ("send_imessage", "send_message"):
+        contact = _clip(str(slots.get("contact") or "someone"), 40)
+        body = _clip(str(slots.get("body") or head), 40)
+        return f"iMessage {contact} · {body}"
+    if text in ("create_calendar_event", "add_calendar_event"):
+        title = _clip(str(slots.get("title") or head), 40)
+        when = str(slots.get("date") or "").strip()
+        return f"Calendar · {title}" + (f" · {when}" if when else "")
+    if text == "find_file":
+        q = _clip(str(slots.get("file_query") or head), 60)
+        return f"Find file · {q}"
+    if text == "open_url":
+        return f"Open URL · {_clip(str(slots.get('url') or head), 60)}"
+    return _clip(head, 80)
+
+
+def _push_checklist_state(overlay) -> None:
+    """Serialize the pending + recent-terminal rows and hand them to the
+    overlay for repaint. Called whenever the checklist changes."""
+    from observer.task_checklist import checklist
+    import json as _json
+
+    cl = checklist()
+    # Show up to 6 pending first, then the most recent 2 terminal rows
+    # so the user can see what just ran.
+    rows = cl.all()
+    pending = [t for t in rows if t.status == "pending" or t.status == "running"]
+    terminal = [t for t in rows if t.status not in ("pending", "running")]
+    terminal.sort(key=lambda t: t.updated_at, reverse=True)
+    visible = pending + terminal[:2]
+
+    payload = [
+        {"id": t.id, "label": t.label, "status": t.status} for t in visible
+    ]
+    overlay.push("checklist_set", _json.dumps(payload, ensure_ascii=False))
+
+
+def _add_checklist_task(overlay, analysis, preview: str) -> None:
+    """Persist a tier-3 suggestion and push the updated list to the overlay."""
+    from observer.task_checklist import checklist
+
+    action = dict(analysis.action or {})
+    label = _checklist_label_for(analysis, preview)
+    detail = analysis.detail or analysis.headline or preview
+    checklist().add(label=label, detail=detail, action=action)
+    _push_checklist_state(overlay)
+
+
+def _analysis_from_task(task) -> "AmbientAnalysis":  # type: ignore[name-defined]
+    """Reconstruct an AmbientAnalysis from a stored task row so we can
+    reuse the existing ambient executor without duplicating logic."""
+    from intent.ambient_analysis import AmbientAnalysis
+
+    return AmbientAnalysis(
+        tier=3,
+        headline=task.label,
+        detail=task.detail,
+        action=dict(task.action or {}),
+        raw_json="",
+    )
+
+
+async def _execute_checklist_task(task_id: str, overlay) -> None:
+    """Look up a checklist task, mark it running, and execute it through
+    the ambient action dispatcher. Always emits a terminal status so the
+    overlay shows a settled ✓ / ✗ state."""
+    from observer.task_checklist import (
+        checklist,
+        STATUS_DONE,
+        STATUS_FAILED,
+        STATUS_RUNNING,
+    )
+    from observer.agent_log import log as agent_log
+
+    cl = checklist()
+    task = cl.get(task_id)
+    if task is None:
+        return
+    if task.status != "pending":
+        agent_log("checklist:skip", f"task {task_id} status={task.status}")
+        return
+
+    cl.update_status(task_id, STATUS_RUNNING)
+    _push_checklist_state(overlay)
+    agent_log("checklist:run", f"{task.label[:100]}")
+
+    try:
+        await _execute_ambient_action(_analysis_from_task(task), overlay)
+        cl.update_status(task_id, STATUS_DONE, result="executed")
+        agent_log("checklist:done", f"{task.label[:100]}")
+    except Exception as exc:
+        cl.update_status(task_id, STATUS_FAILED, result=str(exc)[:200])
+        agent_log("checklist:failed", f"{task.label[:80]}  err={exc}")
+    finally:
+        _push_checklist_state(overlay)
+
+
+def _hydrate_checklist_on_startup(
+    overlay, agent_loop: asyncio.AbstractEventLoop
+) -> None:
+    """On agent start-up, load persisted tasks from ``~/.ali/tasks.json``
+    and paint them into the overlay. Also wire the click handler so the
+    user can tick rows even when ambient mode is off. Safe to call
+    repeatedly — it's idempotent."""
+    from observer.task_checklist import checklist
+    from observer.agent_log import log as agent_log
+
+    setter = getattr(overlay, "set_checklist_click_handler", None)
+    if setter is not None:
+        setter(
+            lambda task_id, kind: _dispatch_checklist_click(
+                task_id, kind, overlay, agent_loop
+            )
+        )
+
+    cl = checklist()
+    # Any tasks persisted as `running` were interrupted by the previous
+    # shutdown; reset them to pending so they're re-tickable.
+    for t in cl.all():
+        if t.status == "running":
+            cl.update_status(t.id, "pending")
+
+    pending = cl.pending()
+    if pending:
+        agent_log(
+            "checklist:hydrate",
+            f"{len(pending)} pending task(s) restored from disk",
+        )
+    _push_checklist_state(overlay)
+
+
+def _dispatch_checklist_click(
+    task_id: str,
+    kind: str,
+    overlay,
+    agent_loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Qt click callback. Runs on the UI thread → schedule work back onto
+    the asyncio agent loop so we don't block Qt and so we stay consistent
+    with the other ambient execution paths."""
+    from observer.task_checklist import checklist, STATUS_SKIPPED
+    from observer.agent_log import log as agent_log
+
+    if kind == "run":
+        asyncio.run_coroutine_threadsafe(
+            _execute_checklist_task(task_id, overlay), agent_loop
+        )
+    elif kind == "skip":
+        cl = checklist()
+        task = cl.get(task_id)
+        if task and task.status == "pending":
+            cl.update_status(task_id, STATUS_SKIPPED)
+            agent_log("checklist:skip", f"{task.label[:100]}")
+            _push_checklist_state(overlay)
+
+
+# Voice command grammar for the checklist. Kept small so the ambient
+# stream doesn't accidentally fire tasks. Every phrase must start with a
+# verb keyword AND include either an ordinal ("1"/"one"), "all", or "tasks".
+_CHECKLIST_RUN_WORDS = ("run", "execute", "do", "tick", "check off", "go")
+_CHECKLIST_SKIP_WORDS = ("skip", "dismiss", "cancel task", "remove task", "drop")
+_CHECKLIST_CLEAR_PHRASES = (
+    "clear tasks",
+    "clear all tasks",
+    "clear the list",
+    "clear checklist",
+    "empty the list",
+    "empty checklist",
+)
+
+# Ordinal words are checked before cardinals so "do the second one" maps
+# to 2 (not 1 via the trailing "one"). Numeric digits still win over both.
+_ORDINAL_WORDS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+}
+_CARDINAL_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+
+
+def _extract_ordinal(text: str) -> int | None:
+    """Return a 1-based index if the utterance names one ("run 1",
+    "execute task three", "do the second one"), else None."""
+    import re
+
+    t = (text or "").lower()
+    m = re.search(r"\b(\d{1,2})\b", t)
+    if m:
+        try:
+            n = int(m.group(1))
+        except ValueError:
+            return None
+        if 1 <= n <= 20:
+            return n
+    for word, num in _ORDINAL_WORDS.items():
+        if re.search(rf"\b{word}\b", t):
+            return num
+    for word, num in _CARDINAL_WORDS.items():
+        if re.search(rf"\b{word}\b", t):
+            return num
+    return None
+
+
+def _handle_checklist_voice_command(
+    text: str,
+    overlay,
+    agent_loop: asyncio.AbstractEventLoop,
+) -> bool:
+    """Try to interpret ``text`` as a checklist voice command. Returns
+    True if it was handled (so the caller skips other processing)."""
+    from observer.task_checklist import checklist, STATUS_SKIPPED
+    from observer.agent_log import log as agent_log
+
+    t = (text or "").strip().lower().rstrip(".!?")
+    if not t:
+        return False
+
+    # Clear-all phrases — match first so "clear all tasks" doesn't get
+    # mis-parsed as a run verb.
+    for phrase in _CHECKLIST_CLEAR_PHRASES:
+        if phrase in t:
+            removed = checklist().clear(include_terminal=True)
+            agent_log("checklist:clear", f"voice removed {removed}")
+            _push_checklist_state(overlay)
+            return True
+
+    has_run_verb = any(
+        t.startswith(v + " ") or t == v or f" {v} " in f" {t} "
+        for v in _CHECKLIST_RUN_WORDS
+    )
+    has_skip_verb = any(
+        t.startswith(v + " ") or t == v or f" {v} " in f" {t} "
+        for v in _CHECKLIST_SKIP_WORDS
+    )
+    if not (has_run_verb or has_skip_verb):
+        return False
+
+    cl = checklist()
+
+    # "run all" → fire every pending task
+    if has_run_verb and ("all" in t.split() or "everything" in t.split()):
+        pending = cl.pending()
+        if not pending:
+            return True
+        agent_log("checklist:run-all", f"n={len(pending)}")
+        for task in pending:
+            asyncio.run_coroutine_threadsafe(
+                _execute_checklist_task(task.id, overlay), agent_loop
+            )
+        return True
+
+    idx = _extract_ordinal(t)
+    if idx is None:
+        # Verb but no index — ambiguous; ignore to avoid misfires.
+        return False
+
+    task = cl.find_by_index(idx)
+    if task is None:
+        agent_log("checklist:voice", f"no task at index {idx}")
+        return True  # Still handled — just no-op.
+
+    if has_skip_verb:
+        cl.update_status(task.id, STATUS_SKIPPED)
+        agent_log("checklist:skip", f"voice idx={idx} {task.label[:80]}")
+        _push_checklist_state(overlay)
+        return True
+
+    asyncio.run_coroutine_threadsafe(
+        _execute_checklist_task(task.id, overlay), agent_loop
+    )
+    return True
+
 
 # Persistent browser sub-agent session. One session spans many voice
 # utterances so follow-ups ("now open my inbox", "reply to this person")

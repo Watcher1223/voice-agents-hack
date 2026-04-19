@@ -23,7 +23,14 @@ DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 CACTUS_API_KEY = os.environ.get("CACTUS_API_KEY", "")
 
 # ── Cactus / Gemma 4 ─────────────────────────────────────────────────────────
-CACTUS_GEMMA4_MODEL = "google/gemma-4-E2B-it"
+# General-purpose on-device model used by RAG, file resolution, and the
+# visual planner. Powerful but slow — ~30s/call on M2 without dedicated ANE.
+CACTUS_GEMMA4_MODEL = os.getenv("CACTUS_GEMMA4_MODEL", "google/gemma-4-E2B-it")
+
+# Intent classification is a tight JSON-shaped task that doesn't need the
+# 2B model. functiongemma-270m-it is purpose-built for function-calling /
+# structured output and runs ~20x faster (~1.5s/call) on ANE.
+CACTUS_INTENT_MODEL = os.getenv("CACTUS_INTENT_MODEL", "google/functiongemma-270m-it")
 
 # ── Cactus VL (browser sub-agent) ────────────────────────────────────────────
 # The browser sub-agent runs inside a Chrome extension whose LLM is configured
@@ -43,9 +50,10 @@ AGENT_NODE_BIN     = os.getenv("AGENT_NODE_BIN",     "node")
 ROUTE_OPENCLI_ENABLED     = os.environ.get("VOICE_AGENT_ROUTE_OPENCLI", "1").lower() in {"1", "true", "yes"}
 ROUTE_BROWSER_TASK_ENABLED = os.environ.get("VOICE_AGENT_ROUTE_BROWSER_TASK", "1").lower() in {"1", "true", "yes"}
 # Ambient mode: run Deepgram from boot + glass-style intent detection that
-# surfaces suggestions every 5 final transcripts (not 12s wall-clock). Off
-# by default so push-to-talk keeps working without a live mic stream.
-AMBIENT_ENABLED = os.environ.get("VOICE_AGENT_AMBIENT", "0").lower() in {"1", "true", "yes"}
+# surfaces suggestions every 5 final transcripts (not 12s wall-clock). On
+# by default because the task checklist (loose utterances → tickable rows)
+# depends on it; set VOICE_AGENT_AMBIENT=0 to use PTT-only.
+AMBIENT_ENABLED = os.environ.get("VOICE_AGENT_AMBIENT", "1").lower() in {"1", "true", "yes"}
 # Event-driven screen context: snap when focus changes or screen is stale.
 # Passed as an image + app/title to the ambient analyser so tier 1-3 can
 # reference what's on screen. On by default when ambient is on.

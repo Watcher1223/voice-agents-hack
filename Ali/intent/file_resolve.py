@@ -725,6 +725,9 @@ async def _cactus_final_pick(
 # ─── Cactus JSON helper (mockable in tests) ───────────────────────────────────
 
 
+_FILE_RESOLVE_TIMEOUT_S = float(os.environ.get("ALI_CACTUS_FILE_RESOLVE_TIMEOUT_S", "10.0"))
+
+
 async def _cactus_json(prompt: str, state: "_ResolverState") -> dict[str, Any] | None:
     """
     Run a single Cactus completion, parsing strict JSON from stdout.
@@ -734,6 +737,7 @@ async def _cactus_json(prompt: str, state: "_ResolverState") -> dict[str, Any] |
     if not CACTUS_CLI:
         return None
     started = time.perf_counter()
+    proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             CACTUS_CLI,
@@ -744,7 +748,19 @@ async def _cactus_json(prompt: str, state: "_ResolverState") -> dict[str, Any] |
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _stderr = await proc.communicate()
+        stdout, _stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_FILE_RESOLVE_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        state.cactus_total += time.perf_counter() - started
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        print(f"[file_resolve] cactus timed out after {_FILE_RESOLVE_TIMEOUT_S:.0f}s — skipping")
+        return None
     except (OSError, asyncio.CancelledError):
         state.cactus_total += time.perf_counter() - started
         return None

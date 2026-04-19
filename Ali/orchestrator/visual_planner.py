@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -79,6 +80,9 @@ async def choose_next_action(
     return action
 
 
+_PLANNER_TIMEOUT_S = float(os.environ.get("ALI_CACTUS_PLANNER_TIMEOUT_S", "15.0"))
+
+
 async def _choose_with_cactus(
     intent: IntentObject,
     observation: dict[str, Any],
@@ -94,7 +98,19 @@ async def _choose_with_cactus(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_PLANNER_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"cactus planner timed out after {_PLANNER_TIMEOUT_S:.0f}s"
+        )
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode().strip())
     return _parse_next_action(stdout.decode())
