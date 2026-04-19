@@ -88,7 +88,10 @@ def _apply_macos_overlay(win: QWidget) -> None:
                 continue
 
         if ns_win is not None:
-            ns_win.setLevel_(25)
+            # NSPopUpMenuWindowLevel (101) sits above any normal app window
+            # including Finder + Mail, so our overlay stays on top regardless
+            # of which app is active.
+            ns_win.setLevel_(101)
             # 1=CanJoinAllSpaces 16=Stationary 256=FullScreenAuxiliary
             ns_win.setCollectionBehavior_(1 | 16 | 256)
             # Keep the overlay visible when our Python app deactivates
@@ -165,9 +168,12 @@ class TranscriptionOverlay(QWidget):
         self._font_small = QFont(".AppleSystemUIFont", 12)
         self._font_close = QFont(".AppleSystemUIFont", 16, QFont.Weight.Medium)
 
+        # Deliberately NOT using Qt.Tool — on macOS Qt auto-hides Tool
+        # windows when the app deactivates, which cannot be overridden from
+        # AppKit. Frameless + StaysOnTop + DoesNotAcceptFocus gives us a
+        # regular borderless window that stays visible when focus shifts.
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.Tool
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
@@ -366,6 +372,10 @@ class TranscriptionOverlay(QWidget):
             self._history.append((text, BLUE, "status"))
         elif state == "action":
             self._history.append((text, GREEN, "assistant"))
+            # Dock to the right while the agent is actively working on a
+            # known intent, so it stays out of the way of whatever app the
+            # agent is driving (Finder, Mail, browser, etc.).
+            self._dock_mode = DOCK_RIGHT
         elif state == "revealed":
             label = f"Revealed in Finder: {text}" if text else "Revealed in Finder"
             self._history.append((label, GREEN, "assistant"))
@@ -611,9 +621,23 @@ class TranscriptionOverlay(QWidget):
         Show overlay above the current app/space without activating a new space.
         """
         self.show()
+        self._reassert_window_level()
+
+    def _reassert_window_level(self) -> None:
+        """
+        Re-apply NSWindow level / collection / hides-on-deactivate every
+        time we show. Qt can reset these after a resize or re-parent.
+        """
         try:
             ns_win = getattr(self, "_ns_window", None)
-            if ns_win is not None:
-                ns_win.orderFrontRegardless()
+            if ns_win is None:
+                return
+            ns_win.setLevel_(101)  # NSPopUpMenuWindowLevel
+            ns_win.setCollectionBehavior_(1 | 16 | 256)
+            try:
+                ns_win.setHidesOnDeactivate_(False)
+            except Exception:
+                pass
+            ns_win.orderFrontRegardless()
         except Exception:
             pass

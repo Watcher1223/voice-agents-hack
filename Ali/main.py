@@ -113,14 +113,19 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
             goal_label = intent.goal.value.replace("_", " ").title()
             overlay.push("intent", f"{goal_label}")
 
-            # 3 — Execute
+            if intent.goal.value == "unknown":
+                print("      (unknown intent — skipping execution)")
+                overlay.push("error", "I didn't catch that — try rephrasing.")
+                continue
+
+            # 3 — Execute (known intent)
             print("[3/3] Executing...")
             menu_bar.set_status("running")
             overlay.push("action", f"Running: {goal_label}…")
 
-            # For file-reveal flows, resolve first so we can dock the overlay
-            # to the right BEFORE Finder opens. The orchestrator's internal
-            # enrich call is idempotent.
+            # For file-reveal flows, resolve first so we can announce the
+            # target BEFORE Finder opens. The orchestrator's internal enrich
+            # call is idempotent.
             revealed_name: str | None = None
             if intent.goal.value == "find_file":
                 from intent.file_resolve import enrich_intent_with_resolved_files

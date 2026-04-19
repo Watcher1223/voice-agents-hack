@@ -119,7 +119,8 @@ class ResolverBehaviorTests(unittest.TestCase):
         async def _fake_cactus(prompt, state):
             role_hint = "resume" if "Role: resume" in prompt else "attachment"
             if "chosen_path" in prompt:
-                return {"chosen_path": str(resume if role_hint == "resume" else deck)}
+                chosen = resume if role_hint == "resume" else deck
+                return {"chosen_path": str(chosen), "confidence": "high"}
             pattern = "*resume*" if role_hint == "resume" else "*deck*"
             return {"predicate": f'kMDItemFSName == "{pattern}"', "only_in_root_index": 0}
 
@@ -141,6 +142,8 @@ class ResolverBehaviorTests(unittest.TestCase):
             return [target]
 
         async def _fake_cactus(prompt, state):
+            if "chosen_path" in prompt:
+                return {"chosen_path": str(target), "confidence": "high"}
             return {"predicate": 'kMDItemFSName == "*taxes*"', "only_in_root_index": 0}
 
         self._patch(resolver_mod, "run_mdfind", _fake_mdfind)
@@ -169,7 +172,7 @@ class ResolverBehaviorTests(unittest.TestCase):
 
     # ── Branches ───────────────────────────────────────────────────────────
 
-    def test_single_candidate_skips_picker(self) -> None:
+    def test_single_candidate_still_invokes_picker(self) -> None:
         candidate = self._write_file("resume.pdf")
         intent = _apply_intent()
 
@@ -181,7 +184,7 @@ class ResolverBehaviorTests(unittest.TestCase):
         async def _fake_cactus(prompt, state):
             if "chosen_path" in prompt:
                 picker_calls.append(prompt)
-                return {"chosen_path": str(candidate)}
+                return {"chosen_path": str(candidate), "confidence": "high"}
             return {"predicate": 'kMDItemFSName == "*resume*"', "only_in_root_index": 0}
 
         self._patch(resolver_mod, "run_mdfind", _fake_mdfind)
@@ -192,19 +195,148 @@ class ResolverBehaviorTests(unittest.TestCase):
         self.assertEqual(
             intent.slots["resolved_local_files"]["resume"], str(candidate)
         )
-        self.assertEqual(picker_calls, [])
+        self.assertEqual(len(picker_calls), 1)
+
+    def test_picker_abstain_triggers_refine(self) -> None:
+        junk = self._write_file("resume_template.plist")
+        real = self._write_file("resume-final.pdf")
+        intent = _apply_intent()
+
+        predicate_rounds: list[str] = []
+        picker_calls: list[list[Path]] = []
+
+        async def _fake_mdfind(predicate, only_in, limit):
+            if "plist" in predicate or "template" in predicate:
+                return [junk]
+            return [real]
+
+        async def _fake_cactus(prompt, state):
+            if "chosen_path" in prompt:
+                if str(junk) in prompt:
+                    picker_calls.append([junk])
+                    return {
+                        "chosen_path": None,
+                        "confidence": "low",
+                        "reason": "looks like a system template",
+                    }
+                picker_calls.append([real])
+                return {"chosen_path": str(real), "confidence": "high"}
+            if not predicate_rounds:
+                predicate_rounds.append("first")
+                return {
+                    "predicate": 'kMDItemFSName == "*template*"',
+                    "only_in_root_index": 0,
+                }
+            predicate_rounds.append("second")
+            return {
+                "predicate": 'kMDItemFSName == "*resume-final*"',
+                "only_in_root_index": 0,
+            }
+
+        self._patch(resolver_mod, "run_mdfind", _fake_mdfind)
+        self._patch(resolver_mod, "_cactus_json", _fake_cactus)
+
+        asyncio.run(enrich_intent_with_resolved_files(intent, intent.raw_transcript))
+
+        self.assertEqual(
+            intent.slots["resolved_local_files"].get("resume"), str(real)
+        )
+        self.assertEqual(len(predicate_rounds), 2)
+        self.assertEqual(len(picker_calls), 2)
+
+    def test_picker_low_confidence_treated_as_abstain(self) -> None:
+        guess = self._write_file("resumes.zip")
+        real = self._write_file("resume-final.pdf")
+        intent = _apply_intent()
+
+        round_counter = {"n": 0}
+
+        async def _fake_mdfind(predicate, only_in, limit):
+            if "resumes" in predicate:
+                return [guess]
+            return [real]
+
+        async def _fake_cactus(prompt, state):
+            if "chosen_path" in prompt:
+                if str(guess) in prompt:
+                    return {
+                        "chosen_path": str(guess),
+                        "confidence": "low",
+                        "reason": "filename only partial match",
+                    }
+                return {"chosen_path": str(real), "confidence": "high"}
+            round_counter["n"] += 1
+            if round_counter["n"] == 1:
+                return {
+                    "predicate": 'kMDItemFSName == "*resumes*"',
+                    "only_in_root_index": 0,
+                }
+            return {
+                "predicate": 'kMDItemFSName == "*resume-final*"',
+                "only_in_root_index": 0,
+            }
+
+        self._patch(resolver_mod, "run_mdfind", _fake_mdfind)
+        self._patch(resolver_mod, "_cactus_json", _fake_cactus)
+
+        asyncio.run(enrich_intent_with_resolved_files(intent, intent.raw_transcript))
+
+        self.assertEqual(
+            intent.slots["resolved_local_files"].get("resume"), str(real)
+        )
+        self.assertEqual(round_counter["n"], 2)
+
+    def test_large_result_set_still_reaches_picker(self) -> None:
+        many = [self._write_file(f"resume-{i:02}.pdf") for i in range(50)]
+        target = many[0]
+        intent = _apply_intent()
+
+        picker_prompts: list[str] = []
+
+        async def _fake_mdfind(predicate, only_in, limit):
+            return many
+
+        async def _fake_cactus(prompt, state):
+            if "chosen_path" in prompt:
+                picker_prompts.append(prompt)
+                return {"chosen_path": str(target), "confidence": "high"}
+            return {
+                "predicate": 'kMDItemFSName == "*resume*"',
+                "only_in_root_index": 0,
+            }
+
+        self._patch(resolver_mod, "run_mdfind", _fake_mdfind)
+        self._patch(resolver_mod, "_cactus_json", _fake_cactus)
+
+        asyncio.run(enrich_intent_with_resolved_files(intent, intent.raw_transcript))
+
+        self.assertEqual(
+            intent.slots["resolved_local_files"].get("resume"), str(target)
+        )
+        self.assertEqual(len(picker_prompts), 1)
+        prompt = picker_prompts[0]
+        self.assertIn(str(target), prompt)
+        # Only the top 12 (Spotlight order) should appear in the pick prompt.
+        self.assertIn(str(many[11]), prompt)
+        self.assertNotIn(str(many[12]), prompt)
 
     def test_picker_rejects_out_of_set_path(self) -> None:
         a = self._write_file("resume-2022.pdf")
         b = self._write_file("resume-2024.pdf")
         intent = _apply_intent()
 
+        picker_calls = {"n": 0}
+
         async def _fake_mdfind(predicate, only_in, limit):
             return [a, b]
 
         async def _fake_cactus(prompt, state):
             if "chosen_path" in prompt:
-                return {"chosen_path": "/tmp/not-in-candidates.pdf"}
+                picker_calls["n"] += 1
+                return {
+                    "chosen_path": "/tmp/not-in-candidates.pdf",
+                    "confidence": "high",
+                }
             return {"predicate": 'kMDItemFSName == "*resume*"', "only_in_root_index": 0}
 
         self._patch(resolver_mod, "run_mdfind", _fake_mdfind)
@@ -213,6 +345,10 @@ class ResolverBehaviorTests(unittest.TestCase):
         asyncio.run(enrich_intent_with_resolved_files(intent, intent.raw_transcript))
 
         self.assertEqual(intent.slots["resolved_local_files"], {})
+        # Out-of-set is surfaced as abstain, so every predicate round in the
+        # loop retries up to FILE_PREDICATE_MAX_ROUNDS (=2 in this test's
+        # setUp); the walk fallback then invokes the picker once more.
+        self.assertEqual(picker_calls["n"], 3)
 
     def test_naive_mdfind_prefers_documents_over_images(self) -> None:
         svg = self._write_file("resume.svg")
@@ -275,7 +411,7 @@ class ResolverBehaviorTests(unittest.TestCase):
 
         async def _fake_cactus(prompt, state):
             if "chosen_path" in prompt:
-                return {"chosen_path": str(hit)}
+                return {"chosen_path": str(hit), "confidence": "high"}
             return {"predicate": 'kMDItemFSName == "*resume*"', "only_in_root_index": 0}
 
         self._patch(resolver_mod, "run_mdfind", _fake_mdfind)

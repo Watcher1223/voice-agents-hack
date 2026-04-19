@@ -28,6 +28,7 @@ import os
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -48,13 +49,9 @@ from config.settings import (
 from executors.local.file_index import bounded_walk, run_mdfind, validate_predicate
 from intent.schema import IntentObject, KnownGoal
 
-# Ambiguity window: if mdfind returns between these many results we call the
-# Cactus picker. Above HIGH_WATER the predicate is "too broad" and we refine.
-_SWEET_SPOT_MIN = 2
-_SWEET_SPOT_MAX = 15
-_HIGH_WATER = 40
-
-# Max candidate lines we put in a single prompt.
+# Max candidate lines we put in a single prompt. Spotlight's native ranking
+# order is preserved — the first `_MAX_PICK_CANDIDATES` results are shown to
+# Cactus verbatim as the "top K" candidates to choose from or abstain on.
 _MAX_PICK_CANDIDATES = 12
 
 # Roles that map to FILE_ALIASES entries when present.
@@ -64,6 +61,20 @@ _ALIAS_ROLES = {"resume", "cover_letter"}
 _LOCAL_ROLE_TAGS = {"resume", "cover_letter", "attachment", "document", "deck"}
 
 CACTUS_CLI = shutil.which("cactus")
+
+
+@dataclass(frozen=True)
+class _PickResult:
+    """Outcome of a single Cactus pick call.
+
+    - `chosen` is the resolved `Path` when Cactus selected a valid candidate.
+    - `abstain_reason` is set iff `chosen is None` and indicates why the loop
+      should refine instead of failing outright (e.g. "null", "low_confidence",
+      "out_of_set", "out_of_roots", "no_response").
+    """
+
+    chosen: Path | None
+    abstain_reason: str | None
 
 _MD_CHEAT_SHEET = (
     "Spotlight MDQuery attributes you can use:\n"
@@ -186,7 +197,8 @@ async def _resolve_role(
             )
             return chosen
 
-        _finalize(state, exit_reason="max_rounds", outcome="failure")
+        exit_reason = "abstained" if state.last_round_abstained else "max_rounds"
+        _finalize(state, exit_reason=exit_reason, outcome="failure")
         return None
     except Exception as exc:  # pragma: no cover - defensive
         _emit(
@@ -256,7 +268,7 @@ async def _cactus_predicate_loop(
         return None
 
     previous: list[dict[str, Any]] = []
-    last_candidates: list[Path] = []
+    state.last_round_abstained = False
 
     for round_idx in range(max(FILE_PREDICATE_MAX_ROUNDS, 1)):
         state.predicate_rounds_used = round_idx + 1
@@ -287,6 +299,7 @@ async def _cactus_predicate_loop(
                 only_in_root_index=root_idx,
             )
             previous.append({"predicate": predicate_raw, "count": 0, "note": "invalid"})
+            state.last_round_abstained = False
             continue
 
         mdfind_started = time.perf_counter()
@@ -294,7 +307,6 @@ async def _cactus_predicate_loop(
         candidates = await run_mdfind(predicate, roots[root_idx], FILE_MDFIND_MAX_RESULTS)
         state.mdfind_total += time.perf_counter() - mdfind_started
         state.last_result_count = len(candidates)
-        last_candidates = candidates
 
         _emit(
             "mdfind",
@@ -306,43 +318,51 @@ async def _cactus_predicate_loop(
             **_debug_fields(predicate=predicate),
         )
 
-        decision = _rule_decision(len(candidates))
+        if not candidates:
+            _emit(
+                "round",
+                role=role,
+                round_index=round_idx,
+                rule_decision="refine",
+                result_count=0,
+            )
+            previous.append(
+                {"predicate": predicate_raw, "count": 0, "note": "empty"}
+            )
+            state.last_round_abstained = False
+            continue
+
+        trimmed = candidates[:_MAX_PICK_CANDIDATES]
+        pick_result = await _cactus_final_pick(
+            intent, transcript, role, trimmed, roots, state
+        )
+        if pick_result.chosen is not None:
+            _emit(
+                "round",
+                role=role,
+                round_index=round_idx,
+                rule_decision="pick",
+                result_count=len(candidates),
+            )
+            return pick_result.chosen
+
         _emit(
             "round",
             role=role,
             round_index=round_idx,
-            rule_decision=decision,
+            rule_decision="refine_after_abstain",
             result_count=len(candidates),
+            abstain_reason=pick_result.abstain_reason or "abstained",
         )
-
-        if decision == "single":
-            chosen = candidates[0]
-            if _is_under_any_root(chosen, roots):
-                return chosen
-            _emit("round", role=role, round_index=round_idx, detail="single_out_of_roots")
-            return None
-
-        if decision == "pick":
-            chosen = await _cactus_final_pick(
-                intent, transcript, role, candidates, roots, state
-            )
-            if chosen is not None:
-                return chosen
-
         previous.append(
             {
                 "predicate": predicate_raw,
                 "count": len(candidates),
-                "basenames": [c.name for c in candidates[:_MAX_PICK_CANDIDATES]],
+                "basenames": [c.name for c in trimmed],
+                "note": pick_result.abstain_reason or "abstained",
             }
         )
-
-    if last_candidates and _SWEET_SPOT_MIN <= len(last_candidates) <= _SWEET_SPOT_MAX:
-        chosen = await _cactus_final_pick(
-            intent, transcript, role, last_candidates, roots, state
-        )
-        if chosen is not None:
-            return chosen
+        state.last_round_abstained = True
 
     return None
 
@@ -519,7 +539,10 @@ async def _walk_fallback(
         return candidates[0] if _is_under_any_root(candidates[0], roots) else None
 
     trimmed = candidates[:_MAX_PICK_CANDIDATES]
-    return await _cactus_final_pick(intent, transcript, role, trimmed, roots, state)
+    pick_result = await _cactus_final_pick(
+        intent, transcript, role, trimmed, roots, state
+    )
+    return pick_result.chosen
 
 
 async def _cactus_final_pick(
@@ -529,31 +552,41 @@ async def _cactus_final_pick(
     candidates: list[Path],
     roots: list[Path],
     state: "_ResolverState",
-) -> Path | None:
+) -> _PickResult:
     if not candidates:
-        return None
+        return _PickResult(None, "no_candidates")
     trimmed = candidates[:_MAX_PICK_CANDIDATES]
     prompt = _build_pick_prompt(intent, transcript, role, trimmed)
     result = await _cactus_json(prompt, state)
     if not result:
-        return None
-    chosen_raw = str(result.get("chosen_path", ""))
-    if not chosen_raw:
-        return None
+        return _PickResult(None, "no_response")
+
+    confidence = str(result.get("confidence", "")).strip().lower()
+    chosen_raw_val = result.get("chosen_path")
+    if chosen_raw_val is None:
+        return _PickResult(None, "null")
+    chosen_raw = str(chosen_raw_val).strip()
+    if not chosen_raw or chosen_raw.lower() == "null":
+        return _PickResult(None, "null")
+
+    if confidence == "low":
+        _emit("round", role=role, detail="pick_low_confidence")
+        return _PickResult(None, "low_confidence")
+
     try:
         chosen = Path(chosen_raw).expanduser()
     except (OSError, ValueError):
-        return None
+        return _PickResult(None, "invalid_path")
     if chosen not in trimmed:
         match = next((c for c in trimmed if str(c) == str(chosen)), None)
         if match is None:
             _emit("round", role=role, detail="pick_out_of_set")
-            return None
+            return _PickResult(None, "out_of_set")
         chosen = match
     if not _is_under_any_root(chosen, roots):
         _emit("round", role=role, detail="pick_out_of_roots")
-        return None
-    return chosen
+        return _PickResult(None, "out_of_roots")
+    return _PickResult(chosen, None)
 
 
 # ─── Cactus JSON helper (mockable in tests) ───────────────────────────────────
@@ -675,16 +708,21 @@ def _build_pick_prompt(
     role_hint = _role_hint(role)
 
     return (
-        "Pick exactly one path from the allowed list that best matches the user's request.\n"
+        "Pick exactly one path from the allowed list that best matches the user's\n"
+        "request, OR abstain if none of them look right. Candidates are listed in\n"
+        "Spotlight's native ranking order (top = most likely match).\n"
         "Respond with JSON only.\n\n"
         f"Role: {role} — {role_hint}\n"
         f"Intent goal: {intent.goal.value}\n"
         f"Transcript: {transcript!r}\n\n"
-        "Candidates:\n"
+        "Candidates (ranked):\n"
         f"{listing}\n\n"
-        "Allowed paths (must copy one verbatim into chosen_path):\n"
+        "Allowed paths (must copy one verbatim into chosen_path if picking):\n"
         f"{allowed}\n\n"
-        "Return JSON: { \"chosen_path\": string, \"rationale\": string }"
+        "Return JSON: { \"chosen_path\": string | null, "
+        "\"confidence\": \"high\" | \"medium\" | \"low\", "
+        "\"reason\": string }\n"
+        "Set chosen_path to null to abstain when none of the candidates match."
     )
 
 
@@ -723,18 +761,6 @@ def _roles_for_intent(intent: IntentObject) -> list[str]:
     return roles
 
 
-def _rule_decision(count: int) -> str:
-    if count == 0:
-        return "refine"
-    if count == 1:
-        return "single"
-    if _SWEET_SPOT_MIN <= count <= _SWEET_SPOT_MAX:
-        return "pick"
-    if count > _HIGH_WATER:
-        return "refine"
-    return "refine"
-
-
 def _is_under_any_root(path: Path, roots: list[Path]) -> bool:
     try:
         resolved = path.expanduser().resolve()
@@ -771,6 +797,7 @@ class _ResolverState:
         "mdfind_calls",
         "last_result_count",
         "walk_file_count",
+        "last_round_abstained",
     )
 
     def __init__(self, role: str) -> None:
@@ -783,6 +810,7 @@ class _ResolverState:
         self.mdfind_calls = 0
         self.last_result_count = 0
         self.walk_file_count = 0
+        self.last_round_abstained = False
 
     def timings_snapshot(self) -> dict[str, int]:
         return {

@@ -20,7 +20,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 CACTUS_API_KEY = os.environ.get("CACTUS_API_KEY", "")
 
 # ── Cactus / Gemma 4 ─────────────────────────────────────────────────────────
-CACTUS_GEMMA4_MODEL = "google/gemma-4-E2B-it"
+# CACTUS_GEMMA4_MODEL = "google/gemma-4-E2B-it"
+CACTUS_GEMMA4_MODEL = "google/functiongemma-270m-it"
 
 # ── Whisper fallback ──────────────────────────────────────────────────────────
 WHISPER_MODEL_SIZE = "base.en"   # tiny.en | base.en | small.en
