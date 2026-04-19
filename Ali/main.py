@@ -497,16 +497,14 @@ async def _run_ambient_capture(overlay) -> None:
     agent_loop = asyncio.get_running_loop()
 
     def _on_interim(text: str) -> None:
-        # Ambient doesn't want to flood the overlay with every partial word.
-        # Interim goes to the log/console only; the pill updates on finals
-        # and on tier surfaces.
+        # Partial words only go to the log / console — never the overlay.
         pass
 
     def _on_final(text: str) -> None:
-        # Show the most recent committed utterance as a small transcript
-        # line. This keeps the overlay visible between analyses so the user
-        # knows the agent is hearing them.
-        overlay.push("assistant", f"· heard: {text[:160]}")
+        # Per feedback: stop flooding the overlay with every utterance.
+        # Finals are written to ~/.ali/agent.log by AmbientCapture already;
+        # the overlay should only show surfaced tiers + action progress,
+        # not a running transcript.
         # Confirmation listener: if there's a pending action waiting on
         # "yes" / "no", try to consume this final transcript.
         global _pending_confirmation
@@ -613,41 +611,188 @@ async def _run_ambient_capture(overlay) -> None:
 
 async def _execute_ambient_action(analysis, overlay) -> None:
     """Route a confirmed (or safe) ambient tier-3 action through the
-    existing execution paths: opencli for adapters, browser_task for
-    browser utterances, orchestrator for local goals."""
+    TWO paths we actually ship: opencli adapters + local AppleScript /
+    filesystem. No browser_task here — ambient only promises what we
+    can deliver reliably."""
     from observer.agent_log import log as agent_log
     action = analysis.action or {}
     kind = action.get("kind", "").lower()
     text = action.get("text", "").strip()
+    slots = action.get("slots") or {}
     headline = analysis.headline.strip()
-    agent_log("ambient:exec", f"kind={kind} text={text[:80]} head={headline[:80]}")
+    detail = (analysis.detail or "").strip()
+    agent_log("ambient:exec", f"kind={kind} text={text[:80]} slots={list(slots)[:6]}")
 
     try:
         if kind == "opencli":
             await _execute_ambient_opencli(text, overlay, headline)
             return
-        if kind == "browser_task":
-            from orchestrator.orchestrator import Orchestrator
-            orchestrator = Orchestrator()
-            await _route_to_browser(text, orchestrator, overlay, None)
-            return
         if kind == "local":
-            from intent.meeting_intelligence import item_to_intent
-            from orchestrator.orchestrator import Orchestrator
-            orchestrator = Orchestrator()
-            intent = item_to_intent({"task": headline, "type": text, "slots": {}})
-            if intent.goal.value == "unknown":
-                overlay.push("ambient_ack", f"✗ could not map {text!r} to a local goal")
-                agent_log("ambient:exec", f"unmapped local goal {text!r}")
-                return
-            await orchestrator.run(intent)
-            overlay.push("ambient_ack", f"✓ {headline[:160]}")
-            agent_log("ambient:exec", f"done {headline[:120]}")
+            await _execute_ambient_local(text, slots, headline, detail, overlay)
             return
-        overlay.push("ambient_ack", f"✗ unknown action kind {kind!r}")
+        overlay.push("ambient_ack", f"✗ unsupported action kind {kind!r}")
+        agent_log("ambient:exec", f"unsupported kind={kind}")
     except Exception as e:
         agent_log("ambient:exec", f"FAILED {headline[:80]}: {e}")
         overlay.push("ambient_ack", f"✗ {headline[:140]}: {e}")
+
+
+def _enrich_local_slots(
+    text: str,
+    slots: dict,
+    headline: str,
+    detail: str,
+) -> dict:
+    """Chain the tools we already have to fill missing slots before a
+    local action fires. This is the 'agentic' bit — instead of opening
+    Mail.app empty we first resolve 'Hanzi' → her email address via the
+    Contacts AppleScript, and if the detail mentions a file (pitch deck,
+    resume, cv) we find it via Spotlight and attach it.
+
+    Mutates and returns the slots dict."""
+    from executors.local.applescript import AppleScriptExecutor
+    from executors.local.filesystem import FilesystemExecutor
+    from observer.agent_log import log as agent_log
+    import re
+
+    applescript = AppleScriptExecutor()
+    fs = FilesystemExecutor()
+
+    if text in ("compose_mail", "send_email"):
+        to = str(slots.get("to", "")).strip()
+        # If `to` is a name (no @), try Contacts resolution.
+        if to and "@" not in to:
+            resolved = applescript.resolve_contact(to)
+            if resolved:
+                agent_log("enrich:resolve_contact", f"{to!r} → {resolved}")
+                slots["to"] = resolved
+        # File-attachment hint: if the detail mentions a common file
+        # alias, try to find it via FilesystemExecutor. find_by_alias
+        # raises when an alias is missing or unresolved — that's fine
+        # for opportunistic attachment, so swallow and skip.
+        text_blob = f"{headline} {detail}".lower()
+        # Map each surface phrase to the alias key we'd try in resources.
+        _attachment_hints = (
+            ("pitch deck", "deck"),
+            ("slide deck", "deck"),
+            ("deck", "deck"),
+            ("resume", "resume"),
+            ("cv", "resume"),
+            ("cover letter", "cover_letter"),
+        )
+        for phrase, alias_key in _attachment_hints:
+            if phrase not in text_blob:
+                continue
+            try:
+                path = fs.find_by_alias(alias_key)
+            except (FileNotFoundError, Exception):
+                continue
+            if not path:
+                continue
+            atts = slots.get("attachments") or []
+            if path not in atts:
+                atts.append(path)
+            slots["attachments"] = atts
+            agent_log("enrich:find_file", f"phrase={phrase!r} → {path}")
+            break
+
+    if text in ("send_imessage", "send_message"):
+        contact = str(slots.get("contact", "")).strip()
+        if contact and "@" not in contact and not contact.startswith("+"):
+            resolved = applescript.resolve_contact(contact)
+            if resolved:
+                agent_log("enrich:resolve_contact", f"{contact!r} → {resolved}")
+                slots["contact"] = resolved
+
+    return slots
+
+
+async def _execute_ambient_local(
+    text: str, slots: dict, headline: str, detail: str, overlay
+) -> None:
+    """Direct dispatch from ambient action_text → AppleScript / filesystem.
+    Skips the vision planner + orchestrator.run, which would otherwise
+    route most goals to the browser sub-agent."""
+    from executors.local.applescript import AppleScriptExecutor
+    from executors.local.filesystem import FilesystemExecutor
+    from observer.agent_log import log as agent_log
+    import subprocess
+
+    # Chain our available tools to fill in missing context before firing.
+    slots = _enrich_local_slots(text, dict(slots), headline, detail)
+    applescript = AppleScriptExecutor()
+
+    if text == "compose_mail" or text == "send_email":
+        to = str(slots.get("to", "")).strip()
+        subject = str(slots.get("subject", headline[:80])).strip()
+        body = str(slots.get("body", detail or "")).strip()
+        attachments = slots.get("attachments") or None
+        applescript.compose_mail(
+            to=to, subject=subject, body=body, send=False, attachments=attachments,
+        )
+        att_note = f" · attached {len(attachments)}" if attachments else ""
+        overlay.push("ambient_ack", f"✓ Mail draft · {subject[:70] or 'new'}{att_note}")
+        agent_log(
+            "ambient:local:done",
+            f"compose_mail to={to!r} subj={subject[:60]!r} atts={attachments!r}",
+        )
+        return
+
+    if text == "send_imessage" or text == "send_message":
+        contact = str(slots.get("contact", "")).strip()
+        body = str(slots.get("body", detail or headline)).strip()
+        if not contact:
+            overlay.push("ambient_ack", "✗ send_imessage: missing contact")
+            return
+        # _enrich_local_slots already resolved the name → address. Don't
+        # re-run resolve_contact on an already-resolved address; it blocks
+        # on Contacts.app lookup when the "name" is actually an email.
+        applescript.send_imessage(contact=contact, body=body)
+        overlay.push("ambient_ack", f"✓ iMessage to {contact}")
+        agent_log("ambient:local:done", f"send_imessage to={contact!r}")
+        return
+
+    if text == "create_calendar_event":
+        title = str(slots.get("title", headline[:80])).strip()
+        date = str(slots.get("date", "")).strip()
+        time_ = str(slots.get("time", "")).strip()
+        attendees = slots.get("attendees") or []
+        if not isinstance(attendees, list):
+            attendees = []
+        if not date:
+            overlay.push("ambient_ack", "✗ calendar: no date inferred")
+            return
+        applescript.create_calendar_event(
+            title=title, date=date, time=time_, attendees=attendees
+        )
+        overlay.push("ambient_ack", f"✓ calendar: {title[:80]} · {date} {time_}")
+        agent_log("ambient:local:done", f"calendar title={title!r} {date} {time_}")
+        return
+
+    if text == "find_file":
+        query = str(slots.get("file_query", "")).strip()
+        fs = FilesystemExecutor()
+        path = fs.find_by_alias(query) if query else None
+        if path:
+            subprocess.run(["open", "-R", path], check=False)
+            overlay.push("ambient_ack", f"✓ revealed: {path}")
+            agent_log("ambient:local:done", f"find_file {query!r} → {path}")
+        else:
+            overlay.push("ambient_ack", f"✗ no file for {query!r}")
+        return
+
+    if text == "open_url":
+        url = str(slots.get("url", "")).strip()
+        if not url:
+            overlay.push("ambient_ack", "✗ open_url: no URL")
+            return
+        subprocess.run(["open", url], check=False)
+        overlay.push("ambient_ack", f"✓ opened {url}")
+        agent_log("ambient:local:done", f"open_url {url}")
+        return
+
+    overlay.push("ambient_ack", f"✗ unsupported local goal {text!r}")
+    agent_log("ambient:exec", f"unsupported local goal {text!r}")
 
 
 async def _execute_ambient_opencli(text: str, overlay, headline: str) -> None:

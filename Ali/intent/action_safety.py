@@ -38,9 +38,11 @@ _OPENCLI_READ_SUBCOMMANDS = {
 # Local goals that are read-only / navigation.
 _LOCAL_READ_GOALS = {"find_file", "open_url"}
 
-# Local goals that write/send.
+# Local goals that write/send. Matches the canonical action_text values
+# emitted by the ambient prompt.
 _LOCAL_WRITE_GOALS = {
-    "send_email", "send_message", "compose_mail",
+    "send_email", "compose_mail", "compose_email",
+    "send_message", "send_imessage",
     "create_calendar_event", "add_calendar_event",
     "book_flight", "apply_to_job",
 }
