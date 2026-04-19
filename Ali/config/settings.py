@@ -66,6 +66,50 @@ AMBIENT_SCREEN_ENABLED = os.environ.get(
 AMBIENT_SPEAK_ENABLED = os.environ.get(
     "VOICE_AGENT_AMBIENT_SPEAK", "0"
 ).lower() in {"1", "true", "yes"}
+# How many Deepgram finals before one Gemini ambient analysis. Lower =
+# faster checklist updates (more API calls). Default 5.
+try:
+    AMBIENT_TRIGGER_EVERY_FINALS = max(
+        1, int(os.environ.get("VOICE_AGENT_AMBIENT_TRIGGER_FINALS", "5"))
+    )
+except ValueError:
+    AMBIENT_TRIGGER_EVERY_FINALS = 5
+# Transient Gemini errors (503, overload) — retry before giving up.
+try:
+    AMBIENT_ANALYSE_RETRIES = max(
+        1, int(os.environ.get("VOICE_AGENT_AMBIENT_ANALYSE_RETRIES", "4"))
+    )
+except ValueError:
+    AMBIENT_ANALYSE_RETRIES = 4
+# Idle-flush window — after the last final, if no new final arrives
+# within this many seconds and >=1 final is buffered, fire an analysis
+# anyway. Prevents a single complete sentence ("email Hanzi about
+# Hawaii") from sitting in the buffer forever when the user stops
+# talking before the 5-final trigger. Set to 0 to disable.
+try:
+    AMBIENT_IDLE_FLUSH_S = max(
+        0.0, float(os.environ.get("VOICE_AGENT_AMBIENT_IDLE_FLUSH_S", "3.5"))
+    )
+except ValueError:
+    AMBIENT_IDLE_FLUSH_S = 3.5
+# Ambient Cactus fallback: when Gemini returns 429 / RESOURCE_EXHAUSTED or
+# the retry budget is blown, run the analysis locally via the Cactus CLI
+# instead of silently dropping the buffer. Gemma 4 (2B) on-device is slow
+# (~30s cold, ~3-5s warm) but keeps the checklist flowing during outages.
+AMBIENT_CACTUS_FALLBACK = os.environ.get(
+    "VOICE_AGENT_AMBIENT_CACTUS_FALLBACK", "1"
+).lower() in {"1", "true", "yes"}
+try:
+    AMBIENT_CACTUS_TIMEOUT_S = max(
+        5.0, float(os.environ.get("VOICE_AGENT_AMBIENT_CACTUS_TIMEOUT_S", "60"))
+    )
+except ValueError:
+    AMBIENT_CACTUS_TIMEOUT_S = 60.0
+# Default to the Gemma 4 model (bigger + better JSON adherence than
+# functiongemma-270m which fails our stricter schema in practice).
+AMBIENT_CACTUS_MODEL = os.environ.get(
+    "VOICE_AGENT_AMBIENT_CACTUS_MODEL", CACTUS_GEMMA4_MODEL
+)
 # OpenCLI requires Node >= 22.19. Bypass the shebang and invoke node+entry
 # directly so a stale `env node` in PATH can't resolve to an older version.
 OPENCLI_NODE_BIN = os.environ.get(

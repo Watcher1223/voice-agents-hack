@@ -105,7 +105,8 @@ _next_session_conversational = False
 CONV_RMS_THRESHOLD = 180.0
 CONV_SILENCE_SEC = 0.88
 CONV_MIN_VOICE_SEC = 0.38
-CONV_MAX_SEC = 10.0
+# Hands-free capture after wake / backtick: max seconds of audio before hard stop.
+CONV_MAX_SEC = float(os.environ.get("ALI_CONV_MAX_SEC", "10.0"))
 # Abort early if the user never starts speaking after a wake trigger.
 # Happens when wake-word fires on a fragment (e.g. "open my") of an
 # utterance the user has already finished — we'd otherwise sit silent

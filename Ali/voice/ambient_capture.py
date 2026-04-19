@@ -1,7 +1,8 @@
 """Ambient listen loop — glass-style.
 
-Always-on Deepgram stream. After every `AMBIENT_TRIGGER_EVERY_FINALS` final
-transcripts arrive, runs `ambient_analysis.analyse` over the rolling
+Always-on Deepgram stream. After every N final transcripts (see
+`VOICE_AGENT_AMBIENT_TRIGGER_FINALS`, default 5), runs
+`ambient_analysis.analyse` over the rolling
 window. If the LLM decides to surface something (tier 1-3), the supplied
 callback fires. Tier 4 (stay silent) produces no callback.
 
@@ -21,9 +22,8 @@ from collections import deque
 from typing import Callable
 
 from observer.agent_log import log as _agent_log
+from config.settings import AMBIENT_IDLE_FLUSH_S, AMBIENT_TRIGGER_EVERY_FINALS
 
-
-AMBIENT_TRIGGER_EVERY_FINALS = 5
 AMBIENT_HISTORY_TURNS = 30
 
 
@@ -62,6 +62,13 @@ class AmbientCapture:
         self._analysis_in_flight = False
         self._previous = None  # type: ignore[assignment]
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Idle-flush: when the user stops talking mid-buffer, we still
+        # want to analyse the partial sentence rather than wait for
+        # N=AMBIENT_TRIGGER_EVERY_FINALS finals that may never arrive.
+        # _idle_flush_handle is a TimerHandle scheduled on the asyncio
+        # loop; each new final cancels the prior one and schedules a
+        # fresh one.
+        self._idle_flush_handle: asyncio.TimerHandle | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -101,6 +108,10 @@ class AmbientCapture:
                 self._loop.call_soon_threadsafe(self._on_final, text)
             if should_trigger and self._loop:
                 self._loop.call_soon_threadsafe(self._schedule_analysis)
+            elif self._loop and AMBIENT_IDLE_FLUSH_S > 0:
+                # No trigger yet, but arm the idle-flush so a complete
+                # short utterance still gets analysed after a pause.
+                self._loop.call_soon_threadsafe(self._arm_idle_flush)
 
         stream_thread = threading.Thread(
             target=stream_transcription_sync,
@@ -121,9 +132,42 @@ class AmbientCapture:
         # Run in background; buffer continues to receive finals meanwhile.
         if self._analysis_in_flight:
             return
+        # Cancel any pending idle-flush — we're firing analysis *now*.
+        if self._idle_flush_handle is not None:
+            self._idle_flush_handle.cancel()
+            self._idle_flush_handle = None
         self._analysis_in_flight = True
         if self._loop:
             self._loop.create_task(self._do_analysis())
+
+    def _arm_idle_flush(self) -> None:
+        """Reset the idle-flush timer. Called on every new final so only
+        a *stretch of silence* fires the analysis early."""
+        if self._loop is None or AMBIENT_IDLE_FLUSH_S <= 0:
+            return
+        if self._idle_flush_handle is not None:
+            self._idle_flush_handle.cancel()
+        self._idle_flush_handle = self._loop.call_later(
+            AMBIENT_IDLE_FLUSH_S, self._idle_flush
+        )
+
+    def _idle_flush(self) -> None:
+        """Fire an analysis if the buffer has content and nothing else
+        is in flight. Called by the TimerHandle armed in _arm_idle_flush."""
+        self._idle_flush_handle = None
+        with self._lock:
+            pending = self._finals_since_trigger
+            in_flight = self._analysis_in_flight
+            total = len(self._history)
+            if pending <= 0 or in_flight:
+                return
+            self._finals_since_trigger = 0
+        _log(
+            "idle-flush",
+            f"silence for {AMBIENT_IDLE_FLUSH_S:.1f}s — firing on {pending} buffered final(s) "
+            f"(history={total})",
+        )
+        self._schedule_analysis()
 
     async def _do_analysis(self) -> None:
         from intent.ambient_analysis import analyse

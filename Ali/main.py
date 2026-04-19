@@ -147,14 +147,7 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
     # flag is on. It does NOT intercept user commands — it only surfaces
     # suggestions (tier 1-3) into the overlay. PTT still works.
     from config.settings import AMBIENT_ENABLED
-    if AMBIENT_ENABLED:
-        print(
-            "[ambient] enabled — loose utterances (no 'Ali' prefix) will be "
-            "parked on the task checklist.",
-            flush=True,
-        )
-        agent_loop.create_task(_run_ambient_capture(overlay))
-    else:
+    if not AMBIENT_ENABLED:
         print(
             "[ambient] disabled — task checklist will stay empty. Set "
             "VOICE_AGENT_AMBIENT=1 in .env (or export it) to capture "
@@ -485,7 +478,16 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
             else:
                 request_ptt_session_from_wake(overlay)
 
+        global _dispatch_wake_heard
+        _dispatch_wake_heard = _wake_heard
         start_wake_word_listener(_wake_heard)  # type: ignore[arg-type]
+        if AMBIENT_ENABLED:
+            print(
+                "[ambient] enabled — loose utterances go to the task checklist; "
+                "'Ali' / 'Hey Ali' also arms PTT via the ambient mic stream.",
+                flush=True,
+            )
+            agent_loop.create_task(_run_ambient_capture(overlay))
 
     def _on_backtick() -> None:
         # Backtick stops meeting if one is running, otherwise starts wake
@@ -525,6 +527,11 @@ _active_meeting: "MeetingCapture | None" = None  # type: ignore[name-defined]
 # VOICE_AGENT_AMBIENT=1. Does not own user commands; only surfaces
 # suggestions via the overlay.
 _ambient_capture: "AmbientCapture | None" = None  # type: ignore[name-defined]
+
+# Set in _on_ptt_armed once the wake callback exists — ambient Deepgram
+# finals call this for "Ali" / "Hey Ali" so wake works while the mic is
+# owned by the ambient stream.
+_dispatch_wake_heard: Callable[[str], None] | None = None
 
 
 # Ambient tier-3 suggestions no longer run through an immediate yes/no
@@ -782,6 +789,25 @@ def _match_any(text: str, tokens: set[str]) -> bool:
     return any(t.startswith(token + " ") or t.endswith(" " + token) or f" {token} " in f" {t} " for token in tokens)
 
 
+def _ambient_deepgram_final_is_explicit_wake(text: str) -> bool:
+    """True when the ambient line looks like a wake phrase, not a casual mention.
+
+    Deepgram finals drive this path while the default mic is streaming to
+    ambient — avoids relying on a second SpeechRecognition capture for short
+    utterances like \"Ali\" alone."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    low = t.lower().rstrip(".!?")
+    if low.startswith("hey ali"):
+        return True
+    if low.startswith("okay ali") or low.startswith("ok ali"):
+        return True
+    if low == "ali" or low.startswith("ali "):
+        return True
+    return False
+
+
 async def _run_ambient_capture(overlay) -> None:
     global _ambient_capture
     from voice.ambient_capture import AmbientCapture
@@ -805,12 +831,19 @@ async def _run_ambient_capture(overlay) -> None:
         pass
 
     def _on_final(text: str) -> None:
-        # Ambient finals no longer flood the overlay. They serve one
-        # purpose now: voice commands to drive the checklist ("run 1",
-        # "run all", "skip 2", "clear tasks"). Everything else is silent.
+        # Checklist voice commands first ("run 1", "run all", …).
         handled = _handle_checklist_voice_command(text, overlay, agent_loop)
         if handled:
             agent_log("checklist:voice", f"handled {text!r}")
+            return
+        # Explicit wake on the ambient mic — same handler as Google wake STT.
+        from voice.wake_word import try_acquire_wake_dispatch
+
+        if _ambient_deepgram_final_is_explicit_wake(text) and try_acquire_wake_dispatch():
+            fn = _dispatch_wake_heard
+            if fn is not None:
+                agent_log("ambient:wake", f"Deepgram wake → PTT: {text!r}")
+                fn(text)
 
     def _on_suggestion(analysis) -> None:
         tier = analysis.tier
@@ -825,18 +858,22 @@ async def _run_ambient_capture(overlay) -> None:
                 speak(detail[:200])
             return
 
-        # Tier 3 — suggests a concrete action. Rather than auto-exec or
-        # prompt for a "yes", park it on the persistent checklist and let
-        # the user tick it when they're ready. Enrich slots NOW so the
-        # label reads with real values (resolved email, file path, etc.).
+        # Tier 3 — one or more concrete actions. Park each on the
+        # persistent checklist; user ticks them later. Enrich slots now so
+        # labels render with resolved values (real email, file path…).
         if tier == 3:
-            enriched = _enrich_analysis_for_preview(analysis)
-            preview = _format_action_preview(enriched)
-            _add_checklist_task(overlay, enriched, preview)
-            agent_log(
-                "checklist:add",
-                f"{headline[:100]}  kind={(enriched.action or {}).get('kind')!r}",
-            )
+            actions = list(getattr(analysis, "actions", []) or [])
+            if not actions:
+                agent_log("checklist:skip", f"tier-3 with no actions: {headline[:80]}")
+                return
+            for action in actions:
+                enriched = _enrich_action_dict(action, headline, detail)
+                _add_checklist_task_for_action(overlay, enriched, headline, detail)
+                agent_log(
+                    "checklist:add",
+                    f"{headline[:80]}  kind={enriched.get('kind')!r}  "
+                    f"label={enriched.get('label', '')[:60]!r}",
+                )
             return
 
     screen = None
@@ -864,10 +901,11 @@ async def _run_ambient_capture(overlay) -> None:
 
 
 async def _execute_ambient_action(analysis, overlay) -> None:
-    """Route a confirmed (or safe) ambient tier-3 action through the
-    TWO paths we actually ship: opencli adapters + local AppleScript /
-    filesystem. No browser_task here — ambient only promises what we
-    can deliver reliably."""
+    """Route a checklist-ticked tier-3 action through one of the three
+    execution paths: opencli lookups, local AppleScript/Spotlight, or
+    the persistent browser sub-agent. Called per Task (reconstructed
+    AmbientAnalysis) so `analysis.actions` always has exactly one
+    entry — hence the `.action` accessor is safe here."""
     from observer.agent_log import log as agent_log
     action = analysis.action or {}
     kind = action.get("kind", "").lower()
@@ -884,6 +922,9 @@ async def _execute_ambient_action(analysis, overlay) -> None:
         if kind == "local":
             await _execute_ambient_local(text, slots, headline, detail, overlay)
             return
+        if kind == "browser_task":
+            await _execute_ambient_browser_task(text, overlay, headline)
+            return
         overlay.push("ambient_ack", f"✗ unsupported action kind {kind!r}")
         agent_log("ambient:exec", f"unsupported kind={kind}")
     except Exception as e:
@@ -891,24 +932,76 @@ async def _execute_ambient_action(analysis, overlay) -> None:
         overlay.push("ambient_ack", f"✗ {headline[:140]}: {e}")
 
 
+async def _execute_ambient_browser_task(
+    task_text: str, overlay, headline: str
+) -> None:
+    """Route a checklist browser_task through the persistent browser
+    sub-agent. The agent's MCP server bundle must already be built
+    (`cd executors/browser/agent/server && npm install && npm run build`).
+    When missing, we surface a readable error on the overlay so the
+    user sees why the task didn't run."""
+    from observer.agent_log import log as agent_log
+    from executors.browser.agent_client import LocalAgentClient
+
+    goal = (task_text or headline or "").strip()
+    if not goal:
+        overlay.push("ambient_ack", "✗ browser_task: no goal text")
+        agent_log("tool:browser_task", "empty goal — skipping")
+        return
+
+    overlay.push("action", f"▶  browser  ·  {goal[:160]}")
+    agent_log("tool:browser_task", f"checklist goal={goal[:160]}")
+    client = LocalAgentClient()
+    try:
+        status = await client.run_task(task=goal, session_id="")
+    except Exception as exc:
+        overlay.push("ambient_ack", f"✗ {str(exc)[:160]}")
+        agent_log("tool:browser_task:err", str(exc)[:200])
+        return
+
+    if status.state == "complete":
+        answer = (status.answer or "Done.").strip()[:400]
+        overlay.push("assistant", answer)
+        agent_log("tool:browser_task:done", answer[:200])
+        return
+
+    err = status.error or status.state or "browser task did not complete"
+    overlay.push("ambient_ack", f"✗ {err[:160]}")
+    agent_log("tool:browser_task:err", err[:200])
+
+
+def _enrich_action_dict(
+    action: dict, headline: str, detail: str
+) -> dict:
+    """Slot enrichment for one action: resolve contact names, find
+    attachments, etc. Returns a new dict (doesn't mutate the input).
+    Browser/opencli actions are passed through untouched — only
+    kind='local' has slots worth enriching."""
+    out = dict(action or {})
+    kind = str(out.get("kind", "")).lower()
+    if kind != "local":
+        return out
+    text = str(out.get("text", "")).strip()
+    slots = dict(out.get("slots") or {})
+    out["slots"] = _enrich_local_slots(text, slots, headline, detail or "")
+    return out
+
+
 def _enrich_analysis_for_preview(analysis):
-    """Run the same slot enrichment the execute path would — BEFORE the
-    user confirms — so the yellow pill shows real values (resolved
-    email, found attachment path, etc.) rather than raw names."""
+    """Back-compat wrapper around the new per-action enrichment. Used
+    by tests and by the checklist-execution path when it rebuilds an
+    AmbientAnalysis from a stored Task."""
     from intent.ambient_analysis import AmbientAnalysis
-    action = dict(analysis.action or {})
-    text = str(action.get("text", "")).strip()
-    slots = dict(action.get("slots") or {})
-    headline = analysis.headline
-    detail = analysis.detail or ""
-    # Mutates `slots` — shared helper with the execute path.
-    enriched = _enrich_local_slots(text, slots, headline, detail)
-    action["slots"] = enriched
+
+    enriched_actions = [
+        _enrich_action_dict(a, analysis.headline, analysis.detail or "")
+        for a in (getattr(analysis, "actions", None) or [])
+    ]
     return AmbientAnalysis(
         tier=analysis.tier,
         headline=analysis.headline,
         detail=analysis.detail,
-        action=action,
+        actions=enriched_actions,
         raw_json=analysis.raw_json,
     )
 
@@ -1153,33 +1246,50 @@ def _clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1].rstrip() + "…"
 
 
-def _checklist_label_for(analysis, fallback: str) -> str:
-    """Build a short, actionable label for the checklist row. Falls
-    back to the headline when the action dict doesn't name recipient /
-    subject / etc."""
-    action = (analysis.action or {}) if analysis is not None else {}
+def _label_from_action(action: dict, fallback: str) -> str:
+    """Build a short, actionable label for one checklist row. Prefers
+    the Gemini-supplied `label`, then composes from slots, then falls
+    back to the headline."""
+    if not isinstance(action, dict):
+        return _clip(fallback, 80)
+    supplied = str(action.get("label") or "").strip()
+    if supplied:
+        return _clip(supplied, 80)
     text = str(action.get("text", "")).strip()
     slots = action.get("slots") or {}
-    head = (analysis.headline.strip() if analysis else "") or fallback
+    kind = str(action.get("kind", "")).lower()
 
     if text in ("compose_mail", "send_email"):
         to = _clip(str(slots.get("to") or "someone"), 40)
-        subj = _clip(str(slots.get("subject") or head), 40)
+        subj = _clip(str(slots.get("subject") or fallback), 40)
         return f"Email {to} · {subj}"
     if text in ("send_imessage", "send_message"):
         contact = _clip(str(slots.get("contact") or "someone"), 40)
-        body = _clip(str(slots.get("body") or head), 40)
+        body = _clip(str(slots.get("body") or fallback), 40)
         return f"iMessage {contact} · {body}"
     if text in ("create_calendar_event", "add_calendar_event"):
-        title = _clip(str(slots.get("title") or head), 40)
+        title = _clip(str(slots.get("title") or fallback), 40)
         when = str(slots.get("date") or "").strip()
         return f"Calendar · {title}" + (f" · {when}" if when else "")
     if text == "find_file":
-        q = _clip(str(slots.get("file_query") or head), 60)
+        q = _clip(str(slots.get("file_query") or fallback), 60)
         return f"Find file · {q}"
     if text == "open_url":
-        return f"Open URL · {_clip(str(slots.get('url') or head), 60)}"
-    return _clip(head, 80)
+        return f"Open URL · {_clip(str(slots.get('url') or fallback), 60)}"
+    if kind == "browser_task":
+        return _clip(text or fallback, 80)
+    if kind == "opencli":
+        return f"Run · {_clip(text, 60)}"
+    return _clip(fallback, 80)
+
+
+def _checklist_label_for(analysis, fallback: str) -> str:
+    """Back-compat: label the analysis's first action. New callers
+    should use `_label_from_action` directly so multi-action analyses
+    get one label per row."""
+    first = getattr(analysis, "action", None) if analysis is not None else None
+    head = (analysis.headline.strip() if analysis else "") or fallback
+    return _label_from_action(first or {}, head)
 
 
 def _push_checklist_state(overlay) -> None:
@@ -1203,15 +1313,34 @@ def _push_checklist_state(overlay) -> None:
     overlay.push("checklist_set", _json.dumps(payload, ensure_ascii=False))
 
 
-def _add_checklist_task(overlay, analysis, preview: str) -> None:
-    """Persist a tier-3 suggestion and push the updated list to the overlay."""
+def _add_checklist_task_for_action(
+    overlay,
+    action: dict,
+    headline: str,
+    detail: str,
+) -> None:
+    """Persist one action from a tier-3 suggestion as its own checklist
+    row. A single ambient analysis can produce several rows — caller
+    iterates over analysis.actions."""
     from observer.task_checklist import checklist
 
-    action = dict(analysis.action or {})
-    label = _checklist_label_for(analysis, preview)
-    detail = analysis.detail or analysis.headline or preview
-    checklist().add(label=label, detail=detail, action=action)
+    fallback = headline or ""
+    label = _label_from_action(action, fallback)
+    row_detail = (detail or headline or "").strip()
+    checklist().add(label=label, detail=row_detail, action=dict(action or {}))
     _push_checklist_state(overlay)
+
+
+def _add_checklist_task(overlay, analysis, preview: str) -> None:
+    """Back-compat wrapper — adds *every* action on the analysis as a
+    separate row. Kept so tests & legacy callers still work."""
+    actions = list(getattr(analysis, "actions", []) or [])
+    if not actions:
+        return
+    headline = analysis.headline or preview
+    detail = analysis.detail or analysis.headline or preview
+    for action in actions:
+        _add_checklist_task_for_action(overlay, action, headline, detail)
 
 
 def _analysis_from_task(task) -> "AmbientAnalysis":  # type: ignore[name-defined]
@@ -1223,7 +1352,7 @@ def _analysis_from_task(task) -> "AmbientAnalysis":  # type: ignore[name-defined
         tier=3,
         headline=task.label,
         detail=task.detail,
-        action=dict(task.action or {}),
+        actions=[dict(task.action or {})],
         raw_json="",
     )
 

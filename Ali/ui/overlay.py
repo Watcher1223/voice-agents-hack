@@ -1077,6 +1077,11 @@ class TranscriptionOverlay(QWidget):
                 for i in items
                 if isinstance(i, dict) and i.get("id")
             ]
+            print(
+                f"[overlay] checklist_set n={len(self._checklist)} "
+                f"visible={self.isVisible()} dock={self._dock_mode}",
+                flush=True,
+            )
             # Force right-dock so the checklist sits out of the way.
             if self._checklist:
                 self._dock_mode = DOCK_RIGHT

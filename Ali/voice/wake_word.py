@@ -32,6 +32,20 @@ recording_active = threading.Event()
 _WAKE_COOLDOWN_SEC = 4.0
 _wake_lock = threading.Lock()
 _last_wake_mono: float | None = None
+
+
+def try_acquire_wake_dispatch() -> bool:
+    """Return True if a wake dispatch may proceed (not within cooldown).
+
+    Shared by Google wake STT and ambient Deepgram finals so duplicate
+    triggers from both paths do not double-fire."""
+    global _last_wake_mono
+    with _wake_lock:
+        now = time.monotonic()
+        if _last_wake_mono is not None and (now - _last_wake_mono) < _WAKE_COOLDOWN_SEC:
+            return False
+        _last_wake_mono = now
+        return True
 _INLINE_COMMAND_PREFIXES = (
     "open ",
     "find ",
@@ -94,20 +108,29 @@ def start_wake_word_listener(callback: Callable[[str], None]) -> None:
             print(f"[wake_word] Heard: \"{text}\" ({google_ms}ms)")
             words = {w.strip(".,!?").lower() for w in text.split()}
             has_wake = any(w in _WAKE_ALIASES for w in words)
-            has_wake_like_prefix = any(w.startswith("al") for w in words if len(w) >= 2)
-            has_wake = has_wake or has_wake_like_prefix
-            inline_command = text.startswith(_INLINE_COMMAND_PREFIXES) and len(text.split()) >= 2
+            # Inline-command fallback (e.g. "open my resume" with a missed
+            # wake word) was added for PTT-only mode. When ambient is on,
+            # loose utterances MUST flow through ambient → tier-3 → task
+            # checklist; letting the inline fallback trigger here would
+            # hijack them into immediate execution and bypass the list.
+            # Keep the fallback only when ambient is off.
+            try:
+                from config.settings import AMBIENT_ENABLED as _AMBIENT_ON
+            except Exception:
+                _AMBIENT_ON = False
+            inline_command = (
+                not _AMBIENT_ON
+                and text.startswith(_INLINE_COMMAND_PREFIXES)
+                and len(text.split()) >= 2
+            )
             if not has_wake and not inline_command:
                 # #region agent log
                 _dlog("wake_word:_check:no_ali", "google returned but no ali",
                       {"text": text, "google_ms": google_ms}, "H1")
                 # #endregion
                 return
-            with _wake_lock:
-                now = time.monotonic()
-                if _last_wake_mono is not None and (now - _last_wake_mono) < _WAKE_COOLDOWN_SEC:
-                    return
-                _last_wake_mono = now
+            if not try_acquire_wake_dispatch():
+                return
             post_speech_ms = int((time.monotonic() - audio_end_mono) * 1000)
             print(f"[wake_word] Heard: '{text}' → triggering")
             # #region agent log
@@ -183,7 +206,7 @@ def start_wake_word_listener(callback: Callable[[str], None]) -> None:
             try:
                 listen_started = time.monotonic()
                 saw_recording = recording_active.is_set()
-                phrase_limit = float(os.environ.get("ALI_WAKE_PHRASE_LIMIT_S", "5.0"))
+                phrase_limit = float(os.environ.get("ALI_WAKE_PHRASE_LIMIT_S", "10.0"))
                 with mic as source:
                     audio = r.listen(source, timeout=2, phrase_time_limit=phrase_limit)
                 audio_end_mono = time.monotonic()
@@ -199,10 +222,10 @@ def start_wake_word_listener(callback: Callable[[str], None]) -> None:
                 frame_bytes = len(getattr(audio, "frame_data", b"") or b"")
                 frame_data = getattr(audio, "frame_data", b"") or b""
                 rms = _rms16(frame_data)
-                # Gate: require ~0.5s of audio at 48kHz mono s16 and enough
-                # energy that it's plausibly speech. Kills the per-cycle
-                # "couldn't understand audio" spam.
-                if frame_bytes < 48_000 or rms < r.energy_threshold * 0.8:
+                # Gate: short speech ("Ali") can be ~0.2s (~19kB @ 48kHz mono s16).
+                # Require enough energy that it's plausibly speech; too low
+                # still kills the per-cycle "couldn't understand audio" spam.
+                if frame_bytes < 18_000 or rms < r.energy_threshold * 0.8:
                     _dlog("wake_word:_run:gated",
                           "skipping recognize_google: too quiet/short",
                           {"bytes": frame_bytes, "rms": round(rms, 2),
