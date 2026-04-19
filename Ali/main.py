@@ -843,28 +843,27 @@ async def _run_find_flights_flow(
         speak("I didn't find any flights for that.")
         return
 
-    top = flights[:3]
-    items: list[dict] = []
-    for f in top:
-        price = int(f.get("price") or 0)
-        label = f"${price} {f.get('flyFrom', '')}→{f.get('flyTo', '')}"
-        deeplink = str(f.get("deepLink") or "")
-        if deeplink:
-            items.append({"label": label, "path": deeplink})
-
+    from executors.flights import format_flight_summary
+    top = flights[:5]
     cheapest = top[0]
+    origin_code = cheapest.get("flyFrom", origin)
+    dest_code   = cheapest.get("flyTo",   destination)
+    date_label  = f"  {slots.get('depart_date', '')}" if slots.get("depart_date") else ""
+    overlay.push("assistant", f"Flights  {origin_code} → {dest_code}{date_label}")
+    for i, f in enumerate(top, 1):
+        overlay.push("assistant", f"  {i}.  {format_flight_summary(f)}")
 
-    # Add calendar event and append chip to same list so all chips show together
+    # Calendar event + chip
     try:
         from executors.calendar import add_flight_events
         n = add_flight_events(slots, cheapest)
         if n > 0:
-            items.append({"label": "Open Calendar", "path": "ali://calendar/"})
+            overlay.push("cited_paths", _json.dumps(
+                [{"label": "Open Calendar", "path": "ali://calendar/"}],
+                ensure_ascii=False,
+            ))
     except Exception:
         n = 0
-
-    if items:
-        overlay.push("cited_paths", _json.dumps(items, ensure_ascii=False))
 
     speak(
         f"Cheapest is {int(cheapest.get('price') or 0)} dollars to "
@@ -1336,28 +1335,27 @@ async def _execute_ambient_find_flights(
         speak("I didn't find any flights for that.")
         return
 
-    top = flights[:3]
-    items: list[dict] = []
-    for f in top:
-        price = int(f.get("price") or 0)
-        label = f"${price} {f.get('flyFrom', '')}→{f.get('flyTo', '')}"
-        deeplink = str(f.get("deepLink") or "")
-        if deeplink:
-            items.append({"label": label, "path": deeplink})
-
+    from executors.flights import format_flight_summary
+    top = flights[:5]
     cheapest = top[0]
+    origin_code = cheapest.get("flyFrom", origin)
+    dest_code   = cheapest.get("flyTo",   destination)
+    date_label  = f"  {slots.get('depart_date', '')}" if slots.get("depart_date") else ""
+    overlay.push("assistant", f"Flights  {origin_code} → {dest_code}{date_label}")
+    for i, f in enumerate(top, 1):
+        overlay.push("assistant", f"  {i}.  {format_flight_summary(f)}")
 
-    # Add calendar event and append chip to same list so all chips show together
+    # Calendar event + chip
     try:
         from executors.calendar import add_flight_events
         n = add_flight_events(slots, cheapest)
         if n > 0:
-            items.append({"label": "Open Calendar", "path": "ali://calendar/"})
+            overlay.push("cited_paths", _json.dumps(
+                [{"label": "Open Calendar", "path": "ali://calendar/"}],
+                ensure_ascii=False,
+            ))
     except Exception:
         n = 0
-
-    if items:
-        overlay.push("cited_paths", _json.dumps(items, ensure_ascii=False))
 
     speak(
         f"Cheapest is {int(cheapest.get('price') or 0)} dollars to "
@@ -1369,7 +1367,7 @@ async def _execute_ambient_find_flights(
         cal_label = "events" if n > 1 else "event"
         speak(f"I've added {n} calendar {cal_label} for your trip.")
 
-    agent_log("tool:find_flights:done", f"top_price={top[0].get('price')} count={len(items)}")
+    agent_log("tool:find_flights:done", f"top_price={cheapest.get('price')} count={len(top)}")
 
 
 def _enrich_action_dict(
