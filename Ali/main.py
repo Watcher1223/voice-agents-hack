@@ -1031,7 +1031,19 @@ async def _execute_ambient_opencli(text: str, overlay, headline: str) -> None:
     from observer.agent_log import log as agent_log
     import re
 
-    parts = text.strip().split()
+    # Parse with shlex so multi-word queries like google search "gamma 4"
+    # land as ONE positional arg. Naive str.split() splits 'gamma 4' into
+    # two args → opencli sees extras and returns empty.
+    import shlex as _shlex
+    try:
+        parts = _shlex.split(text.strip())
+    except ValueError:
+        parts = text.strip().split()
+    if len(parts) >= 3 and parts[0] in {"google", "hackernews", "wikipedia", "arxiv", "reddit"} \
+            and parts[1] in {"search", "hot", "top", "news"}:
+        # For <adapter> <subcmd> <rest...>: rejoin the rest as ONE arg so
+        # multi-word queries work regardless of quoting.
+        parts = [parts[0], parts[1], " ".join(parts[2:])]
     if not parts:
         overlay.push("ambient_ack", "✗ empty opencli command")
         return
