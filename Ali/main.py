@@ -583,19 +583,35 @@ def _enrich_local_slots(
             if resolved:
                 agent_log("enrich:resolve_contact", f"{to!r} → {resolved}")
                 slots["to"] = resolved
-        # File-attachment hint: if the detail mentions a file alias,
-        # look it up via FilesystemExecutor and attach.
+        # File-attachment hint: if the detail mentions a common file
+        # alias, try to find it via FilesystemExecutor. find_by_alias
+        # raises when an alias is missing or unresolved — that's fine
+        # for opportunistic attachment, so swallow and skip.
         text_blob = f"{headline} {detail}".lower()
-        for alias in ("pitch deck", "deck", "resume", "cv", "cover letter"):
-            if alias in text_blob:
-                path = fs.find_by_alias(alias.replace(" ", ""))
-                if path:
-                    atts = slots.get("attachments") or []
-                    if path not in atts:
-                        atts.append(path)
-                    slots["attachments"] = atts
-                    agent_log("enrich:find_file", f"alias={alias!r} → {path}")
-                    break
+        # Map each surface phrase to the alias key we'd try in resources.
+        _attachment_hints = (
+            ("pitch deck", "deck"),
+            ("slide deck", "deck"),
+            ("deck", "deck"),
+            ("resume", "resume"),
+            ("cv", "resume"),
+            ("cover letter", "cover_letter"),
+        )
+        for phrase, alias_key in _attachment_hints:
+            if phrase not in text_blob:
+                continue
+            try:
+                path = fs.find_by_alias(alias_key)
+            except (FileNotFoundError, Exception):
+                continue
+            if not path:
+                continue
+            atts = slots.get("attachments") or []
+            if path not in atts:
+                atts.append(path)
+            slots["attachments"] = atts
+            agent_log("enrich:find_file", f"phrase={phrase!r} → {path}")
+            break
 
     if text in ("send_imessage", "send_message"):
         contact = str(slots.get("contact", "")).strip()
@@ -639,15 +655,17 @@ async def _execute_ambient_local(
         )
         return
 
-    if text == "send_imessage":
+    if text == "send_imessage" or text == "send_message":
         contact = str(slots.get("contact", "")).strip()
         body = str(slots.get("body", detail or headline)).strip()
         if not contact:
             overlay.push("ambient_ack", "✗ send_imessage: missing contact")
             return
-        resolved = applescript.resolve_contact(contact) or contact
-        applescript.send_imessage(contact=resolved, body=body)
-        overlay.push("ambient_ack", f"✓ iMessage sent to {contact}")
+        # _enrich_local_slots already resolved the name → address. Don't
+        # re-run resolve_contact on an already-resolved address; it blocks
+        # on Contacts.app lookup when the "name" is actually an email.
+        applescript.send_imessage(contact=contact, body=body)
+        overlay.push("ambient_ack", f"✓ iMessage to {contact}")
         agent_log("ambient:local:done", f"send_imessage to={contact!r}")
         return
 
