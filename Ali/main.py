@@ -34,6 +34,7 @@ except Exception:
 
 from config.index_bootstrap import ensure_index
 from config.preflight import run_preflight_checks
+from intent.schema import KnownGoal
 
 
 class TranscriptionOverlay(Protocol):
@@ -367,6 +368,7 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 # cheapest, speak its summary, open Kiwi's booking deeplink.
                 if intent.goal == KnownGoal.FIND_FLIGHTS:
                     from executors.flights import search_flights, format_flight_summary, FlightSearchError
+                    from voice.speak import speak
                     try:
                         flights = await search_flights(intent.slots)
                     except FlightSearchError as e:
@@ -1426,7 +1428,9 @@ async def _execute_ambient_local(
         if not url:
             overlay.push("ambient_ack", "✗ open_url: no URL")
             return
-        subprocess.run(["open", url], check=False)
+        # Force Chrome so the browser-agent extension loads the tab.
+        # Plain `open` follows macOS default (Safari on dev machines).
+        subprocess.run(["open", "-a", "Google Chrome", url], check=False)
         overlay.push("ambient_ack", f"✓ opened {url}")
         agent_log("ambient:local:done", f"open_url {url}")
         return
@@ -2415,7 +2419,14 @@ def _open_url_local(url: str) -> None:
         return
     try:
         import subprocess
-        subprocess.run(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        # Force Chrome so the browser-agent extension drives the tab.
+        # Plain `open <url>` leaks to Safari on systems where it's default.
+        subprocess.run(
+            ["open", "-a", "Google Chrome", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
     except Exception:
         pass
 
