@@ -850,20 +850,24 @@ async def _run_find_flights_flow(
     dest_code   = cheapest.get("flyTo",   destination)
     date_label  = f"  {slots.get('depart_date', '')}" if slots.get("depart_date") else ""
     overlay.push("assistant", f"Flights  {origin_code} → {dest_code}{date_label}")
-    for i, f in enumerate(top, 1):
-        overlay.push("assistant", f"  {i}.  {format_flight_summary(f)}")
 
-    # Calendar event + chip
+    # Build chip list: each flight as a clickable link, then calendar
+    items: list[dict] = []
+    for i, f in enumerate(top, 1):
+        deeplink = str(f.get("deepLink") or "")
+        label = f"{i}.  {format_flight_summary(f)}"
+        items.append({"label": label, "path": deeplink})
+
+    # Calendar event
     try:
         from executors.calendar import add_flight_events
         n = add_flight_events(slots, cheapest)
         if n > 0:
-            overlay.push("cited_paths", _json.dumps(
-                [{"label": "Open Calendar", "path": "ali://calendar/"}],
-                ensure_ascii=False,
-            ))
+            items.append({"label": "Open Calendar", "path": "ali://calendar/"})
     except Exception:
         n = 0
+
+    overlay.push("cited_paths", _json.dumps(items, ensure_ascii=False))
 
     speak(
         f"Cheapest is {int(cheapest.get('price') or 0)} dollars to "
@@ -1342,20 +1346,24 @@ async def _execute_ambient_find_flights(
     dest_code   = cheapest.get("flyTo",   destination)
     date_label  = f"  {slots.get('depart_date', '')}" if slots.get("depart_date") else ""
     overlay.push("assistant", f"Flights  {origin_code} → {dest_code}{date_label}")
-    for i, f in enumerate(top, 1):
-        overlay.push("assistant", f"  {i}.  {format_flight_summary(f)}")
 
-    # Calendar event + chip
+    # Build chip list: each flight as a clickable link, then calendar
+    items: list[dict] = []
+    for i, f in enumerate(top, 1):
+        deeplink = str(f.get("deepLink") or "")
+        label = f"{i}.  {format_flight_summary(f)}"
+        items.append({"label": label, "path": deeplink})
+
+    # Calendar event
     try:
         from executors.calendar import add_flight_events
         n = add_flight_events(slots, cheapest)
         if n > 0:
-            overlay.push("cited_paths", _json.dumps(
-                [{"label": "Open Calendar", "path": "ali://calendar/"}],
-                ensure_ascii=False,
-            ))
+            items.append({"label": "Open Calendar", "path": "ali://calendar/"})
     except Exception:
         n = 0
+
+    overlay.push("cited_paths", _json.dumps(items, ensure_ascii=False))
 
     speak(
         f"Cheapest is {int(cheapest.get('price') or 0)} dollars to "
