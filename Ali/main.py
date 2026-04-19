@@ -119,6 +119,18 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     await _route_to_browser(transcript, orchestrator, overlay, menu_bar)
                     return
 
+                # 1.5 — OpenCLI fast path: deterministic adapters for known
+                #       sites (no LLM in the loop). Feature-flag gated so we
+                #       can A/B against browser_task live.
+                from config.settings import ROUTE_OPENCLI_ENABLED, ROUTE_BROWSER_TASK_ENABLED
+                if ROUTE_OPENCLI_ENABLED:
+                    from executors.opencli_client import match_intent
+                    hit = match_intent(transcript)
+                    if hit is not None:
+                        print(f"[opencli] matched intent: {hit[0].name}")
+                        await _route_to_opencli(transcript, hit, overlay, menu_bar)
+                        return
+
                 # 2 — Parse intent
                 menu_bar.set_status("parsing intent")
                 print("[2/3] Parsing intent...")
@@ -189,6 +201,16 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 # the agent receives the raw transcript so it can interpret
                 # "open my linking" as "linkedin" itself.
                 if _is_browser_intent(intent):
+                    if not ROUTE_BROWSER_TASK_ENABLED:
+                        # browser_task path is disabled by flag — fall
+                        # through to chat_reply instead of a silent no-op.
+                        from intent.chat import chat_reply
+                        from voice.speak import speak
+                        print("[route] browser_task disabled by flag — using chat fallback")
+                        reply = await chat_reply(transcript)
+                        overlay.push("assistant", reply or "That would need a browser, but it's turned off.")
+                        speak(reply or "Browser routing is turned off.")
+                        return
                     # #region agent log
                     try:
                         import json as _j, os as _o, time as _t
@@ -198,7 +220,7 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                             _f.write(_j.dumps({"sessionId":"4ea166","hypothesisId":"H11",
                                 "location":"main:browser_session_dispatch",
                                 "message":"routing utterance to persistent browser session",
-                                "data":{"goal": intent.goal.value, "cold_start": not _browser_active},
+                                "data":{"goal": intent.goal.value, "cold_start": _browser_handle is None},
                                 "timestamp": int(_t.time()*1000)})+"\n")
                             _f.flush()
                     except Exception:
@@ -451,6 +473,43 @@ async def _reset_browser_session(orchestrator) -> None:
     except Exception:
         pass
     _browser_handle = None
+
+
+async def _route_to_opencli(transcript: str, hit, overlay, menu_bar) -> None:
+    """Dispatch a voice utterance through opencli (deterministic adapter).
+
+    `hit` is (OpenCliIntent, capture_groups). On success, summarize the rows
+    via the intent's speak_template and read them back; on failure, surface
+    a short error and DO NOT fall back to browser_task silently — the user
+    can say the command again or use a more general phrasing.
+    """
+    from voice.speak import speak
+    from executors.opencli_client import run_intent, summarize
+
+    intent, groups = hit
+    menu_bar.set_status("running")
+    overlay.push("action", f"opencli: {intent.name}")
+
+    try:
+        result = await run_intent(intent, groups)
+    except FileNotFoundError as e:
+        msg = f"opencli binary not found: {e}"
+        print(f"[opencli] {msg}")
+        overlay.push("error", msg)
+        speak("OpenCLI isn't installed.")
+        return
+
+    if result.ok:
+        reply = summarize(result, intent, groups).strip() or "Done."
+        print(f"[opencli] ✓ {intent.name} → {reply[:200]}")
+        overlay.push("assistant", reply[:400])
+        speak(reply[:400])
+        return
+
+    err = result.error_message()
+    print(f"[opencli] ✗ {intent.name}: {err}")
+    overlay.push("error", err[:200])
+    speak("That opencli command failed.")
 
 
 async def _run_meeting_capture(overlay, menu_bar) -> None:

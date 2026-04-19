@@ -34,6 +34,25 @@ CACTUS_VL_MODEL    = os.getenv("CACTUS_VL_MODEL",    "google/gemma-4-E2B-it")
 CACTUS_SIDECAR_URL = os.getenv("CACTUS_SIDECAR_URL", "http://127.0.0.1:8765")
 AGENT_NODE_BIN     = os.getenv("AGENT_NODE_BIN",     "node")
 
+# ── OpenCLI routing (deterministic, pre-built adapters) ──────────────────────
+# When ROUTE_OPENCLI_ENABLED is on, voice transcripts that match an entry in
+# config/opencli_intents.json are dispatched to the opencli CLI (no LLM in the
+# loop). If no intent matches or the flag is off, we fall back to
+# ROUTE_BROWSER_TASK_ENABLED — the LLM-driven browser sub-agent. Both flags can
+# be toggled at the command line via env to A/B the two paths live.
+ROUTE_OPENCLI_ENABLED     = os.environ.get("VOICE_AGENT_ROUTE_OPENCLI", "1").lower() in {"1", "true", "yes"}
+ROUTE_BROWSER_TASK_ENABLED = os.environ.get("VOICE_AGENT_ROUTE_BROWSER_TASK", "1").lower() in {"1", "true", "yes"}
+# OpenCLI requires Node >= 22.19. Bypass the shebang and invoke node+entry
+# directly so a stale `env node` in PATH can't resolve to an older version.
+OPENCLI_NODE_BIN = os.environ.get(
+    "OPENCLI_NODE_BIN",
+    "/Users/apple/.nvm/versions/node/v22.22.2/bin/node",
+)
+OPENCLI_ENTRY = os.environ.get(
+    "OPENCLI_ENTRY",
+    "/Users/apple/.nvm/versions/node/v22.22.2/lib/node_modules/@jackwener/opencli/dist/src/main.js",
+)
+
 # ── Whisper fallback ──────────────────────────────────────────────────────────
 WHISPER_MODEL_SIZE = "base.en"   # tiny.en | base.en | small.en
 

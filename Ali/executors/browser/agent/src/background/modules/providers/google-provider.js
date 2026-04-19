@@ -71,19 +71,29 @@ export class GoogleProvider extends BaseProvider {
     const googleTools = this._convertTools(tools);
     const googleMessages = this._convertMessages(messages);
 
-    return {
+    const body = {
       contents: googleMessages,
-      tools: googleTools,
-      tool_config: {
-        function_calling_config: {
-          mode: 'AUTO', // Let Gemini decide when to use functions vs return text
-        },
-      },
       generationConfig: {
         maxOutputTokens: this.config.maxTokens || 10000,
       },
       systemInstruction: { parts: [{ text: systemText }] },
     };
+
+    // Only attach tools + tool_config when we actually have function
+    // declarations. Gemini returns
+    //   400: Function calling config is set without function_declarations
+    // when tool_config is present but the declarations are empty — which
+    // happens on nested LLM calls (e.g. the `find` tool's element picker).
+    if (googleTools.length > 0) {
+      body.tools = googleTools;
+      body.tool_config = {
+        function_calling_config: {
+          mode: 'AUTO', // Let Gemini decide when to use functions vs return text
+        },
+      };
+    }
+
+    return body;
   }
 
   normalizeResponse(response) {

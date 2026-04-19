@@ -1,0 +1,60 @@
+{
+  "intents": [
+    {
+      "name": "hn_top",
+      "match": "(?i).*(?:top|latest)?\\s*hacker ?news(?:\\s+stories)?\\b",
+      "description": "Top stories on Hacker News",
+      "cmd": ["hackernews", "top", "--limit", "5"],
+      "speak_template": "Top Hacker News: {top3_titles}"
+    },
+    {
+      "name": "hn_search",
+      "match": "(?i)search (?:hn|hacker ?news)(?: for)? (.+?)\\.?$",
+      "description": "Hacker News search (positional query)",
+      "cmd": ["hackernews", "search", "$1", "--limit", "5"],
+      "speak_template": "Hacker News on {match_1}: {top3_titles}"
+    },
+    {
+      "name": "linkedin_feed",
+      "match": "(?i).*\\blinkedin(?:\\s+feed)?\\b(?:\\s*(?:please|for me))?\\.?$",
+      "description": "LinkedIn timeline",
+      "cmd": ["linkedin", "timeline", "--limit", "5"],
+      "speak_template": "Top on your LinkedIn: {top3_titles}"
+    },
+    {
+      "name": "reddit_hot",
+      "match": "(?i).*(?:\\btop\\b|\\bhot\\b|what'?s).*\\breddit\\b",
+      "description": "Reddit hot",
+      "cmd": ["reddit", "hot", "--limit", "5"],
+      "speak_template": "Top on Reddit: {top3_titles}"
+    },
+    {
+      "name": "google_search",
+      "match": "(?i)^(?:google|search)(?:\\s+google)?(?:\\s+for)?\\s+(.+?)\\.?$",
+      "description": "Google web search (positional keyword)",
+      "cmd": ["google", "search", "$1", "--limit", "5"],
+      "speak_template": "Top Google results for {match_1}: {top3_titles}"
+    },
+    {
+      "name": "wikipedia_search",
+      "match": "(?i)(?:wikipedia|wiki)(?:\\s+(?:search|look ?up|tell me about))?\\s+(.+?)\\.?$",
+      "description": "Wikipedia article search",
+      "cmd": ["wikipedia", "search", "$1", "--limit", "3"],
+      "speak_template": "Wikipedia on {match_1}: {top3_titles}"
+    },
+    {
+      "name": "producthunt_today",
+      "match": "(?i).*(?:top|what'?s on|show) (?:on )?product ?hunt(?:\\s+today)?\\b",
+      "description": "Today's Product Hunt launches",
+      "cmd": ["producthunt", "today", "--limit", "5"],
+      "speak_template": "Today on Product Hunt: {top3_titles}"
+    },
+    {
+      "name": "google_news",
+      "match": "(?i)(?:what'?s|give me|show)(?: me)?(?: the)? (?:news|headlines|top news)(?:\\s+today)?\\b",
+      "description": "Google News top headlines",
+      "cmd": ["google", "news", "--limit", "5"],
+      "speak_template": "Top headlines: {top3_titles}"
+    }
+  ]
+}
