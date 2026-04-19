@@ -337,6 +337,20 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 menu_bar.set_status("running")
                 overlay.push("action", f"Running: {goal_label}…")
 
+                # Flights: build Kiwi URL and open it. No browser agent
+                # needed — Kiwi's results page is all the user wants to see.
+                if intent.goal == KnownGoal.FIND_FLIGHTS:
+                    from executors.flights import build_kiwi_url
+                    try:
+                        url = build_kiwi_url(intent.slots)
+                    except ValueError as e:
+                        overlay.push("error", f"Can't build flight search: {e}")
+                        speak("I didn't catch the origin or destination.")
+                        return
+                    _open_url_local(url)
+                    overlay.push("done", f"Opened {url}")
+                    return
+
                 # Browser-shaped intents (open_url, apply_to_job, anything the
                 # parser flagged requires_browser=True) all enter the same
                 # persistent session. Intent metadata is used only to route;
