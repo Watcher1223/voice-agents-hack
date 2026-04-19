@@ -28,12 +28,42 @@ class TranscriptionOverlay(Protocol):
 def _build_overlay() -> tuple["TranscriptionOverlay", Callable[[], None]]:
     backend = os.getenv("ALI_UI_BACKEND", "qt").strip().lower()
     if backend == "qt":
+        import signal
+
+        from PySide6.QtCore import QTimer  # pyright: ignore[reportMissingImports]
         from PySide6.QtWidgets import QApplication  # pyright: ignore[reportMissingImports]
         from ui.overlay import TranscriptionOverlay
 
         app = QApplication(sys.argv)
         overlay = TranscriptionOverlay(app)
-        return overlay, app.exec
+
+        # Wire Ctrl+C / SIGTERM into Qt's event loop so the process can exit
+        # cleanly and the menu-bar status icon disappears with it.
+        def _handle_signal(*_args) -> None:
+            print("[main] shutdown signal received — quitting")
+            app.quit()
+
+        signal.signal(signal.SIGINT, _handle_signal)
+        try:
+            signal.signal(signal.SIGTERM, _handle_signal)
+        except (ValueError, OSError):
+            pass
+
+        # Qt's event loop sleeps between UI events, which means Python signals
+        # don't fire until there's user activity. A cheap periodic no-op timer
+        # keeps the loop awake so SIGINT is delivered immediately.
+        _signal_kick = QTimer()
+        _signal_kick.start(200)
+        _signal_kick.timeout.connect(lambda: None)
+        overlay._signal_kick_timer = _signal_kick  # type: ignore[attr-defined]
+
+        def _run_qt() -> None:
+            try:
+                app.exec()
+            finally:
+                os._exit(0)
+
+        return overlay, _run_qt
 
     from ui.web_overlay import TranscriptionOverlay
 
@@ -87,10 +117,27 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
             print("[3/3] Executing...")
             menu_bar.set_status("running")
             overlay.push("action", f"Running: {goal_label}…")
+
+            # For file-reveal flows, resolve first so we can dock the overlay
+            # to the right BEFORE Finder opens. The orchestrator's internal
+            # enrich call is idempotent.
+            revealed_name: str | None = None
+            if intent.goal.value == "find_file":
+                from intent.file_resolve import enrich_intent_with_resolved_files
+                await enrich_intent_with_resolved_files(intent, transcript)
+                revealed_name = _revealed_basename(intent)
+                if revealed_name is not None:
+                    overlay.push("revealed", revealed_name)
+
             await orchestrator.run(intent)
 
             print("      ✓ Done")
-            overlay.push("done")
+            if revealed_name is None:
+                revealed_name = _revealed_basename(intent)
+                if revealed_name is not None:
+                    overlay.push("revealed", revealed_name)
+                else:
+                    overlay.push("done")
 
         except Exception as e:
             import traceback
@@ -100,6 +147,19 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
             overlay.push("error", str(e))
         finally:
             menu_bar.set_status("ready")
+
+
+def _revealed_basename(intent) -> str | None:
+    """Return the basename of a FIND_FILE that resolved to an existing path, else None."""
+    if intent.goal.value != "find_file":
+        return None
+    resolved = intent.slots.get("resolved_local_files") if isinstance(intent.slots, dict) else None
+    if not isinstance(resolved, dict):
+        return None
+    path = resolved.get("found")
+    if not isinstance(path, str) or not path:
+        return None
+    return os.path.basename(path)
 
 
 def _run_agent(overlay: "TranscriptionOverlay") -> None:

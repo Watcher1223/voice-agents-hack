@@ -25,9 +25,6 @@ playwright>=1.44.0
 # macOS menu bar
 rumps>=0.4.0
 
-# Dynamic island UI (run from Ali/: python -m island.main)
-PyQt6>=6.6
-
 # Modern desktop UI (replaces tkinter overlay)
 PySide6>=6.8.0
 websockets>=12.0

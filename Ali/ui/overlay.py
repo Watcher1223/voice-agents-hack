@@ -54,8 +54,13 @@ W_FULL  = 560
 H_PILL  = 58
 R       = 29      # large radius → pill shape
 MARGIN  = 8       # gap from top (below menu bar)
+MARGIN_RIGHT = 16 # gap from right edge when docked-right
 MAX_H   = 540
 MAX_HIST = 6
+
+# ── Docking ───────────────────────────────────────────────────────────────────
+DOCK_TOP    = "top"
+DOCK_RIGHT  = "right"
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 PULSE_MS    = 500
@@ -84,8 +89,16 @@ def _apply_macos_overlay(win: QWidget) -> None:
 
         if ns_win is not None:
             ns_win.setLevel_(25)
-            # 1=CanJoinAllSpaces 16=IgnoresCycle 256=FullScreenAuxiliary
+            # 1=CanJoinAllSpaces 16=Stationary 256=FullScreenAuxiliary
             ns_win.setCollectionBehavior_(1 | 16 | 256)
+            # Keep the overlay visible when our Python app deactivates
+            # (Finder / Mail take focus). Without this, Qt.Tool windows
+            # auto-hide on deactivation and the user has to click the Dock
+            # icon to bring it back.
+            try:
+                ns_win.setHidesOnDeactivate_(False)
+            except Exception:
+                pass
             ns_win.setOpaque_(False)
             ns_win.setBackgroundColor_(NSColor.clearColor())
 
@@ -144,6 +157,8 @@ class TranscriptionOverlay(QWidget):
         self._cam_running = False
         self._cam_bridge.frame_ready.connect(self._on_cam_frame)
         self._cam_bridge.greeted.connect(self._on_wake_greeted)
+
+        self._dock_mode: str = DOCK_TOP
 
         self._font_label = QFont(".AppleSystemUIFont", 15, QFont.Weight.Bold)
         self._font_body  = QFont(".AppleSystemUIFont", 14)
@@ -313,10 +328,12 @@ class TranscriptionOverlay(QWidget):
         self._pulse_timer.stop()
 
         if state == "hidden":
+            self._dock_mode = DOCK_TOP
             self._do_hide()
             return
 
         if state == "wake":
+            self._dock_mode = DOCK_TOP
             self._wake_mode = True
             self._wake_greeted = False
             self._wake_text = ""
@@ -327,6 +344,7 @@ class TranscriptionOverlay(QWidget):
             return
 
         if state == "recording":
+            self._dock_mode = DOCK_TOP
             self._history.clear()
             self._recording = True
             self._pulse_on = True
@@ -348,6 +366,14 @@ class TranscriptionOverlay(QWidget):
             self._history.append((text, BLUE, "status"))
         elif state == "action":
             self._history.append((text, GREEN, "assistant"))
+        elif state == "revealed":
+            label = f"Revealed in Finder: {text}" if text else "Revealed in Finder"
+            self._history.append((label, GREEN, "assistant"))
+            self._dock_mode = DOCK_RIGHT
+            # No autohide — leave visible beside the Finder window until the
+            # user dismisses or triggers a new command. Always-on-top is
+            # handled by the NSStatusWindowLevel set in _apply_macos_overlay
+            # so Finder can come forward normally without fighting us.
         elif state == "done":
             self._history.append(("✓  Done", GREEN, "assistant"))
             self._autohide_timer.start(AUTOHIDE_MS)
@@ -376,8 +402,13 @@ class TranscriptionOverlay(QWidget):
         screen = QGuiApplication.primaryScreen()
         if screen:
             geo = screen.availableGeometry()
-            x = geo.center().x() - w // 2
-            y = geo.top() + MARGIN
+            if self._dock_mode == DOCK_RIGHT:
+                x = geo.right() - w - MARGIN_RIGHT
+                y = geo.center().y() - h // 2
+                y = max(geo.top() + MARGIN, min(y, geo.bottom() - h - MARGIN))
+            else:
+                x = geo.center().x() - w // 2
+                y = geo.top() + MARGIN
             self.setGeometry(x, y, w, h)
         else:
             self.resize(w, h)
