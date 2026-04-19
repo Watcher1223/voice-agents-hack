@@ -208,13 +208,15 @@ async def _call_cactus(prompt: str, model: str) -> str:
     # chat REPL. We pipe "exit" on stdin so the process terminates after one
     # turn instead of hanging on the "You:" prompt.
     proc: asyncio.subprocess.Process | None = None
+    safe_prompt = _sanitize_for_argv(prompt)
+    safe_model = _sanitize_for_argv(model)
     try:
         proc = await asyncio.create_subprocess_exec(
             _CACTUS_CLI,
             "run",
-            model,
+            safe_model,
             "--prompt",
-            prompt,
+            safe_prompt,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
