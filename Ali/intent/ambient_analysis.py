@@ -127,12 +127,28 @@ def _best_effort_json(raw: str) -> tuple[dict[str, Any] | None, str]:
     return None, cleaned
 
 
-def _assemble_prompt(history: list[str], previous: AmbientAnalysis | None) -> str:
+def _assemble_prompt(
+    history: list[str],
+    previous: AmbientAnalysis | None,
+    screen_app: str = "",
+    screen_window_title: str = "",
+) -> str:
     hist_block = "\n".join(f"- {line}" for line in history) or "(empty)"
     prev_block = previous.raw_json if (previous and previous.raw_json) else "(none)"
+    screen_block = "(none)"
+    if screen_app or screen_window_title:
+        screen_block = (
+            f"Active app: {screen_app or 'unknown'}\n"
+            f"Window title: {screen_window_title or 'unknown'}\n"
+            "A screenshot of the user's current screen is attached to this "
+            "request. Feel free to reference what's visible on it when it "
+            "directly helps answer a question, define a term the user can "
+            "see, or suggest an action about what's open."
+        )
     return (
         f"{_SYSTEM}\n\n"
         f"{_HISTORY_PREAMBLE}\n{hist_block}\n\n"
+        f"CURRENT SCREEN CONTEXT:\n{screen_block}\n\n"
         f"{_PREVIOUS_JSON_PREAMBLE}\n{prev_block}\n\n"
         "Emit your JSON object now."
     )
@@ -141,21 +157,40 @@ def _assemble_prompt(history: list[str], previous: AmbientAnalysis | None) -> st
 async def analyse(
     history: list[str],
     previous: AmbientAnalysis | None = None,
+    screen_app: str = "",
+    screen_window_title: str = "",
+    screen_image_bytes: bytes = b"",
 ) -> AmbientAnalysis:
     """Run one pass of ambient analysis over the rolling transcript. Returns
     a tier-4 (silent) result on any error so the caller never has to
-    exception-handle — ambient must fail quiet."""
+    exception-handle — ambient must fail quiet.
+
+    Screen context is optional. When provided, the prompt tells the model
+    that the image + app name + window title are the user's current focus;
+    this lets tier 1-3 reference on-screen details ('the Gmail compose
+    window', 'the arxiv paper you're reading').
+    """
     if not _AVAILABLE or not history:
         return AmbientAnalysis()
 
-    prompt = _assemble_prompt(history, previous)
+    prompt = _assemble_prompt(history, previous, screen_app, screen_window_title)
     loop = asyncio.get_event_loop()
 
     def _call() -> str:
         client = _genai.Client(api_key=GEMINI_API_KEY)
+        contents: list = [prompt]
+        if screen_image_bytes:
+            # google-genai Part with inline bytes + mime type. Gemini Flash
+            # handles JPEG natively; no need to upload first.
+            contents.append(
+                _genai.types.Part.from_bytes(
+                    data=screen_image_bytes,
+                    mime_type="image/jpeg",
+                )
+            )
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=prompt,
+            contents=contents,
             config=_genai.types.GenerateContentConfig(
                 temperature=0.2,
                 max_output_tokens=2048,

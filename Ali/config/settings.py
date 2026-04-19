@@ -46,6 +46,12 @@ ROUTE_BROWSER_TASK_ENABLED = os.environ.get("VOICE_AGENT_ROUTE_BROWSER_TASK", "1
 # surfaces suggestions every 5 final transcripts (not 12s wall-clock). Off
 # by default so push-to-talk keeps working without a live mic stream.
 AMBIENT_ENABLED = os.environ.get("VOICE_AGENT_AMBIENT", "0").lower() in {"1", "true", "yes"}
+# Event-driven screen context: snap when focus changes or screen is stale.
+# Passed as an image + app/title to the ambient analyser so tier 1-3 can
+# reference what's on screen. On by default when ambient is on.
+AMBIENT_SCREEN_ENABLED = os.environ.get(
+    "VOICE_AGENT_AMBIENT_SCREEN", "1" if AMBIENT_ENABLED else "0"
+).lower() in {"1", "true", "yes"}
 # OpenCLI requires Node >= 22.19. Bypass the shebang and invoke node+entry
 # directly so a stale `env node` in PATH can't resolve to an older version.
 OPENCLI_NODE_BIN = os.environ.get(

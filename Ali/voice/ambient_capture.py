@@ -40,10 +40,12 @@ class AmbientCapture:
         on_interim: Callable[[str], None],
         on_final: Callable[[str], None],
         on_suggestion: Callable[["AmbientAnalysis"], None],
+        screen_observer=None,
     ) -> None:
         self._on_interim    = on_interim
         self._on_final      = on_final
         self._on_suggestion = on_suggestion
+        self._screen_observer = screen_observer
 
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -114,7 +116,19 @@ class AmbientCapture:
         try:
             with self._lock:
                 history_snapshot = list(self._history)
-            result = await analyse(history_snapshot, self._previous)
+            screen_app, screen_title, image = "", "", b""
+            if self._screen_observer is not None:
+                ctx = self._screen_observer.latest_context()
+                screen_app = ctx.app
+                screen_title = ctx.window_title
+                image = ctx.image_bytes
+            result = await analyse(
+                history_snapshot,
+                self._previous,
+                screen_app=screen_app,
+                screen_window_title=screen_title,
+                screen_image_bytes=image,
+            )
             if result.should_surface():
                 self._previous = result
                 self._on_suggestion(result)

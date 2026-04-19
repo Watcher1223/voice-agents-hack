@@ -384,6 +384,8 @@ async def _run_ambient_capture(overlay) -> None:
     global _ambient_capture
     from voice.ambient_capture import AmbientCapture
     from voice.speak import speak
+    from observer.screen_loop import ScreenObserver
+    from config.settings import AMBIENT_SCREEN_ENABLED
 
     def _on_interim(text: str) -> None:
         # Feather-light: just update the overlay's transcribing line so
@@ -405,7 +407,13 @@ async def _run_ambient_capture(overlay) -> None:
         if tier in (1, 2) and detail:
             speak(detail[:400])
 
-    capture = AmbientCapture(_on_interim, _on_final, _on_suggestion)
+    screen = None
+    if AMBIENT_SCREEN_ENABLED:
+        screen = ScreenObserver()
+        screen.start()
+        print("[ambient] screen observer started (event-driven snapshots)")
+
+    capture = AmbientCapture(_on_interim, _on_final, _on_suggestion, screen_observer=screen)
     _ambient_capture = capture
     print("[ambient] starting glass-style listen loop (every 5 finals → analyse)")
     try:
@@ -413,6 +421,8 @@ async def _run_ambient_capture(overlay) -> None:
     except Exception as e:
         print(f"[ambient] loop crashed: {e}")
     finally:
+        if screen is not None:
+            screen.stop()
         _ambient_capture = None
 
 # Persistent browser sub-agent session. One session spans many voice
