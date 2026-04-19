@@ -672,10 +672,14 @@ async def _run_ambient_capture(overlay) -> None:
         headline = analysis.headline.strip()
         detail = (analysis.detail or headline).strip()
 
-        # Tier 1/2 — info only. Show always; speak only if voice is
-        # enabled AND we're not in a meeting.
+        # Tier 1/2 — info only. Show BOTH headline and detail on the
+        # overlay. Earlier we only pushed the headline, which is just
+        # the question restated — the user wants the actual answer.
+        # Speak only if voice is explicitly enabled.
         if tier in (1, 2):
             overlay.push("assistant", headline[:200])
+            if detail:
+                overlay.push("assistant", detail[:400])
             if detail and _should_speak():
                 speak(detail[:200])
             return
