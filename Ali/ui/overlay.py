@@ -46,14 +46,14 @@ def _dlog(loc: str, msg: str, data: dict, hid: str = "H2") -> None:
 # PyAudio/CoreAudio). Import cv2 lazily, only when the wake-scene actually
 # opens the webcam.
 
-W_WAKE    = 560
+W_WAKE    = 476   # was 560, reduced 15% for stage projector
 H_WAKE    = 200
 CAM_W     = 160
 CAM_H     = 160
 USER_NAME = "Alspencer"
 
 # ── Meeting mode geometry ─────────────────────────────────────────────────────
-W_MEETING       = 560
+W_MEETING       = 476   # was 560, reduced 15% for stage projector
 H_MEETING_BASE  = 200    # height before any action items
 H_ACTION_ROW    = 52     # height per action item row (fits 80×45 thumbnail)
 MAX_ACTIONS_SHOWN = 5
@@ -119,8 +119,8 @@ R_TOP_EXPANDED = 12   # VoiceInk live-text top
 R_BOT_EXPANDED = 22   # VoiceInk live-text bottom
 R_FLOATING     = 20   # MiniRecorderView compactCornerRadius (when floating)
 
-W_PILL  = 340        # compact pill
-W_FULL  = 560        # expanded history
+W_PILL  = 289        # compact pill   (was 340, reduced 15%)
+W_FULL  = 476        # expanded history (was 560, reduced 15%)
 H_PILL  = 44         # tightened: matches VoiceInk mainRow (notchH + 6)
 MARGIN  = 0          # attach to menu bar edge (Dynamic Island anchor)
 MARGIN_RIGHT = 16    # gap from right edge when docked-right
@@ -584,8 +584,8 @@ class TranscriptionOverlay(QWidget):
         Requires Accessibility for the host app (Terminal, Cursor, etc.).
         """
         try:
-            import AppKit
-            from AppKit import NSEvent
+            import AppKit  # type: ignore[reportMissingImports]
+            from AppKit import NSEvent  # type: ignore[reportMissingImports]
         except ImportError:
             print("[overlay] AppKit unavailable — global hotkeys skipped", flush=True)
             return
