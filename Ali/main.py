@@ -162,6 +162,14 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 overlay.push("transcript", f'"{transcript}"')
 
                 from intent.grad_calendar_hint import append_grad_calendar_note_if_needed
+                from intent.pronoun_rewrite import rewrite_self_pronouns
+
+                # Demo-mode rewrite: "me"/"my" → "hanzi" so self-directed
+                # tasks route to Hanzi uniformly. Keep the raw transcript for
+                # display/knowledge-question paths.
+                routing_transcript = rewrite_self_pronouns(transcript)
+                if routing_transcript != transcript:
+                    print(f"[pronoun-rewrite] {transcript!r} → {routing_transcript!r}")
 
                 # Multi-turn follow-up: if the previous turn asked for a
                 # missing slot (e.g. "What should I say?", "Where to?"),
@@ -208,7 +216,7 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 #     inbox" → "reply to hanzi").
                 if _browser_handle is not None:
                     print(f"[browser] extending session {_browser_handle} — skipping classifier")
-                    await _route_to_browser(transcript, orchestrator, overlay, menu_bar)
+                    await _route_to_browser(routing_transcript, orchestrator, overlay, menu_bar)
                     return
 
                 # 1.5 — OpenCLI fast path: deterministic adapters for known
@@ -226,7 +234,7 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 # 2 — Parse intent
                 menu_bar.set_status("parsing intent")
                 print("[2/3] Parsing intent...")
-                intent = await parse_intent(transcript)
+                intent = await parse_intent(routing_transcript)
                 print(f"      → goal={intent.goal.value}  slots={intent.slots}")
                 # #region agent log
                 try:
@@ -310,14 +318,33 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     speak(out)
                     return
 
+                # 2.7 — Multi-action quick path. If a single utterance
+                # packs multiple actions ("email Korin AND book a flight",
+                # "text me X. Also email me X"), run the Gemma extractor
+                # to split them and fire each one in parallel through the
+                # native + shared browser clients. This runs BEFORE the
+                # send_message branch so a bundled "text+email" request
+                # isn't silently collapsed into just the iMessage half.
+                # Skips for browser-shaped / find-file intents, which have
+                # specific flows.
+                if (
+                    not _is_browser_intent(intent)
+                    and intent.goal.value not in ("find_file",)
+                    and _is_multi_action_candidate(routing_transcript)
+                ):
+                    handled = await _run_quick_multi_action(routing_transcript, overlay, menu_bar)
+                    if handled:
+                        return
+
                 # send_message bypasses the browser sub-agent and the
                 # vision-first orchestrator — it fires an iMessage via
                 # AppleScript directly. Keep this ahead of the
-                # multi-action and browser-routing branches so "text
-                # Hanzi …" always hits the local path.
+                # browser-routing branch so "text Hanzi …" always hits
+                # the local path when the utterance is single-action.
                 if intent.goal.value == "send_message":
                     contact_raw = str(intent.slots.get("contact") or "").strip()
                     body = str(intent.slots.get("body") or "").strip()
+                    file_query = str(intent.slots.get("file_query") or "").strip()
                     if contact_raw.lower() == "unknown":
                         contact_raw = ""
                     await _run_send_message_flow(
@@ -327,23 +354,9 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                         overlay,
                         menu_bar,
                         request_ptt_session_from_wake,
+                        file_query=file_query,
                     )
                     return
-
-                # 2.7 — Multi-action quick path. If a single utterance
-                # packs multiple actions ("email Korin AND book a flight"),
-                # run the Gemma extractor to split them and fire each one
-                # in parallel through the shared browser client. Skips for
-                # browser-shaped / find-file intents, which have specific
-                # flows.
-                if (
-                    not _is_browser_intent(intent)
-                    and intent.goal.value not in ("find_file",)
-                    and _is_multi_action_candidate(transcript)
-                ):
-                    handled = await _run_quick_multi_action(transcript, overlay, menu_bar)
-                    if handled:
-                        return
 
                 # 3 — Execute (known intent)
                 print("[3/3] Executing...")
@@ -381,7 +394,7 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     except Exception:
                         pass
                     # #endregion
-                    await _route_to_browser(transcript, orchestrator, overlay, menu_bar)
+                    await _route_to_browser(routing_transcript, orchestrator, overlay, menu_bar)
                     return
 
                 revealed_name: str | None = None
@@ -604,6 +617,8 @@ async def _run_send_message_flow(
     overlay,
     menu_bar,
     request_ptt_session_from_wake,
+    *,
+    file_query: str = "",
 ) -> None:
     """Send an iMessage end-to-end. Prompts for missing contact/body and
     auto-relistens via PTT so the user can just speak the answer. If the
@@ -614,16 +629,19 @@ async def _run_send_message_flow(
         AppleScriptExecutionError,
         AppleScriptExecutor,
     )
+    from executors.local.filesystem import resolve_file_query_to_path_async
     from voice.speak import speak
 
     contact = (contact or "").strip()
     body = (body or "").strip()
+    file_query = (file_query or "").strip()
 
     if not contact:
         async def _resume_contact(answer: str) -> None:
             await _run_send_message_flow(
                 answer, body, goal_label, overlay, menu_bar,
                 request_ptt_session_from_wake,
+                file_query=file_query,
             )
 
         _ask_followup(
@@ -635,7 +653,7 @@ async def _run_send_message_flow(
         )
         return
 
-    if not body:
+    if not body and not file_query:
         async def _resume_body(answer: str) -> None:
             # If the body reply bundles extra actions ("I'll be late,
             # and book me a flight to LA"), peel them off so we don't
@@ -646,6 +664,7 @@ async def _run_send_message_flow(
             await _run_send_message_flow(
                 contact, extra_body, goal_label, overlay, menu_bar,
                 request_ptt_session_from_wake,
+                file_query=file_query,
             )
 
         _ask_followup(
@@ -661,6 +680,15 @@ async def _run_send_message_flow(
     menu_bar.set_status("running")
     overlay.push("action", f"Running: {goal_label}…")
 
+    attachments: list[str] = []
+    if file_query:
+        resolved = await resolve_file_query_to_path_async(file_query)
+        if resolved:
+            attachments.append(resolved)
+            print(f"[send_message] resolved file_query {file_query!r} → {resolved}")
+        else:
+            print(f"[send_message] could not resolve file_query {file_query!r}")
+
     applescript = AppleScriptExecutor()
     address = contact
     if "@" not in contact and not contact.startswith("+"):
@@ -672,13 +700,16 @@ async def _run_send_message_flow(
             return
 
     try:
-        applescript.send_imessage(contact=address, body=body)
+        applescript.send_imessage(
+            contact=address, body=body, attachments=attachments or None,
+        )
     except AppleScriptExecutionError as exc:
         overlay.push("error", str(exc))
         speak("I couldn't send that message.")
         return
 
-    overlay.push("assistant", f"✓ iMessage → {contact}: {body[:140]}")
+    att_note = f" · {len(attachments)} attached" if attachments else ""
+    overlay.push("assistant", f"✓ iMessage → {contact}: {body[:140]}{att_note}")
     speak("Sent.")
 
 
@@ -739,7 +770,7 @@ async def _dispatch_extracted_items(
     """Run a pre-extracted list of action items through the same
     machinery `_run_quick_multi_action` uses. Skips the extractor step
     since we already have the items."""
-    from executors.meeting_tasks import search_flight, draft_email_in_gmail, TaskResult
+    from executors.meeting_tasks import search_flight, TaskResult
     from voice.speak import speak
     import asyncio as _aio
 
@@ -765,11 +796,11 @@ async def _dispatch_extracted_items(
                 origin = slots.get("origin") or ""
                 result = await search_flight(browser_client, browser_lock, dest, date, origin)
             elif item_type in ("draft_email", "send_email", "compose_email", "compose_mail"):
-                recipient = slots.get("recipient") or ""
-                subject = slots.get("subject") or "Follow-up"
-                key_points = slots.get("key_points") or ""
-                body = key_points or f"Hi {recipient},\n\nFollowing up per our conversation."
-                result = await draft_email_in_gmail(browser_client, browser_lock, recipient, subject, body)
+                result = await _dispatch_email_item(
+                    slots, task_label, browser_client, browser_lock,
+                )
+            elif item_type in ("send_message", "send_imessage", "imessage"):
+                result = await _dispatch_imessage_item(slots, task_label)
             else:
                 result = TaskResult(False, "unsupported", detail=f"type={item_type}")
         except Exception as exc:
@@ -786,6 +817,109 @@ async def _dispatch_extracted_items(
 
     if results_summary:
         speak("Also handled " + "; ".join(s.split(":")[0] for s in results_summary) + ".")
+
+
+async def _dispatch_email_item(
+    slots: dict,
+    task_label: str,
+    browser_client,
+    browser_lock,
+):
+    """Send an extracted draft_email item via native Mail.app (attachments
+    Just Work). Falls back to the Gmail browser executor only if the
+    AppleScript path errors out."""
+    from executors.local.applescript import AppleScriptExecutionError, AppleScriptExecutor
+    from executors.local.filesystem import resolve_file_query_to_path_async
+    from executors.meeting_tasks import TaskResult, draft_email_in_gmail
+
+    recipient = str(slots.get("recipient") or slots.get("to") or "").strip()
+    subject = str(slots.get("subject") or "Follow-up").strip()
+    key_points = str(slots.get("key_points") or slots.get("body") or "").strip()
+    body = key_points or f"Hi {recipient or 'there'},\n\nFollowing up per our conversation."
+
+    attachments: list[str] = []
+    file_query = str(slots.get("file_query") or "").strip()
+    if file_query:
+        resolved = await resolve_file_query_to_path_async(file_query)
+        if resolved:
+            attachments.append(resolved)
+
+    applescript = AppleScriptExecutor()
+    address = recipient
+    if recipient and "@" not in recipient and not recipient.startswith("+"):
+        try:
+            address = applescript.resolve_contact(recipient) or recipient
+        except AppleScriptExecutionError:
+            address = recipient
+
+    try:
+        applescript.compose_mail(
+            to=address,
+            subject=subject,
+            body=body,
+            send=False,
+            attachments=attachments or None,
+        )
+        att_note = f" · {len(attachments)} attached" if attachments else ""
+        label = recipient or address or "the recipient"
+        return TaskResult(
+            success=True,
+            summary=f"Mail draft ready for {label}{att_note}",
+        )
+    except AppleScriptExecutionError as exc:
+        print(f"[multi-action] Mail.app draft failed ({exc}); falling back to Gmail browser")
+        try:
+            return await draft_email_in_gmail(
+                browser_client, browser_lock, recipient, subject, body,
+            )
+        except Exception as exc2:
+            return TaskResult(False, "draft failed", detail=str(exc2))
+
+
+async def _dispatch_imessage_item(slots: dict, task_label: str):
+    """Send an extracted send_message item via iMessage, resolving the
+    contact name and any referenced file attachment."""
+    from executors.local.applescript import AppleScriptExecutionError, AppleScriptExecutor
+    from executors.local.filesystem import resolve_file_query_to_path_async
+    from executors.meeting_tasks import TaskResult
+
+    contact = str(slots.get("recipient") or slots.get("contact") or "").strip()
+    body = str(slots.get("body") or slots.get("key_points") or "").strip()
+    file_query = str(slots.get("file_query") or "").strip()
+
+    if not contact:
+        return TaskResult(False, "missing contact", detail="send_message had no recipient")
+
+    applescript = AppleScriptExecutor()
+    address = contact
+    if "@" not in contact and not contact.startswith("+"):
+        try:
+            address = applescript.resolve_contact(contact)
+        except AppleScriptExecutionError as exc:
+            return TaskResult(False, "unknown contact", detail=str(exc))
+
+    attachments: list[str] = []
+    if file_query:
+        resolved = await resolve_file_query_to_path_async(file_query)
+        if resolved:
+            attachments.append(resolved)
+
+    if not body and not attachments:
+        # If neither text nor attachment resolved, nothing to send.
+        return TaskResult(False, "empty message", detail="no body or attachment")
+
+    try:
+        applescript.send_imessage(
+            contact=address, body=body, attachments=attachments or None,
+        )
+    except AppleScriptExecutionError as exc:
+        return TaskResult(False, "send failed", detail=str(exc))
+
+    att_note = f" · {len(attachments)} attached" if attachments else ""
+    return TaskResult(
+        success=True,
+        summary=f"iMessage sent to {contact}{att_note}",
+    )
 
 
 def _match_any(text: str, tokens: set[str]) -> bool:
@@ -984,14 +1118,23 @@ def _enrich_action_dict(
     """Slot enrichment for one action: resolve contact names, find
     attachments, etc. Returns a new dict (doesn't mutate the input).
     Browser/opencli actions are passed through untouched — only
-    kind='local' has slots worth enriching."""
+    kind='local' has slots worth enriching.
+
+    Never raises — if any sub-step (contact resolution, file lookup)
+    throws, we fall back to the raw slots so the task still lands on
+    the checklist. Missing enrichment is always better than a dropped
+    task the user won't discover."""
     out = dict(action or {})
     kind = str(out.get("kind", "")).lower()
     if kind != "local":
         return out
     text = str(out.get("text", "")).strip()
     slots = dict(out.get("slots") or {})
-    out["slots"] = _enrich_local_slots(text, slots, headline, detail or "")
+    try:
+        out["slots"] = _enrich_local_slots(text, slots, headline, detail or "")
+    except Exception as exc:
+        print(f"[enrich] slot enrichment failed for text={text!r}: {exc}")
+        out["slots"] = slots
     return out
 
 
@@ -1066,27 +1209,25 @@ def _enrich_local_slots(
 
     Mutates and returns the slots dict."""
     from executors.local.applescript import AppleScriptExecutor
-    from executors.local.filesystem import FilesystemExecutor
+    from executors.local.filesystem import FilesystemExecutor, resolve_file_query_to_path
     from observer.agent_log import log as agent_log
     import re
 
     applescript = AppleScriptExecutor()
     fs = FilesystemExecutor()
 
-    if text in ("compose_mail", "send_email"):
-        to = str(slots.get("to", "")).strip()
-        # If `to` is a name (no @), try Contacts resolution.
-        if to and "@" not in to:
-            resolved = applescript.resolve_contact(to)
-            if resolved:
-                agent_log("enrich:resolve_contact", f"{to!r} → {resolved}")
-                slots["to"] = resolved
-        # File-attachment hint: if the detail mentions a common file
-        # alias, try to find it via FilesystemExecutor. find_by_alias
-        # raises when an alias is missing or unresolved — that's fine
-        # for opportunistic attachment, so swallow and skip.
-        text_blob = f"{headline} {detail}".lower()
-        # Map each surface phrase to the alias key we'd try in resources.
+    def _append_attachment(path: str | None, source: str) -> None:
+        if not path:
+            return
+        atts = slots.get("attachments") or []
+        if not isinstance(atts, list):
+            atts = []
+        if path not in atts:
+            atts.append(path)
+        slots["attachments"] = atts
+        agent_log("enrich:find_file", f"source={source} → {path}")
+
+    def _resolve_hints_from_text(blob: str) -> str | None:
         _attachment_hints = (
             ("pitch deck", "deck"),
             ("slide deck", "deck"),
@@ -1096,20 +1237,74 @@ def _enrich_local_slots(
             ("cover letter", "cover_letter"),
         )
         for phrase, alias_key in _attachment_hints:
-            if phrase not in text_blob:
+            if phrase not in blob:
                 continue
             try:
-                path = fs.find_by_alias(alias_key)
+                return fs.find_by_alias(alias_key)
             except (FileNotFoundError, Exception):
-                continue
-            if not path:
-                continue
-            atts = slots.get("attachments") or []
-            if path not in atts:
-                atts.append(path)
-            slots["attachments"] = atts
-            agent_log("enrich:find_file", f"phrase={phrase!r} → {path}")
-            break
+                return None
+        return None
+
+    _FILE_NOUN_WORDS = (
+        "report", "deck", "slides", "presentation", "doc", "document",
+        "pdf", "memo", "notes", "spreadsheet", "sheet", "proposal",
+        "letter", "invoice", "contract", "resume", "cv", "agenda",
+    )
+
+    def _derive_label_file_query(headline: str, detail: str) -> str | None:
+        """Last-ditch fallback: if the LLM forgot the file_query slot but
+        the headline/detail names a document-ish noun ("Q1 Report",
+        "pitch deck", "product memo"), try to extract that phrase so
+        resolve_file_query_to_path has something to search on."""
+        blob = f"{headline}. {detail}"
+        low = blob.lower()
+        if not any(w in low for w in _FILE_NOUN_WORDS):
+            return None
+        # Grab up to 3 words ending in one of the file-noun words.
+        m = re.search(
+            r"([A-Za-z0-9][A-Za-z0-9 _\-]{0,40}?\b(?:"
+            + "|".join(_FILE_NOUN_WORDS)
+            + r")s?)\b",
+            blob,
+            re.IGNORECASE,
+        )
+        if not m:
+            return None
+        phrase = re.sub(r"\s+", " ", m.group(1)).strip()
+        return phrase or None
+
+    def _resolve_attachments_chain() -> None:
+        """Shared attachment-resolution chain:
+          1. Explicit ``file_query`` slot from the extractor.
+          2. Alias-phrase hint match in headline/detail ("deck", "resume"...).
+          3. Document-noun phrase derived from the label ("Q1 Report").
+        """
+        file_query = str(slots.get("file_query", "")).strip()
+        if file_query:
+            _append_attachment(
+                resolve_file_query_to_path(file_query),
+                f"file_query={file_query!r}",
+            )
+        if not slots.get("attachments"):
+            text_blob = f"{headline} {detail}".lower()
+            _append_attachment(_resolve_hints_from_text(text_blob), "hint")
+        if not slots.get("attachments"):
+            derived = _derive_label_file_query(headline, detail)
+            if derived:
+                _append_attachment(
+                    resolve_file_query_to_path(derived),
+                    f"derived={derived!r}",
+                )
+
+    if text in ("compose_mail", "send_email"):
+        to = str(slots.get("to", "")).strip()
+        # If `to` is a name (no @), try Contacts resolution.
+        if to and "@" not in to:
+            resolved = applescript.resolve_contact(to)
+            if resolved:
+                agent_log("enrich:resolve_contact", f"{to!r} → {resolved}")
+                slots["to"] = resolved
+        _resolve_attachments_chain()
 
     if text in ("send_imessage", "send_message"):
         contact = str(slots.get("contact", "")).strip()
@@ -1118,6 +1313,7 @@ def _enrich_local_slots(
             if resolved:
                 agent_log("enrich:resolve_contact", f"{contact!r} → {resolved}")
                 slots["contact"] = resolved
+        _resolve_attachments_chain()
 
     return slots
 
@@ -1156,15 +1352,17 @@ async def _execute_ambient_local(
     if text == "send_imessage" or text == "send_message":
         contact = str(slots.get("contact", "")).strip()
         body = str(slots.get("body", detail or headline)).strip()
+        attachments = slots.get("attachments") or None
         if not contact:
             overlay.push("ambient_ack", "✗ send_imessage: missing contact")
             return
         # _enrich_local_slots already resolved the name → address. Don't
         # re-run resolve_contact on an already-resolved address; it blocks
         # on Contacts.app lookup when the "name" is actually an email.
-        applescript.send_imessage(contact=contact, body=body)
-        overlay.push("ambient_ack", f"✓ iMessage to {contact}")
-        agent_log("ambient:local:done", f"send_imessage to={contact!r}")
+        applescript.send_imessage(contact=contact, body=body, attachments=attachments)
+        att_note = f" · attached {len(attachments)}" if attachments else ""
+        overlay.push("ambient_ack", f"✓ iMessage to {contact}{att_note}")
+        agent_log("ambient:local:done", f"send_imessage to={contact!r} atts={attachments!r}")
         return
 
     if text == "create_calendar_event":
@@ -1811,10 +2009,24 @@ _ACTION_VERBS = (
 )
 
 
+_MULTI_ACTION_JOINERS = (
+    " and ",
+    ",",
+    ". ",
+    "; ",
+    "? ",
+    "! ",
+    " also ",
+    " then ",
+    " plus ",
+)
+
+
 def _is_multi_action_candidate(transcript: str) -> bool:
-    """Cheap heuristic: ≥2 action verbs + conjunction suggests a multi-item utterance."""
+    """Cheap heuristic: ≥2 action verbs + conjunction/sentence-break suggests
+    a multi-item utterance (e.g. "text me X. Also email me X")."""
     t = (transcript or "").lower()
-    if " and " not in t and "," not in t:
+    if not any(joiner in t for joiner in _MULTI_ACTION_JOINERS):
         return False
     verbs_seen = sum(1 for v in _ACTION_VERBS if v in t)
     return verbs_seen >= 2
@@ -1829,7 +2041,7 @@ async def _run_quick_multi_action(transcript: str, overlay, menu_bar) -> bool:
     lets the caller fall back to single-intent execution.
     """
     from intent.meeting_intelligence import extract_action_items
-    from executors.meeting_tasks import search_flight, draft_email_in_gmail, TaskResult
+    from executors.meeting_tasks import search_flight, TaskResult
     from voice.speak import speak
 
     print(f"[multi-action] extracting tasks from: {transcript[:80]}")
@@ -1858,7 +2070,7 @@ async def _run_quick_multi_action(transcript: str, overlay, menu_bar) -> bool:
 
     async def _run_one(item: dict) -> None:
         task_label = item.get("task", "")
-        item_type = item.get("type", "")
+        item_type = str(item.get("type", "")).lower()
         slots = item.get("slots", {})
         overlay.push("meeting_action_update", f"{task_label}|Running")
 
@@ -1871,17 +2083,12 @@ async def _run_quick_multi_action(transcript: str, overlay, menu_bar) -> bool:
                 result = await search_flight(
                     browser_client, browser_lock, dest, date, origin,
                 )
-            elif item_type == "draft_email":
-                recipient = slots.get("recipient") or ""
-                subject = slots.get("subject") or "Follow-up"
-                key_points = slots.get("key_points") or ""
-                body = (
-                    key_points
-                    or f"Hi {recipient},\n\nFollowing up per our conversation."
+            elif item_type in ("draft_email", "send_email", "compose_email", "compose_mail"):
+                result = await _dispatch_email_item(
+                    slots, task_label, browser_client, browser_lock,
                 )
-                result = await draft_email_in_gmail(
-                    browser_client, browser_lock, recipient, subject, body,
-                )
+            elif item_type in ("send_message", "send_imessage", "imessage"):
+                result = await _dispatch_imessage_item(slots, task_label)
             else:
                 result = TaskResult(False, "unsupported", detail=f"type={item_type}")
         except Exception as e:

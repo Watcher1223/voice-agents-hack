@@ -76,12 +76,13 @@ Goal definitions (read carefully — pick the most specific one):
   slots: {"company": str, "role": str?, "batch": str?}
   requires_browser: true, requires_submission: true.
 
-- send_message: send an iMessage/SMS/chat to a specific person (e.g. "text Hanzi I'm late", "message Corinne saying hi").
+- send_message: send an iMessage/SMS/chat to a specific person (e.g. "text Hanzi I'm late", "message Corinne saying hi", "text Hanzi the Q1 Report").
   Trigger words ONLY count when they're verbs ("text X...", "message X..."). NOT for "the next message said...", "text on the slide", "the text of the doc".
-  slots: {"contact": str, "body": str}
-  uses_local_data: ["contacts"], requires_submission: true.
+  slots: {"contact": str, "body": str?, "file_query": str?}
+  If the user references a file to send alongside or instead of a body ("text Hanzi the Q1 Report"), extract the natural-language file name into "file_query".
+  uses_local_data: ["contacts"]; include "attachment" too when a file_query is set. requires_submission: true.
 
-- send_email: compose/send an email, usually with a file attachment (e.g. "email Sam the deck", "send the Q1 doc to my boss").
+- send_email: compose/send an email, usually with a file attachment (e.g. "email Sam the deck", "send the Q1 doc to my boss", "email Hanzi the Q1 Report").
   slots: {"to": str?, "subject": str?, "body": str?, "file_query": str?}
   uses_local_data: include "attachment" when a file is referenced. requires_submission: true.
 
@@ -121,6 +122,9 @@ Transcript: "the next message says the deadline is Friday"
 Transcript: "text Corinne I'll be ten minutes late"
 {"goal":"send_message","target":{"type":"contact","value":"Corinne"},"uses_local_data":["contacts"],"requires_browser":false,"requires_submission":true,"slots":{"contact":"Corinne","body":"I'll be ten minutes late"}}
 
+Transcript: "text hanzi the Q1 Report"
+{"goal":"send_message","target":{"type":"contact","value":"hanzi"},"uses_local_data":["contacts","attachment"],"requires_browser":false,"requires_submission":true,"slots":{"contact":"hanzi","file_query":"Q1 Report"}}
+
 Transcript: "schedule a meeting with Sam Tuesday at 3"
 {"goal":"add_calendar_event","target":{"type":"calendar","value":""},"uses_local_data":["calendar"],"requires_browser":false,"requires_submission":true,"slots":{"title":"Meeting with Sam","when":"Tuesday at 3","attendees":["Sam"]}}
 
@@ -130,8 +134,8 @@ Transcript: "open my resume"
 Transcript: "open my linkedin"
 {"goal":"open_url","target":{"type":"url","value":"https://www.linkedin.com"},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{"url":"https://www.linkedin.com"}}
 
-Transcript: "email me the Q1 deck"
-{"goal":"send_email","target":{"type":"contact","value":""},"uses_local_data":["attachment"],"requires_browser":false,"requires_submission":true,"slots":{"file_query":"Q1 deck"}}
+Transcript: "email hanzi the Q1 Report"
+{"goal":"send_email","target":{"type":"contact","value":"hanzi"},"uses_local_data":["attachment"],"requires_browser":false,"requires_submission":true,"slots":{"to":"hanzi","subject":"Q1 Report","file_query":"Q1 Report"}}
 
 Transcript: "who am I"
 {"goal":"ask_knowledge","target":{"type":"question","value":"who am I"},"uses_local_data":["index"],"requires_browser":false,"requires_submission":false,"slots":{"question":"who am I"}}

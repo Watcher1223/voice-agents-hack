@@ -44,6 +44,14 @@ Slot extraction rules:
     "recipient": person's name mentioned (first name or full name) — required
     "subject": a good subject line inferred from context
     "key_points": 1-2 sentence summary of what to say in the email body
+    "file_query": natural-language name of any file referenced to attach
+                  (e.g. "Q1 Report", "resume", "pitch deck") — omit if none
+
+  send_message slots:
+    "recipient": person's name to iMessage/SMS (first or full name) — required
+    "body": the literal message text to send (omit if only a file is sent)
+    "file_query": natural-language name of any file to attach to the message
+                  (e.g. "Q1 Report", "resume") — omit if none
 
 Return a JSON array. Each element:
 {
@@ -51,6 +59,16 @@ Return a JSON array. Each element:
   "type": "<type>",
   "slots": { ...extracted fields }
 }
+
+Example — "text hanzi the Q1 Report and also email it to hanzi":
+[
+  {"task":"Text Hanzi Q1 Report","type":"send_message",
+   "slots":{"recipient":"Hanzi","file_query":"Q1 Report"}},
+  {"task":"Email Hanzi Q1 Report","type":"draft_email",
+   "slots":{"recipient":"Hanzi","subject":"Q1 Report",
+            "key_points":"Sharing the Q1 Report as requested.",
+            "file_query":"Q1 Report"}}
+]
 
 Return [] if no new tasks. Output ONLY valid JSON — no explanation, no markdown fences."""
 

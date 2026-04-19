@@ -87,9 +87,18 @@ Apply this decision hierarchy IN ORDER. Stop at the first tier that fires.
         Spotlight. `text` must be exactly one of:
           compose_mail           — opens Mail.app with a draft (does
                                     NOT auto-send; user clicks Send).
-                                    slots: to, subject, body.
+                                    slots: to, subject, body,
+                                           file_query (OPTIONAL: natural-
+                                           language name of a local file
+                                           to attach, e.g. "Q1 Report",
+                                           "resume", "pitch deck").
           send_imessage          — sends an iMessage now (IS
-                                    auto-sent). slots: contact, body.
+                                    auto-sent). slots: contact, body,
+                                           file_query (OPTIONAL: same
+                                           rules as compose_mail; set
+                                           this whenever the user names
+                                           a file to send like "text
+                                           Hanzi the Q1 Report").
           create_calendar_event  — creates a Calendar event.
                                     slots: title, date, time,
                                     attendees (list, optional).
@@ -146,6 +155,12 @@ Example for "email Hanzi that I want to book a grad trip to Hawaii":
      "slots":{}, "label":"Book flight to Hawaii"}
   ]
 }
+
+File-attachment note: whenever the user names a file to send ("the
+pitch deck", "the onboarding doc", "the revenue report"), echo that
+exact phrase into `file_query` on the send_imessage / compose_mail
+action. Do NOT invent file paths — the agent resolves the phrase to a
+local path later.
 
 Rules:
 - TASKS ALREADY ON CHECKLIST lists rows the user has not yet executed.
@@ -344,7 +359,10 @@ def _assemble_prompt(
     screen_app: str = "",
     screen_window_title: str = "",
 ) -> str:
-    hist_block = "\n".join(f"- {line}" for line in history) or "(empty)"
+    from intent.pronoun_rewrite import rewrite_self_pronouns
+
+    rewritten = [rewrite_self_pronouns(line) for line in history]
+    hist_block = "\n".join(f"- {line}" for line in rewritten) or "(empty)"
     prev_block = previous.raw_json if (previous and previous.raw_json) else "(none)"
     checklist_block = _format_pending_checklist_block()
     screen_block = "(none)"
@@ -395,11 +413,15 @@ Each action object:
    "label": <short verb phrase for the task>}
 
 kind="local" — text is one of:
-  compose_mail           slots: {"to":<name>, "subject":<topic>, "body":<message>}
-  send_imessage          slots: {"contact":<name>, "body":<message>}
+  compose_mail           slots: {"to":<name>, "subject":<topic>, "body":<message>, "file_query":<file name, optional>}
+  send_imessage          slots: {"contact":<name>, "body":<message>, "file_query":<file name, optional>}
   create_calendar_event  slots: {"title":<what>, "date":<YYYY-MM-DD>, "time":<HH:MM>}
   find_file              slots: {"file_query":<query>}
   open_url               slots: {"url":<url>}
+
+If the user says to send/text/email a file ("text Hanzi the Q1 Report"),
+put the file name into `file_query` on that action so the agent can
+attach it. The file name is the phrase the user said, NOT a path.
 
 kind="opencli" — text is an opencli command (hackernews top, google search X, wikipedia search Y, arxiv search Z). slots: {}.
 
@@ -416,10 +438,12 @@ ALREADY ON CHECKLIST, do not re-emit it."""
 def _assemble_cactus_prompt(
     history: list[str], previous: AmbientAnalysis | None
 ) -> str:
+    from intent.pronoun_rewrite import rewrite_self_pronouns
+
     # Only the most recent few turns — the 1B model tends to over-weight
     # older lines when the context gets long, and the interesting signal
     # is always in the last utterance or two.
-    tail = history[-4:] if history else []
+    tail = [rewrite_self_pronouns(line) for line in (history[-4:] if history else [])]
     hist_block = "\n".join(f"- {line}" for line in tail) or "(empty)"
     checklist_block = _format_pending_checklist_block()
     return (
