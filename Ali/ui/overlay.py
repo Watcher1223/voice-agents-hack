@@ -11,12 +11,17 @@ import sys
 import threading
 from typing import Callable
 
-from PySide6.QtCore import QPoint, QRect, Qt, QObject, QTimer, Signal, Slot  # pyright: ignore[reportMissingImports]
+from PySide6.QtCore import (  # pyright: ignore[reportMissingImports]
+    QEasingCurve, QPoint, QPropertyAnimation, QRect, QRectF, Qt, QObject,
+    QTimer, Signal, Slot,
+)
 from PySide6.QtGui import (  # pyright: ignore[reportMissingImports]
     QBrush, QColor, QCursor, QFont, QGuiApplication, QImage, QLinearGradient,
     QPainter, QPainterPath, QPen, QPixmap,
 )
 from PySide6.QtWidgets import QApplication, QWidget  # pyright: ignore[reportMissingImports]
+import math
+import time
 
 # #region agent log
 def _dlog(loc: str, msg: str, data: dict, hid: str = "H2") -> None:
@@ -65,33 +70,108 @@ class _CamBridge(QObject):
     frame_ready = Signal(QImage)
     greeted     = Signal()
 
-# ── Colors ────────────────────────────────────────────────────────────────────
-FG          = QColor(246, 246, 250)       # primary text on liquid glass
-DIM         = QColor(196, 194, 202)       # secondary text
-RED         = QColor("#E8342E")
-YELLOW      = QColor("#F3C84B")
-BLUE        = QColor("#64D2FF")
-GREEN       = QColor("#3CD07A")
-ERR         = QColor("#FF6B6B")
+# ── Design tokens (lifted from VoiceInk NotchRecorderView + MiniRecorderView,
+#    and boring.notch sizing/matters.swift) ────────────────────────────────────
+#
+# Philosophy: pure black Dynamic-Island style body. Asymmetric corner radii
+# (small top, larger bottom) make the overlay read as "hanging" from the menu
+# bar. Inner elements stagger in with a ~90ms delay after the pill expands.
 
-# ── Geometry ──────────────────────────────────────────────────────────────────
-W_PILL  = 340
-W_FULL  = 560
-H_PILL  = 58
-R       = 29      # large radius → pill shape
-MARGIN  = 8       # gap from top (below menu bar)
-MARGIN_RIGHT = 16 # gap from right edge when docked-right
+# Colors
+FG          = QColor(255, 255, 255)        # pure white, full opacity
+DIM         = QColor(255, 255, 255, 153)   # white @ 60% — VoiceInk subtext
+FAINT       = QColor(255, 255, 255, 90)    # white @ 35% — VoiceInk inactive
+DIVIDER_C   = QColor(255, 255, 255, 38)    # white @ 15% — VoiceInk Divider
+RED         = QColor(255, 59, 48)          # systemRed — VoiceInk record color
+YELLOW      = QColor(255, 214, 10)         # systemYellow
+BLUE        = QColor(0, 122, 255)          # systemBlue
+GREEN       = QColor(52, 199, 89)          # systemGreen
+ERR         = QColor(255, 105, 97)         # soft red for errors
+PROC_GRAY   = QColor(102, 102, 115)        # processing button fill
+
+# Geometry — asymmetric radii (hanging-island look)
+R_TOP_COMPACT  = 8    # VoiceInk compact top radius
+R_BOT_COMPACT  = 16   # VoiceInk compact bottom radius
+R_TOP_EXPANDED = 12   # VoiceInk live-text top
+R_BOT_EXPANDED = 22   # VoiceInk live-text bottom
+R_FLOATING     = 20   # MiniRecorderView compactCornerRadius (when floating)
+
+W_PILL  = 340        # compact pill
+W_FULL  = 560        # expanded history
+H_PILL  = 44         # tightened: matches VoiceInk mainRow (notchH + 6)
+MARGIN  = 0          # attach to menu bar edge (Dynamic Island anchor)
+MARGIN_RIGHT = 16    # gap from right edge when docked-right
 MAX_H   = 540
 MAX_HIST = 8
+
+# Spacing scale
+PAD_H_COMPACT = 14
+PAD_H_EXPANDED = 18
+PAD_V = 10
+STACK_SPACING = 10
+
+# Audio visualizer (VoiceInk AudioVisualizer)
+BAR_COUNT   = 13      # slightly fewer than VoiceInk's 15 for a tighter pill
+BAR_W       = 3
+BAR_SPACING = 2
+BAR_H_MIN   = 3
+BAR_H_MAX   = 22
 
 # ── Docking ───────────────────────────────────────────────────────────────────
 DOCK_TOP    = "top"
 DOCK_RIGHT  = "right"
 
 # ── Timing ────────────────────────────────────────────────────────────────────
-PULSE_MS    = 500
-POLL_MS     = 40
-AUTOHIDE_MS = 5_000
+PULSE_MS     = 40       # breath/bar tick — 25 fps
+POLL_MS      = 40
+AUTOHIDE_MS  = 5_000
+SPRING_MS    = 420      # VoiceInk expand spring response × 1000
+COLLAPSE_MS  = 450      # VoiceInk collapse spring response × 1000
+STAGGER_MS   = 90       # VoiceInk inner-element delay
+
+
+def _notch_path(w: int, h: int, r_top: int, r_bot: int) -> QPainterPath:
+    """Asymmetric rounded rect: small top radii, larger bottom radii.
+
+    This is the signature Dynamic Island shape — when anchored to the menu bar
+    it reads as an extension hanging from the notch.
+    """
+    p = QPainterPath()
+    p.moveTo(r_top, 0)
+    p.lineTo(w - r_top, 0)
+    p.arcTo(QRectF(w - 2 * r_top, 0, 2 * r_top, 2 * r_top), 90, -90)
+    p.lineTo(w, h - r_bot)
+    p.arcTo(QRectF(w - 2 * r_bot, h - 2 * r_bot, 2 * r_bot, 2 * r_bot), 0, -90)
+    p.lineTo(r_bot, h)
+    p.arcTo(QRectF(0, h - 2 * r_bot, 2 * r_bot, 2 * r_bot), 270, -90)
+    p.lineTo(0, r_top)
+    p.arcTo(QRectF(0, 0, 2 * r_top, 2 * r_top), 180, -90)
+    p.closeSubpath()
+    return p
+
+
+def _bar_heights(t: float, amplitude: float, bar_count: int = BAR_COUNT) -> list[float]:
+    """Return BAR_COUNT bar heights in [BAR_H_MIN, BAR_H_MAX].
+
+    Default: VoiceInk-style wave — sinusoidal per-bar phase, boosted amplitude,
+    center-weighted so the middle bars ride taller than the edges.
+
+    ★ This is the most distinctive visual moment of the overlay. Tweak the wave
+    shape (frequency, phases, center weight) to personalize the signature feel.
+    """
+    amp = max(0.0, min(1.0, amplitude)) ** 0.7
+    center = (bar_count - 1) / 2
+    heights = []
+    for i in range(bar_count):
+        phase = i * 0.4
+        wave = 0.5 + 0.5 * math.sin(t * 8.0 + phase)
+        center_boost = 1.0 - (abs(i - center) / center) * 0.4
+        h = BAR_H_MIN + amp * wave * center_boost * (BAR_H_MAX - BAR_H_MIN)
+        heights.append(h)
+    return heights
+
+
+USE_VIBRANCY = False   # Dynamic-Island look = pure black, not frosted glass.
 
 
 def _apply_macos_overlay(win: QWidget) -> None:
@@ -132,29 +212,31 @@ def _apply_macos_overlay(win: QWidget) -> None:
             ns_win.setOpaque_(False)
             ns_win.setBackgroundColor_(NSColor.clearColor())
 
-            qt_view = ns_win.contentView()  # QNSView — Qt renders here
-            # Add the blur view BEHIND Qt's content view (as sibling in frame view)
-            # so Qt text renders on top of the vibrancy, not underneath it.
-            try:
-                frame_view = qt_view.superview()  # NSThemeFrame (window frame)
-                if frame_view is None:
-                    raise ValueError("no frame_view")
-                effect = NSVisualEffectView.alloc().initWithFrame_(qt_view.frame())
-                effect.setMaterial_(21)      # UnderWindowBackground — subtle
-                effect.setBlendingMode_(0)   # BehindWindow
-                effect.setState_(1)          # Active
-                effect.setAutoresizingMask_(18)
-                # Insert behind Qt's view so Qt text is always on top
-                frame_view.addSubview_positioned_relativeTo_(effect, -1, qt_view)
-                win._ns_window = ns_win  # type: ignore[attr-defined]
-                win._ns_effect = effect  # type: ignore[attr-defined]
-                win._vibrancy_active = True  # type: ignore[attr-defined]
-                print("[overlay] liquid glass vibrancy active")
-            except Exception as ve:
-                # Vibrancy positioning failed — fall back to Qt-painted glass
-                win._ns_window = ns_win  # type: ignore[attr-defined]
+            win._ns_window = ns_win  # type: ignore[attr-defined]
+
+            if not USE_VIBRANCY:
+                # Dynamic-Island look: solid black body painted by Qt; skip the
+                # NSVisualEffectView install entirely.
                 win._vibrancy_active = False  # type: ignore[attr-defined]
-                print(f"[overlay] vibrancy positioning skipped ({ve}) — using solid glass")
+                print("[overlay] dynamic-island mode (pure black, no vibrancy)")
+            else:
+                qt_view = ns_win.contentView()
+                try:
+                    frame_view = qt_view.superview()
+                    if frame_view is None:
+                        raise ValueError("no frame_view")
+                    effect = NSVisualEffectView.alloc().initWithFrame_(qt_view.frame())
+                    effect.setMaterial_(21)      # UnderWindowBackground — subtle
+                    effect.setBlendingMode_(0)   # BehindWindow
+                    effect.setState_(1)          # Active
+                    effect.setAutoresizingMask_(18)
+                    frame_view.addSubview_positioned_relativeTo_(effect, -1, qt_view)
+                    win._ns_effect = effect  # type: ignore[attr-defined]
+                    win._vibrancy_active = True  # type: ignore[attr-defined]
+                    print("[overlay] liquid glass vibrancy active")
+                except Exception as ve:
+                    win._vibrancy_active = False  # type: ignore[attr-defined]
+                    print(f"[overlay] vibrancy positioning skipped ({ve}) — using solid black")
 
         win.setWindowTitle("")
     except Exception as e:
@@ -180,7 +262,10 @@ def _update_vibrancy_mask(win: QWidget) -> None:
             pass
         bounds = CGRectMake(0, 0, w, h)
         mask = CAShapeLayer.layer()
-        path = CGPathCreateWithRoundedRect(bounds, R, R, None)
+        # Use the larger bottom radius as a reasonable single-value mask fallback.
+        # (Vibrancy is off by default in dynamic-island mode; this only runs if
+        # USE_VIBRANCY = True.)
+        path = CGPathCreateWithRoundedRect(bounds, R_BOT_EXPANDED, R_BOT_EXPANDED, None)
         mask.setPath_(path)
         effect.setWantsLayer_(True)
         effect.layer().setMask_(mask)
@@ -221,6 +306,12 @@ class TranscriptionOverlay(QWidget):
         self._meeting_actions: list[tuple[str, str]] = []  # (task, status)
 
         self._dock_mode: str = DOCK_TOP
+
+        # Click-to-confirm for ambient suggestions. When a confirmable
+        # suggestion is active, left-click on the pill confirms and
+        # right-click dismisses. Main.py registers the callbacks via
+        # set_pending_confirm(); we clear on click or ambient_ack push.
+        self._pending_confirm_cbs: tuple[Callable[[], None], Callable[[], None]] | None = None
 
         self._font_label = QFont(".AppleSystemUIFont", 15, QFont.Weight.Bold)
         self._font_body  = QFont(".AppleSystemUIFont", 14)
@@ -327,7 +418,39 @@ class TranscriptionOverlay(QWidget):
 
     # ── Input ────────────────────────────────────────────────────────────────
 
+    def set_pending_confirm(
+        self,
+        on_confirm: Callable[[], None],
+        on_dismiss: Callable[[], None],
+    ) -> None:
+        """Enter click-to-confirm mode: left-click → on_confirm, right-
+        click → on_dismiss. Cleared when the click fires or when
+        `clear_pending_confirm()` is called (e.g. on timeout)."""
+        self._pending_confirm_cbs = (on_confirm, on_dismiss)
+
+    def clear_pending_confirm(self) -> None:
+        self._pending_confirm_cbs = None
+
     def mousePressEvent(self, e) -> None:  # type: ignore[override]
+        # Click-to-confirm takes precedence over drag + close.
+        if self._pending_confirm_cbs is not None:
+            cbs = self._pending_confirm_cbs
+            if e.button() == Qt.MouseButton.LeftButton and not self._hit_close(
+                e.position().x(), e.position().y()
+            ):
+                self._pending_confirm_cbs = None
+                try:
+                    cbs[0]()
+                except Exception:
+                    pass
+                return
+            if e.button() == Qt.MouseButton.RightButton:
+                self._pending_confirm_cbs = None
+                try:
+                    cbs[1]()
+                except Exception:
+                    pass
+                return
         if e.button() == Qt.MouseButton.LeftButton:
             if self._hit_close(e.position().x(), e.position().y()):
                 self._do_hide()
@@ -585,6 +708,15 @@ class TranscriptionOverlay(QWidget):
         elif state == "assistant":
             self._history.append((text, FG, "assistant"))
             # No autohide — stay visible until next command or × dismiss
+        elif state == "ambient_confirm":
+            # Destructive ambient suggestion awaiting user's 'yes'/backtick.
+            # Yellow signals "needs input"; text should already read like a
+            # prompt ("Send email to Hanzi?  say 'yes' to confirm").
+            self._history.append((text or "Proceed?", YELLOW, "assistant"))
+        elif state == "ambient_ack":
+            # Follow-up after a confirmation — either ✓ executed or ✗ skipped.
+            color = GREEN if text.startswith("✓") else DIM
+            self._history.append((text, color, "assistant"))
         else:
             self._history.append((text, FG, "assistant"))
 
@@ -609,22 +741,52 @@ class TranscriptionOverlay(QWidget):
         h += PAD_BOT
         return min(MAX_H, max(H_PILL, h))
 
-    def _set_size(self, w: int, h: int) -> None:
-        self._reposition(w, h)
+    def _set_size(self, w: int, h: int, *, animated: bool = True) -> None:
+        self._reposition(w, h, animated=animated)
 
-    def _reposition(self, w: int, h: int) -> None:
+    def _reposition(self, w: int, h: int, *, animated: bool = True) -> None:
         screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
-        if screen:
-            geo = screen.availableGeometry()
-            if self._dock_mode == DOCK_RIGHT:
-                x = geo.right() - w - MARGIN_RIGHT
-                y = geo.top() + MARGIN   # top-right, same row as pill
-            else:
-                x = geo.center().x() - w // 2
-                y = geo.top() + MARGIN
-            self.setGeometry(x, y, w, h)
-        else:
+        if not screen:
             self.resize(w, h)
+            return
+
+        geo = screen.availableGeometry()
+        if self._dock_mode == DOCK_RIGHT:
+            x = geo.right() - w - MARGIN_RIGHT
+            y = geo.top() + 8   # small float gap when docked-right
+        else:
+            # DOCK_TOP: anchor to the menu bar so the pill reads as a Dynamic
+            # Island extension hanging from the notch.
+            x = geo.center().x() - w // 2
+            y = geo.top() + MARGIN
+        target = QRect(x, y, w, h)
+
+        if not animated or not self.isVisible():
+            self.setGeometry(target)
+            return
+
+        # Spring-ish expand / collapse via OutBack easing. VoiceInk uses a real
+        # SwiftUI spring; QPropertyAnimation doesn't have one, but OutBack with
+        # a small overshoot reads similarly.
+        anim = getattr(self, "_geo_anim", None)
+        if anim is None:
+            anim = QPropertyAnimation(self, b"geometry")
+            self._geo_anim = anim  # type: ignore[attr-defined]
+        else:
+            anim.stop()
+
+        collapsing = (w * h) < (self.width() * self.height())
+        if collapsing:
+            anim.setDuration(COLLAPSE_MS)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        else:
+            anim.setDuration(SPRING_MS)
+            curve = QEasingCurve(QEasingCurve.Type.OutBack)
+            curve.setOvershoot(1.2)  # subtle — ≈ spring damping 0.80
+            anim.setEasingCurve(curve)
+        anim.setStartValue(self.geometry())
+        anim.setEndValue(target)
+        anim.start()
 
     # ── Paint ─────────────────────────────────────────────────────────────────
 
@@ -633,120 +795,109 @@ class TranscriptionOverlay(QWidget):
         p.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
 
         w, h = self.width(), self.height()
-        vibrancy = getattr(self, "_vibrancy_active", False)
 
-        shell = QPainterPath()
-        shell.addRoundedRect(QRect(0, 0, w, h), R, R)
+        # Choose radii based on mode. Dynamic-island compact = small top / big
+        # bottom; expanded history panel = larger top / larger bottom.
+        if self._meeting_mode or self._wake_mode or not (self._recording or self._prompt_armed):
+            r_top, r_bot = R_TOP_EXPANDED, R_BOT_EXPANDED
+        else:
+            r_top, r_bot = R_TOP_COMPACT, R_BOT_COMPACT
 
-        # ── Wake / call mode — camera feed + greeting ────────────────────────
+        # When docked right (floating), symmetric radii look better — the pill
+        # is no longer "hanging" from the menu bar.
+        if self._dock_mode == DOCK_RIGHT:
+            r_top = r_bot = R_FLOATING
+
+        shell = _notch_path(w, h, r_top, r_bot)
+
         if self._wake_mode:
             self._paint_wake(p, w, h, shell)
             return
 
-        # ── Meeting capture mode ──────────────────────────────────────────────
         if self._meeting_mode:
-            self._paint_glass_body(p, shell, w, h, vibrancy)
+            self._paint_black_body(p, shell, w, h)
             self._paint_meeting(p, w, h)
             return
 
-        # ── 1. Soft drop shadow (two offset layers for bloom) ─────────────────
-        for offset, alpha in ((4, 14), (2, 8)):
-            s = QPainterPath()
-            s.addRoundedRect(QRect(offset // 2, offset, w - offset, h), R, R)
-            p.fillPath(s, QColor(0, 0, 0, alpha))
-
-        # ── 2. Glass body — translucent liquid tint ────────────────────────────
-        if vibrancy:
-            p.fillPath(shell, QColor(18, 18, 22, 145))  # semi-opaque so text pops over blur
-        else:
-            p.fillPath(shell, QColor(34, 38, 48, 200))  # solid fallback
-
-        # ── 3. Border — soft glass edge ───────────────────────────────────────
-        border = QLinearGradient(0, 0, 0, h)
-        border.setColorAt(0.0, QColor(255, 255, 255, 68))
-        border.setColorAt(0.5, QColor(210, 220, 240, 44))
-        border.setColorAt(1.0, QColor(156, 168, 188, 30))
-        p.setPen(QPen(QBrush(border), 1.2))
-        p.drawPath(shell)
-
-        # ── 4. Inner contour — slight edge depth with low opacity ─────────────
-        inner = QPainterPath()
-        inner.addRoundedRect(QRect(1, 1, w - 2, h - 2), R - 1, R - 1)
-        inner_hi = QLinearGradient(0, 1, 0, h)
-        inner_hi.setColorAt(0.0, QColor(255, 255, 255, 38))
-        inner_hi.setColorAt(1.0, QColor(110, 122, 146, 24))
-        p.setPen(QPen(QBrush(inner_hi), 0.8))
-        p.drawPath(inner)
-
-        # ── 5. Content ────────────────────────────────────────────────────────
+        self._paint_black_body(p, shell, w, h)
         if self._recording or self._prompt_armed:
             self._paint_pill(p)
         else:
             self._paint_expanded(p)
 
     def _paint_pill(self, p: QPainter) -> None:
+        """Dynamic-Island-style compact pill: breathing red dot on the left,
+        live audio-bar visualizer on the right. Mirrors VoiceInk's notch mode."""
         w, h = self.width(), self.height()
         cy = h // 2
 
-        # Blinking dot
+        # ── Left: breathing record dot ───────────────────────────────────────
+        # Continuous sin-wave opacity instead of binary blink. More iOS-like.
+        t = time.monotonic()
+        breath = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 3.2))  # 0.55..1.0
+        dot_color = QColor(RED)
+        dot_color.setAlphaF(breath)
         p.setPen(Qt.PenStyle.NoPen)
-        dot = RED if self._pulse_on else QColor(200, 80, 76, 80)
-        p.setBrush(dot)
-        p.drawEllipse(QPoint(26, cy), 8, 8)
+        p.setBrush(dot_color)
+        p.drawEllipse(QPoint(PAD_H_COMPACT + 6, cy), 5, 5)
 
-        # Mic icon
-        self._draw_mic(p, 52, cy)
-
-        # Label
+        # ── Center: label ────────────────────────────────────────────────────
         p.setPen(FG)
         p.setFont(self._font_label)
+        label_x = PAD_H_COMPACT + 20
+        label_w = w - PAD_H_COMPACT - 20 - (BAR_COUNT * (BAR_W + BAR_SPACING) + PAD_H_COMPACT)
         p.drawText(
-            QRect(74, cy - 12, w - 90, 24),
-            Qt.AlignmentFlag.AlignVCenter,
+            QRect(label_x, cy - 10, label_w, 20),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
             self._pill_label,
         )
 
-    def _paint_glass_body(
-        self, p: QPainter, shell: QPainterPath, w: int, h: int, vibrancy: bool
+        # ── Right: live audio bars ───────────────────────────────────────────
+        bar_group_w = BAR_COUNT * BAR_W + (BAR_COUNT - 1) * BAR_SPACING
+        bar_x0 = w - PAD_H_COMPACT - bar_group_w
+        # Synthetic amplitude until real mic meter is wired: breathe with the dot.
+        amp = 0.4 + 0.6 * breath
+        heights = _bar_heights(t, amp)
+        p.setBrush(QColor(255, 255, 255, 217))  # white @ 85% — VoiceInk bar color
+        p.setPen(Qt.PenStyle.NoPen)
+        for i, bh in enumerate(heights):
+            bh_clamped = max(BAR_H_MIN, min(BAR_H_MAX, bh))
+            bx = bar_x0 + i * (BAR_W + BAR_SPACING)
+            by = cy - bh_clamped / 2
+            p.drawRoundedRect(QRectF(bx, by, BAR_W, bh_clamped), BAR_W / 2, BAR_W / 2)
+
+    def _paint_black_body(
+        self, p: QPainter, shell: QPainterPath, w: int, h: int
     ) -> None:
-        """Shared glass background used by meeting mode (and the normal pill path)."""
-        for offset, alpha in ((4, 14), (2, 8)):
-            s = QPainterPath()
-            s.addRoundedRect(QRect(offset // 2, offset, w - offset, h), R, R)
-            p.fillPath(s, QColor(0, 0, 0, alpha))
-        if vibrancy:
-            p.fillPath(shell, QColor(18, 18, 22, 145))
-        else:
-            p.fillPath(shell, QColor(34, 38, 48, 200))
-        border = QLinearGradient(0, 0, 0, h)
-        border.setColorAt(0.0, QColor(255, 255, 255, 68))
-        border.setColorAt(0.5, QColor(210, 220, 240, 44))
-        border.setColorAt(1.0, QColor(156, 168, 188, 30))
-        p.setPen(QPen(QBrush(border), 1.2))
-        p.drawPath(shell)
+        """Pure black Dynamic-Island body. No border — the hardware-black look
+        comes from pixel-perfect black, not a stroke."""
+        p.fillPath(shell, QColor(0, 0, 0))
 
     def _paint_meeting(self, p: QPainter, w: int, h: int) -> None:
         """Meeting capture overlay: live transcript + action items queue."""
-        pad = 14
+        pad = PAD_H_EXPANDED
 
         # ── Header ────────────────────────────────────────────────────────────
-        dot_col = RED if self._pulse_on else QColor(200, 80, 76, 80)
+        t = time.monotonic()
+        breath = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 3.2))
+        dot_col = QColor(RED); dot_col.setAlphaF(breath)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(dot_col)
-        p.drawEllipse(QPoint(pad + 6, 22), 6, 6)
+        p.drawEllipse(QPoint(pad + 4, 22), 5, 5)
 
         p.setPen(FG)
         p.setFont(self._font_label)
-        p.drawText(QRect(pad + 20, 10, w - 90, 24), Qt.AlignmentFlag.AlignVCenter,
+        p.drawText(QRect(pad + 18, 10, w - 90, 24), Qt.AlignmentFlag.AlignVCenter,
                    "Meeting Capture")
 
         p.setPen(DIM)
         p.setFont(self._font_small)
-        p.drawText(QRect(w - 60, 10, 50, 24), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        p.drawText(QRect(w - 72, 10, 60, 24),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    "say stop")
 
         # Divider
-        p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        p.setPen(QPen(DIVIDER_C, 1))
         p.drawLine(QPoint(pad, 38), QPoint(w - pad, 38))
 
         # ── Transcript area ───────────────────────────────────────────────────
@@ -761,17 +912,17 @@ class TranscriptionOverlay(QWidget):
         p.drawText(QRect(pad, tx_y, tx_w, tx_h - 22), _flags,
                    self._meeting_transcript or "Listening to meeting…")
 
-        # Interim text (live, brighter) — pulsing
+        # Interim text (live, brighter) — breathe the alpha on a ~1.6s cycle
         if self._meeting_interim:
-            interim_alpha = 220 if self._pulse_on else 160
+            interim_alpha = int(170 + 70 * (0.5 + 0.5 * math.sin(t * 3.9)))
             p.setPen(QColor(246, 246, 250, interim_alpha))
             p.setFont(self._font_body)
             p.drawText(QRect(pad, tx_y + tx_h - 26, tx_w, 22),
                        int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
                        self._meeting_interim)
         else:
-            # Blinking cursor to signal active listening
-            if self._pulse_on:
+            # Cursor blink at ~1 Hz — decoupled from the 25 fps repaint tick
+            if int(t * 2) % 2 == 0:
                 p.setPen(QColor(100, 210, 255, 180))
                 p.setFont(self._font_body)
                 p.drawText(QRect(pad, tx_y + tx_h - 26, 20, 22),
@@ -782,16 +933,16 @@ class TranscriptionOverlay(QWidget):
 
         # Divider before actions
         sep_y = tx_y + tx_h + 4
-        p.setPen(QPen(QColor(255, 255, 255, 30), 1))
+        p.setPen(QPen(DIVIDER_C, 1))
         p.drawLine(QPoint(pad, sep_y), QPoint(w - pad, sep_y))
 
         p.setPen(DIM)
         p.setFont(self._font_small)
-        p.drawText(QRect(pad, sep_y + 4, 120, 18), Qt.AlignmentFlag.AlignLeft, "Action Items")
+        p.drawText(QRect(pad, sep_y + 4, 120, 18), Qt.AlignmentFlag.AlignLeft, "ACTION ITEMS")
 
         # ── Action items ──────────────────────────────────────────────────────
         STATUS_COLOR = {
-            "Queued":  QColor(196, 194, 202),
+            "Queued":  DIM,
             "Running": BLUE,
             "done":    GREEN,
             "error":   ERR,
@@ -810,17 +961,17 @@ class TranscriptionOverlay(QWidget):
 
             # Subtle row background
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QColor(255, 255, 255, 12))
-            p.drawRoundedRect(pad, ay, w - pad * 2, H_ACTION_ROW - 4, 8, 8)
+            p.setBrush(QColor(255, 255, 255, 14))
+            p.drawRoundedRect(pad, ay, w - pad * 2, H_ACTION_ROW - 4, 10, 10)
 
             p.setPen(FG)
             p.setFont(self._font_small)
-            p.drawText(QRect(pad + 10, ay + 2, w - 130, H_ACTION_ROW - 6),
+            p.drawText(QRect(pad + 12, ay + 2, w - 140, H_ACTION_ROW - 6),
                        int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
                        task)
 
             p.setPen(sc)
-            p.drawText(QRect(w - 110, ay + 2, 96, H_ACTION_ROW - 6),
+            p.drawText(QRect(w - 118, ay + 2, 98, H_ACTION_ROW - 6),
                        int(Qt.AlignmentFlag.AlignRight) | int(Qt.AlignmentFlag.AlignVCenter),
                        label)
 
@@ -859,10 +1010,11 @@ class TranscriptionOverlay(QWidget):
 
         # Recording indicator (top-right corner when listening)
         if self._recording:
-            dot_color = RED if self._pulse_on else QColor(200, 80, 76, 80)
+            breath = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.monotonic() * 3.2))
+            dot_color = QColor(RED); dot_color.setAlphaF(breath)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(dot_color)
-            p.drawEllipse(QPoint(w - 20, 16), 6, 6)
+            p.drawEllipse(QPoint(w - 20, 16), 5, 5)
             p.setPen(DIM)
             p.setFont(self._font_small)
             p.drawText(QRect(w - 110, 8, 82, 16), Qt.AlignmentFlag.AlignRight, "Listening…")
@@ -892,66 +1044,53 @@ class TranscriptionOverlay(QWidget):
                 "While you were asleep I've been busy — I found great opportunities and took care of things.",
             )
 
-    def _draw_mic(self, p: QPainter, cx: int, cy: int) -> None:
-        pen = QPen(DIM, 1.8)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        body = QPainterPath()
-        body.addRoundedRect(cx - 5, cy - 10, 10, 14, 5, 5)
-        p.drawPath(body)
-        p.drawArc(QRect(cx - 8, cy + 2, 16, 9), 180 * 16, -180 * 16)
-        p.drawLine(QPoint(cx, cy + 11), QPoint(cx, cy + 15))
-        p.drawLine(QPoint(cx - 5, cy + 15), QPoint(cx + 5, cy + 15))
-
     def _paint_expanded(self, p: QPainter) -> None:
         w, h = self.width(), self.height()
-        pad = 22
+        pad = PAD_H_EXPANDED
 
         # Subtle × button
-        p.setPen(QColor(180, 178, 195, 100))
+        p.setPen(FAINT)
         p.setFont(self._font_close)
-        p.drawText(QRect(w - 34, 8, 22, 22), Qt.AlignmentFlag.AlignCenter, "×")
+        p.drawText(QRect(w - 30, 8, 20, 20), Qt.AlignmentFlag.AlignCenter, "×")
 
         if not self._history:
             return
 
-        y = 18
+        y = 16
 
         for text, colour, kind in self._history:
             if kind == "user":
-                # Command: small, muted — one line, italic
-                p.setPen(QColor(168, 165, 180))
+                # Prompt echo: dim, lowercase-style quote
+                p.setPen(DIM)
                 p.setFont(self._font_small)
-                # Trim quotes, truncate to fit one line
                 display = text.strip('"').strip("'")
                 if len(display) > 58:
                     display = display[:55] + "…"
                 p.drawText(
-                    QRect(pad, y, w - pad * 2 - 30, 22),
+                    QRect(pad, y, w - pad * 2 - 24, 20),
                     int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
                     display,
                 )
-                y += 22
-                # Hairline separator
-                p.setPen(QPen(QColor(255, 255, 255, 22), 0.8))
-                p.drawLine(QPoint(pad, y + 4), QPoint(w - pad, y + 4))
-                y += 14
+                y += 24
+                p.setPen(QPen(DIVIDER_C, 0.8))
+                p.drawLine(QPoint(pad, y), QPoint(w - pad, y))
+                y += 12
             else:
-                # Response / status — larger, colour-coded
                 lines = max(1, (len(text) + 46) // 47)
-                th = lines * 26
+                th = lines * 24
                 p.setPen(colour)
                 p.setFont(self._font_body)
                 _flags = int(Qt.TextFlag.TextWordWrap) | int(Qt.AlignmentFlag.AlignLeft)
                 p.drawText(QRect(pad, y, w - pad * 2, th), _flags, text)
-                y += th + 6
+                y += th + 8
 
     # ── Timers ────────────────────────────────────────────────────────────────
 
     def _pulse_tick(self) -> None:
+        # Drive continuous repaint; breathing/bar animation reads time.monotonic()
+        # directly inside paintEvent so frames are always fresh.
         if self.isVisible():
-            self._pulse_on = not self._pulse_on
+            self._pulse_on = not self._pulse_on  # kept for meeting-mode cursor blink
             self.update()
 
     def _do_hide(self) -> None:

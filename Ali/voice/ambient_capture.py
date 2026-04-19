@@ -16,32 +16,21 @@ Design choices (from glass + our constraints):
 from __future__ import annotations
 
 import asyncio
-import os
 import threading
-import time
 from collections import deque
-from pathlib import Path
 from typing import Callable
+
+from observer.agent_log import log as _agent_log
 
 
 AMBIENT_TRIGGER_EVERY_FINALS = 5
 AMBIENT_HISTORY_TURNS = 30
 
-# Persistent log so we can inspect what happened after the fact. One line
-# per event — finals, triggers, tier outcomes — JSONL-ish plain text.
-_AMBIENT_LOG_PATH = Path(
-    os.environ.get("VOICE_AGENT_AMBIENT_LOG", "~/.ali/ambient.log")
-).expanduser()
-
 
 def _log(tag: str, text: str) -> None:
-    try:
-        _AMBIENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _AMBIENT_LOG_PATH.open("a") as f:
-            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [{tag}] {text}\n")
-    except Exception:
-        pass
-    print(f"[ambient][{tag}] {text}")
+    # All ambient events go through the unified agent log. Prefix with
+    # `ambient:` so grep separates them from browser_task / opencli events.
+    _agent_log(f"ambient:{tag}", text)
 
 
 class AmbientCapture:

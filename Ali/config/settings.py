@@ -52,6 +52,12 @@ AMBIENT_ENABLED = os.environ.get("VOICE_AGENT_AMBIENT", "0").lower() in {"1", "t
 AMBIENT_SCREEN_ENABLED = os.environ.get(
     "VOICE_AGENT_AMBIENT_SCREEN", "1" if AMBIENT_ENABLED else "0"
 ).lower() in {"1", "true", "yes"}
+# Voice readback (TTS via `say`) is OFF by default — overlay text is the
+# primary response channel and voice gets in the way during meetings.
+# Set to 1 to re-enable speaking tier 1/2 answers.
+AMBIENT_SPEAK_ENABLED = os.environ.get(
+    "VOICE_AGENT_AMBIENT_SPEAK", "0"
+).lower() in {"1", "true", "yes"}
 # OpenCLI requires Node >= 22.19. Bypass the shebang and invoke node+entry
 # directly so a stale `env node` in PATH can't resolve to an older version.
 OPENCLI_NODE_BIN = os.environ.get(

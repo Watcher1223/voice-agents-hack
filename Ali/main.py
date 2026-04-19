@@ -380,32 +380,130 @@ _active_meeting: "MeetingCapture | None" = None  # type: ignore[name-defined]
 _ambient_capture: "AmbientCapture | None" = None  # type: ignore[name-defined]
 
 
+_pending_confirmation: dict | None = None  # {"analysis": ..., "deadline": float, "safety": ...}
+_PENDING_CONFIRMATION_WINDOW_S = 10.0
+
+_YES_TOKENS = {"yes", "yeah", "yep", "sure", "do it", "go ahead", "confirm", "ok", "okay", "please", "please do"}
+_NO_TOKENS  = {"no", "nope", "skip", "not now", "cancel", "ignore", "never mind", "nevermind", "stop"}
+
+
+def _match_any(text: str, tokens: set[str]) -> bool:
+    t = (text or "").strip().lower().rstrip(".!?")
+    if not t:
+        return False
+    if t in tokens:
+        return True
+    return any(t.startswith(token + " ") or t.endswith(" " + token) or f" {token} " in f" {t} " for token in tokens)
+
+
 async def _run_ambient_capture(overlay) -> None:
-    global _ambient_capture
+    global _ambient_capture, _pending_confirmation
     from voice.ambient_capture import AmbientCapture
     from voice.speak import speak
     from observer.screen_loop import ScreenObserver
-    from config.settings import AMBIENT_SCREEN_ENABLED
+    from observer.meeting_detect import is_meeting_active
+    from observer.agent_log import log as agent_log
+    from intent.action_safety import classify as classify_safety
+    from config.settings import AMBIENT_SCREEN_ENABLED, AMBIENT_SPEAK_ENABLED
+    import time
+
+    def _should_speak() -> bool:
+        # Voice is off by default; and off whenever we're in a live meeting
+        # (Zoom / Meet / Slack huddle / Teams / Discord voice / Webex).
+        if not AMBIENT_SPEAK_ENABLED:
+            return False
+        if screen is not None:
+            ctx = screen.latest_context()
+            if is_meeting_active(ctx.app, ctx.window_title):
+                return False
+        return True
+
+    agent_loop = asyncio.get_running_loop()
 
     def _on_interim(text: str) -> None:
-        # Feather-light: just update the overlay's transcribing line so
-        # the user sees "I'm listening."
         overlay.push("meeting_interim", text[:120])
 
     def _on_final(text: str) -> None:
         overlay.push("meeting_final", text[:200])
+        # Confirmation listener: if there's a pending action waiting on
+        # "yes" / "no", try to consume this final transcript.
+        global _pending_confirmation
+        pc = _pending_confirmation
+        if pc is None:
+            return
+        if time.monotonic() > pc["deadline"]:
+            _pending_confirmation = None
+            overlay.clear_pending_confirm()
+            overlay.push("ambient_ack", "✗ suggestion expired")
+            agent_log("ambient:expire", "confirmation window elapsed")
+            return
+        if _match_any(text, _YES_TOKENS):
+            agent_log("ambient:confirm", "via voice 'yes'")
+            _pending_confirmation = None
+            overlay.clear_pending_confirm()
+            agent_loop.create_task(_execute_ambient_action(pc["analysis"], overlay))
+        elif _match_any(text, _NO_TOKENS):
+            agent_log("ambient:dismiss", "via voice 'no'")
+            _pending_confirmation = None
+            overlay.clear_pending_confirm()
+            overlay.push("ambient_ack", "✗ dismissed")
 
     def _on_suggestion(analysis) -> None:
         tier = analysis.tier
         headline = analysis.headline.strip()
         detail = (analysis.detail or headline).strip()
-        print(f"[ambient][tier-{tier}] {headline}")
-        overlay.push("assistant", headline[:200])
-        # Speak only tiers 1-2 (answer / define) to avoid audio spam for
-        # every suggested action. Tier-3 (suggest action) shows silently
-        # on the overlay; user can follow up with voice to execute.
-        if tier in (1, 2) and detail:
-            speak(detail[:400])
+
+        # Tier 1/2 — info only. Show always; speak only if voice is
+        # enabled AND we're not in a meeting.
+        if tier in (1, 2):
+            overlay.push("assistant", headline[:200])
+            if detail and _should_speak():
+                speak(detail[:200])
+            return
+
+        # Tier 3 — suggests a concrete action. Safety-check it.
+        if tier == 3:
+            safety = classify_safety(analysis.action)
+            if safety == "safe":
+                # Auto-execute; no confirmation ceremony.
+                print(f"[ambient] auto-executing SAFE action: {analysis.action}")
+                overlay.push("assistant", f"→ {headline[:180]}")
+                agent_loop.create_task(_execute_ambient_action(analysis, overlay))
+                return
+            # NEEDS_CONFIRM — show pill + wait for left-click (confirm),
+            # right-click (dismiss), voice "yes"/"no", or 10s timeout.
+            global _pending_confirmation
+            _pending_confirmation = {
+                "analysis": analysis,
+                "deadline": time.monotonic() + _PENDING_CONFIRMATION_WINDOW_S,
+                "safety": safety,
+            }
+            prompt = f"{headline[:140]}  — click to confirm · right-click to dismiss"
+            overlay.push("ambient_confirm", prompt)
+
+            def _on_click_confirm() -> None:
+                global _pending_confirmation
+                pc = _pending_confirmation
+                if pc is None:
+                    return
+                agent_log("ambient:confirm", "via click")
+                _pending_confirmation = None
+                asyncio.run_coroutine_threadsafe(
+                    _execute_ambient_action(pc["analysis"], overlay),
+                    agent_loop,
+                )
+
+            def _on_click_dismiss() -> None:
+                global _pending_confirmation
+                if _pending_confirmation is None:
+                    return
+                agent_log("ambient:dismiss", "via right-click")
+                _pending_confirmation = None
+                overlay.push("ambient_ack", "✗ dismissed")
+
+            overlay.set_pending_confirm(_on_click_confirm, _on_click_dismiss)
+            agent_log("ambient:await-confirm", f"{headline[:100]} ({safety})")
+            return
 
     screen = None
     if AMBIENT_SCREEN_ENABLED:
@@ -424,6 +522,77 @@ async def _run_ambient_capture(overlay) -> None:
         if screen is not None:
             screen.stop()
         _ambient_capture = None
+
+
+async def _execute_ambient_action(analysis, overlay) -> None:
+    """Route a confirmed (or safe) ambient tier-3 action through the
+    existing execution paths: opencli for adapters, browser_task for
+    browser utterances, orchestrator for local goals."""
+    from observer.agent_log import log as agent_log
+    action = analysis.action or {}
+    kind = action.get("kind", "").lower()
+    text = action.get("text", "").strip()
+    headline = analysis.headline.strip()
+    agent_log("ambient:exec", f"kind={kind} text={text[:80]} head={headline[:80]}")
+
+    try:
+        if kind == "opencli":
+            await _execute_ambient_opencli(text, overlay, headline)
+            return
+        if kind == "browser_task":
+            from orchestrator.orchestrator import Orchestrator
+            orchestrator = Orchestrator()
+            await _route_to_browser(text, orchestrator, overlay, None)
+            return
+        if kind == "local":
+            from intent.meeting_intelligence import item_to_intent
+            from orchestrator.orchestrator import Orchestrator
+            orchestrator = Orchestrator()
+            intent = item_to_intent({"task": headline, "type": text, "slots": {}})
+            if intent.goal.value == "unknown":
+                overlay.push("ambient_ack", f"✗ could not map {text!r} to a local goal")
+                agent_log("ambient:exec", f"unmapped local goal {text!r}")
+                return
+            await orchestrator.run(intent)
+            overlay.push("ambient_ack", f"✓ {headline[:160]}")
+            agent_log("ambient:exec", f"done {headline[:120]}")
+            return
+        overlay.push("ambient_ack", f"✗ unknown action kind {kind!r}")
+    except Exception as e:
+        agent_log("ambient:exec", f"FAILED {headline[:80]}: {e}")
+        overlay.push("ambient_ack", f"✗ {headline[:140]}: {e}")
+
+
+async def _execute_ambient_opencli(text: str, overlay, headline: str) -> None:
+    """Run an opencli command suggested by the ambient analyzer. Unlike the
+    PTT path we don't need a regex match — the text IS the command."""
+    from executors.opencli_client import run_intent, summarize, OpenCliIntent
+    from observer.agent_log import log as agent_log
+    import re
+
+    parts = text.strip().split()
+    if not parts:
+        overlay.push("ambient_ack", "✗ empty opencli command")
+        return
+    # Show the tool call before it runs so the overlay feels responsive.
+    overlay.push("action", f"▶  opencli  ·  {' '.join(parts[:3])}")
+    agent_log("tool:opencli", f"ambient cmd={parts}")
+    adhoc = OpenCliIntent(
+        name=f"ambient:{parts[0]}",
+        match=re.compile(".*"),
+        cmd=parts + ["--limit", "5"],
+        description=f"ambient-suggested opencli: {text}",
+        speak_template="{top3_titles}",
+    )
+    result = await run_intent(adhoc, groups=[])
+    if result.ok:
+        reply = summarize(result, adhoc, []) or "Done."
+        overlay.push("assistant", reply[:400])
+        agent_log("tool:opencli:done", reply[:200])
+    else:
+        err = result.error_message()
+        overlay.push("ambient_ack", f"✗ {err[:160]}")
+        agent_log("tool:opencli:err", err[:160])
 
 # Persistent browser sub-agent session. One session spans many voice
 # utterances so follow-ups ("now open my inbox", "reply to this person")
@@ -469,8 +638,12 @@ async def _route_to_browser(transcript: str, orchestrator, overlay, menu_bar) ->
     from ui.confirmation import ask_confirmation
 
     client = orchestrator._browser_agent
-    menu_bar.set_status("running")
-    overlay.push("action", "Browsing…")
+    if menu_bar is not None:
+        menu_bar.set_status("running")
+    # Show the actual task so the user can see what the agent will do.
+    overlay.push("action", f"▶  browser: {transcript[:180]}")
+    from observer.agent_log import log as agent_log
+    agent_log("tool:browser_task", transcript[:160])
 
     async def _turn(text: str):
         """One round-trip: start a new session or push a message to the
@@ -546,7 +719,10 @@ async def _route_to_opencli(transcript: str, hit, overlay, menu_bar) -> None:
 
     intent, groups = hit
     menu_bar.set_status("running")
-    overlay.push("action", f"opencli: {intent.name}")
+    cmd_preview = " ".join(intent.cmd[:3])
+    overlay.push("action", f"▶  opencli  ·  {cmd_preview}")
+    from observer.agent_log import log as agent_log
+    agent_log("tool:opencli", f"{intent.name} cmd={intent.cmd}")
 
     try:
         result = await run_intent(intent, groups)
