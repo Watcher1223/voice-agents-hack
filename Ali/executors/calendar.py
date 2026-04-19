@@ -19,28 +19,36 @@ def _applescript_for_event(
     dt = datetime.strptime(iso_date, "%Y-%m-%d")
     end_hour = start_hour + duration_hours
 
-    # Build date objects via property assignment — locale-independent.
-    def date_block(var: str, hour: int) -> str:
-        return f"""
-        set {var} to current date
-        set year of {var} to {dt.year}
-        set month of {var} to {dt.month}
-        set day of {var} to {dt.day}
-        set hours of {var} to {hour}
-        set minutes of {var} to 0
-        set seconds of {var} to 0"""
-
-    safe_title = title.replace('"', "'")
-    return f"""
-tell application "Calendar"
+    safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+    return f"""tell application "Calendar"
     set targetCal to first calendar whose writable is true
     tell targetCal
-        {date_block("startDate", start_hour)}
-        {date_block("endDate", end_hour)}
+        set startDate to current date
+        set year of startDate to {dt.year}
+        set month of startDate to {dt.month}
+        set day of startDate to {dt.day}
+        set hours of startDate to {start_hour}
+        set minutes of startDate to 0
+        set seconds of startDate to 0
+        set endDate to current date
+        set year of endDate to {dt.year}
+        set month of endDate to {dt.month}
+        set day of endDate to {dt.day}
+        set hours of endDate to {end_hour}
+        set minutes of endDate to 0
+        set seconds of endDate to 0
         make new event with properties {{summary:"{safe_title}", start date:startDate, end date:endDate}}
     end tell
-end tell
-"""
+end tell"""
+
+
+def _event_title(origin: str, destination: str, price, iata_from: str, iata_to: str) -> str:
+    """Build a human-readable event title using city names when available."""
+    # Prefer full city names from slots; fall back to IATA codes from flight data
+    src = origin.strip() or iata_from
+    dst = destination.strip() or iata_to
+    price_str = f" (${price})" if price else ""
+    return f"Flight {src} \u2192 {dst}{price_str}"
 
 
 def add_flight_events(slots: dict, flight: dict) -> int:
@@ -53,8 +61,10 @@ def add_flight_events(slots: dict, flight: dict) -> int:
     if sys.platform != "darwin":
         return 0
 
-    fly_from = flight.get("flyFrom") or slots.get("origin", "")
-    fly_to = flight.get("flyTo") or slots.get("destination", "")
+    origin = slots.get("origin") or ""
+    destination = slots.get("destination") or ""
+    iata_from = flight.get("flyFrom") or origin
+    iata_to = flight.get("flyTo") or destination
     price = flight.get("price")
     depart_date = slots.get("depart_date")
     return_date = slots.get("return_date") or None
@@ -62,17 +72,19 @@ def add_flight_events(slots: dict, flight: dict) -> int:
     if not depart_date:
         return 0
 
-    price_str = f" (${price})" if price else ""
-    created = 0
+    events = [
+        (depart_date, _event_title(origin, destination, price, iata_from, iata_to)),
+    ]
+    if return_date:
+        events.append((return_date, _event_title(destination, origin, None, iata_to, iata_from)))
 
-    for iso_date, title in [
-        (depart_date, f"Flight {fly_from} to {fly_to}{price_str}"),
-        *([(return_date, f"Return flight {fly_to} to {fly_from}")] if return_date else []),
-    ]:
+    created = 0
+    for iso_date, title in events:
         script = _applescript_for_event(title, iso_date)
         try:
             result = subprocess.run(
-                ["osascript", "-e", script],
+                ["osascript"],
+                input=script,
                 capture_output=True,
                 text=True,
                 timeout=10,
