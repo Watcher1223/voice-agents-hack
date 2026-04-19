@@ -550,16 +550,21 @@ async def _run_ambient_capture(overlay) -> None:
                 overlay.push("assistant", f"→ {headline[:180]}")
                 agent_loop.create_task(_execute_ambient_action(analysis, overlay))
                 return
-            # NEEDS_CONFIRM — show pill + wait for left-click (confirm),
-            # right-click (dismiss), voice "yes"/"no", or 10s timeout.
+
+            # NEEDS_CONFIRM — enrich NOW (not at execute time) so the user
+            # sees the resolved recipient, attachment, etc. on the pill
+            # before they commit. Store the enriched analysis in
+            # _pending_confirmation so we don't re-enrich on click.
+            enriched_analysis = _enrich_analysis_for_preview(analysis)
+            preview = _format_action_preview(enriched_analysis)
+
             global _pending_confirmation
             _pending_confirmation = {
-                "analysis": analysis,
+                "analysis": enriched_analysis,
                 "deadline": time.monotonic() + _PENDING_CONFIRMATION_WINDOW_S,
                 "safety": safety,
             }
-            prompt = f"{headline[:140]}  — click to confirm · right-click to dismiss"
-            overlay.push("ambient_confirm", prompt)
+            overlay.push("ambient_confirm", preview)
 
             def _on_click_confirm() -> None:
                 global _pending_confirmation
@@ -635,6 +640,66 @@ async def _execute_ambient_action(analysis, overlay) -> None:
     except Exception as e:
         agent_log("ambient:exec", f"FAILED {headline[:80]}: {e}")
         overlay.push("ambient_ack", f"✗ {headline[:140]}: {e}")
+
+
+def _enrich_analysis_for_preview(analysis):
+    """Run the same slot enrichment the execute path would — BEFORE the
+    user confirms — so the yellow pill shows real values (resolved
+    email, found attachment path, etc.) rather than raw names."""
+    from intent.ambient_analysis import AmbientAnalysis
+    action = dict(analysis.action or {})
+    text = str(action.get("text", "")).strip()
+    slots = dict(action.get("slots") or {})
+    headline = analysis.headline
+    detail = analysis.detail or ""
+    # Mutates `slots` — shared helper with the execute path.
+    enriched = _enrich_local_slots(text, slots, headline, detail)
+    action["slots"] = enriched
+    return AmbientAnalysis(
+        tier=analysis.tier,
+        headline=analysis.headline,
+        detail=analysis.detail,
+        action=action,
+        raw_json=analysis.raw_json,
+    )
+
+
+def _format_action_preview(analysis) -> str:
+    """Build the text that goes on the yellow `ambient_confirm` pill.
+    Show exactly what will happen: recipient, subject, body preview,
+    attachment count. Under ~220 chars so it fits the overlay."""
+    action = analysis.action or {}
+    text = action.get("text", "").strip()
+    slots = action.get("slots") or {}
+    head = analysis.headline.strip()
+
+    def _clip(s: str, n: int) -> str:
+        s = (s or "").strip()
+        return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+    if text in ("compose_mail", "send_email"):
+        to = _clip(str(slots.get("to") or "(no recipient)"), 60)
+        subj = _clip(str(slots.get("subject") or "(no subject)"), 50)
+        body = _clip(str(slots.get("body") or ""), 80)
+        atts = slots.get("attachments") or []
+        tail = f"  [{len(atts)} attached]" if atts else ""
+        preview = f"Email → {to}{tail}  ·  {subj}  ·  “{body}”"
+    elif text in ("send_imessage", "send_message"):
+        contact = _clip(str(slots.get("contact") or "(no contact)"), 50)
+        body = _clip(str(slots.get("body") or ""), 100)
+        preview = f"iMessage → {contact}  ·  “{body}”"
+    elif text in ("create_calendar_event", "add_calendar_event"):
+        title = _clip(str(slots.get("title") or head), 50)
+        date = str(slots.get("date") or "").strip()
+        time_ = str(slots.get("time") or "").strip()
+        when = f"{date} {time_}".strip() or "(no time)"
+        att = slots.get("attendees") or []
+        who = f"  ·  with {', '.join(str(a) for a in att)[:60]}" if att else ""
+        preview = f"Calendar → {title}  ·  {when}{who}"
+    else:
+        preview = head[:180]
+
+    return f"{preview}   · click to confirm · right-click to cancel"
 
 
 def _enrich_local_slots(
