@@ -1641,7 +1641,7 @@ def _dispatch_checklist_click(
     """Qt click callback. Runs on the UI thread → schedule work back onto
     the asyncio agent loop so we don't block Qt and so we stay consistent
     with the other ambient execution paths."""
-    from observer.task_checklist import checklist, STATUS_SKIPPED
+    from observer.task_checklist import checklist
     from observer.agent_log import log as agent_log
 
     if kind == "run":
@@ -1649,11 +1649,14 @@ def _dispatch_checklist_click(
             _execute_checklist_task(task_id, overlay), agent_loop
         )
     elif kind == "skip":
+        # Hard delete: drop the row from the store entirely rather than
+        # marking it skipped. The × glyph is the user's "get this out of
+        # my sight" affordance, so honour that literally.
         cl = checklist()
         task = cl.get(task_id)
-        if task and task.status == "pending":
-            cl.update_status(task_id, STATUS_SKIPPED)
-            agent_log("checklist:skip", f"{task.label[:100]}")
+        label = task.label[:100] if task else task_id
+        if cl.remove(task_id):
+            agent_log("checklist:delete", label)
             _push_checklist_state(overlay)
 
 
@@ -1713,7 +1716,7 @@ def _handle_checklist_voice_command(
 ) -> bool:
     """Try to interpret ``text`` as a checklist voice command. Returns
     True if it was handled (so the caller skips other processing)."""
-    from observer.task_checklist import checklist, STATUS_SKIPPED
+    from observer.task_checklist import checklist
     from observer.agent_log import log as agent_log
 
     t = (text or "").strip().lower().rstrip(".!?")
@@ -1765,8 +1768,9 @@ def _handle_checklist_voice_command(
         return True  # Still handled — just no-op.
 
     if has_skip_verb:
-        cl.update_status(task.id, STATUS_SKIPPED)
-        agent_log("checklist:skip", f"voice idx={idx} {task.label[:80]}")
+        label = task.label[:80]
+        cl.remove(task.id)
+        agent_log("checklist:delete", f"voice idx={idx} {label}")
         _push_checklist_state(overlay)
         return True
 

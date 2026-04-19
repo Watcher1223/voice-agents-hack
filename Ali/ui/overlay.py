@@ -666,8 +666,8 @@ class TranscriptionOverlay(QWidget):
     ) -> None:
         """Register a callback invoked when the user clicks a checklist
         row. The handler receives ``(task_id, kind)`` where ``kind`` is
-        ``"run"`` (checkbox clicked → execute) or ``"skip"`` (dismiss
-        glyph clicked → remove from the list)."""
+        ``"run"`` (checkbox clicked → execute) or ``"skip"`` (× glyph
+        clicked → hard-delete from the list)."""
         self._checklist_click_handler = handler
 
     def _hit_checklist(self, x: float, y: float) -> tuple[str, str] | None:
@@ -1709,24 +1709,22 @@ class TranscriptionOverlay(QWidget):
         }
         status_text, status_col = status_map.get(sl, (status[:16], DIM))
 
-        # × skip glyph on the far right for pending tasks. Clicking it
-        # removes the row without executing.
+        # × glyph on the far right for every row (pending, done, failed,
+        # skipped, even running). Clicking it hard-deletes the row from
+        # the checklist — useful for tidying up completed tasks too.
         right_edge = pad_left + width - 10
-        if sl == "pending":
-            glyph_x = right_edge - 12
-            glyph_y = y + CHECKLIST_ROW_H // 2
-            p.setPen(FAINT)
-            p.setFont(self._font_small)
-            p.drawText(
-                QRect(glyph_x - 6, glyph_y - 9, 18, 18),
-                Qt.AlignmentFlag.AlignCenter,
-                "×",
-            )
-            skip_hit = QRect(glyph_x - 12, glyph_y - 12, 24, 24)
-            self._checklist_hit_rects.append((skip_hit, task_id, "skip"))
-            status_right = glyph_x - 14
-        else:
-            status_right = right_edge
+        glyph_x = right_edge - 12
+        glyph_y = y + CHECKLIST_ROW_H // 2
+        p.setPen(FAINT)
+        p.setFont(self._font_small)
+        p.drawText(
+            QRect(glyph_x - 6, glyph_y - 9, 18, 18),
+            Qt.AlignmentFlag.AlignCenter,
+            "×",
+        )
+        skip_hit = QRect(glyph_x - 12, glyph_y - 12, 24, 24)
+        self._checklist_hit_rects.append((skip_hit, task_id, "skip"))
+        status_right = glyph_x - 14
 
         p.setPen(status_col)
         p.setFont(self._font_small)
