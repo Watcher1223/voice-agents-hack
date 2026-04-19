@@ -225,6 +225,9 @@ async def _parse_with_gemini(transcript: str) -> IntentObject:
     return _parse_json_response(raw, transcript)
 
 
+_CACTUS_TIMEOUT_S = float(os.environ.get("ALI_CACTUS_TIMEOUT_S", "8"))
+
+
 async def _parse_with_cactus(transcript: str) -> IntentObject:
     prompt = f"{SYSTEM_PROMPT}\n\nTranscript: {transcript}"
     # Keep CLI args minimal for broad cactus version compatibility.
@@ -234,7 +237,24 @@ async def _parse_with_cactus(transcript: str) -> IntentObject:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_CACTUS_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        # Cactus is stuck (model not pulled, CLI prompting, stalled
+        # generation). Kill the subprocess and raise so parse_intent
+        # falls through to the rule-based parser — which feeds the
+        # unknown→browser fallback in main._handle_transcript.
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=1.0)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+        raise RuntimeError(f"timed out after {_CACTUS_TIMEOUT_S}s")
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode().strip())
     return _parse_json_response(stdout.decode(), transcript)

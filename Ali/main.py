@@ -148,6 +148,12 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
     async def _handle_transcript(transcript: str) -> None:
         async with command_lock:
             try:
+                # Apply vocab corrections up-front so every entry path
+                # (wake-tail inline dispatch via Google STT, full PTT via
+                # Deepgram/Whisper, etc.) benefits from the same
+                # "Corinne→Korin / Alex→LAX" safety net.
+                from config.vocab import apply_corrections
+                transcript = apply_corrections(transcript)
                 print("\n─── New command ───────────────────────────────")
                 overlay.push("transcript", f'"{transcript}"')
 
@@ -231,8 +237,20 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     return
 
                 if intent.goal.value in ("unknown", "ask_knowledge"):
+                    from config.settings import ROUTE_BROWSER_TASK_ENABLED
                     from intent.chat import chat_reply
                     from voice.speak import speak
+
+                    # Action-shaped utterances ("book a flight…", "check for a
+                    # hotel…") should execute in real time via the browser
+                    # agent — not get punted to chat_reply. This is the
+                    # failsafe that kicks in whenever the classifier is
+                    # down (Gemini 429) or simply doesn't recognize the goal.
+                    if ROUTE_BROWSER_TASK_ENABLED and _looks_like_browser_action(transcript):
+                        print("[2.5/3] Unknown but action-shaped → browser agent...")
+                        await _route_to_browser(transcript, orchestrator, overlay, menu_bar)
+                        return
+
                     print("[2.5/3] Unknown intent → conversational reply...")
                     reply = ""
                     if _disk_on:
@@ -1142,6 +1160,60 @@ _ACTION_VERBS = (
     "book", "find", "search", "draft", "schedule",
     "call", "reply", "open", "order", "buy",
 )
+
+# Verbs that, when they lead the utterance, signal "go execute this now"
+# even if the classifier returned unknown. We route these straight to the
+# browser agent so real-time actions happen instead of falling to chat.
+_BROWSER_FALLBACK_VERBS = frozenset({
+    "book", "buy", "order", "purchase", "reserve",
+    "search", "look", "check", "find",
+    "reserve", "rent", "schedule",
+    "post", "tweet", "share",
+    "get", "fetch", "grab", "pull",
+    "apply",
+    "show",
+})
+
+_BROWSER_FALLBACK_LEADERS = (
+    "can you ", "could you ", "please ", "would you ", "i want to ",
+    "i'd like to ", "id like to ", "help me ", "let's ", "lets ",
+)
+
+# Vocatives that may re-appear mid-transcript when Deepgram glues two
+# utterances together ("…California. Ali, book a flight…"). We strip
+# these per-clause before the verb check.
+_BROWSER_FALLBACK_VOCATIVES = (
+    "hey ali ", "okay ali ", "ok ali ", "ali ",
+)
+
+
+def _looks_like_browser_action(transcript: str) -> bool:
+    """True when any clause of the utterance reads like a real-time
+    imperative the browser agent should just go do (book a flight,
+    check a hotel, order groceries…). Clause-aware because Deepgram
+    sometimes commits two utterances as one final — e.g.
+    'Flight from Ontario. Ali, book a flight…' — and we want the later
+    imperative to still trigger execution."""
+    t = (transcript or "").strip().lower()
+    if not t:
+        return False
+    import re as _re
+    for raw_clause in _re.split(r"[,.;!?]+", t):
+        clause = raw_clause.strip()
+        if not clause:
+            continue
+        for voc in _BROWSER_FALLBACK_VOCATIVES:
+            if clause.startswith(voc):
+                clause = clause[len(voc):].strip()
+                break
+        for lead in _BROWSER_FALLBACK_LEADERS:
+            if clause.startswith(lead):
+                clause = clause[len(lead):].strip()
+                break
+        words = clause.split()
+        if words and words[0] in _BROWSER_FALLBACK_VERBS:
+            return True
+    return False
 
 
 def _is_multi_action_candidate(transcript: str) -> bool:
