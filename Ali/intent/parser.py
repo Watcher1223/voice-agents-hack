@@ -224,8 +224,20 @@ async def parse_intent(transcript: str) -> IntentObject:
     return rule
 
 
+def _today_context() -> str:
+    """Gemini's training cutoff skews its year estimate (it picked 2023
+    for 'April 20' in an April-2026 session). Feed it the real date so
+    find_flights slots stop coming back as past-year ISO strings."""
+    import datetime as _dt
+    today = _dt.date.today()
+    return (
+        f"Today's date is {today.isoformat()} ({today.strftime('%A, %B %d, %Y')}). "
+        "All dates in your output MUST be today or later — never emit a past date."
+    )
+
+
 async def _parse_with_gemini(transcript: str) -> IntentObject:
-    prompt = f"{SYSTEM_PROMPT}\n\nTranscript: {transcript}"
+    prompt = f"{SYSTEM_PROMPT}\n\n{_today_context()}\n\nTranscript: {transcript}"
     loop = asyncio.get_event_loop()
 
     def _call():
@@ -249,7 +261,7 @@ _CACTUS_PARSE_TIMEOUT_S = float(os.environ.get("ALI_CACTUS_INTENT_TIMEOUT_S", "8
 
 
 async def _parse_with_cactus(transcript: str) -> IntentObject:
-    prompt = f"{SYSTEM_PROMPT}\n\nTranscript: {transcript}"
+    prompt = f"{SYSTEM_PROMPT}\n\n{_today_context()}\n\nTranscript: {transcript}"
     # Keep CLI args minimal for broad cactus version compatibility.
     # Some installs reject "--max-tokens"/"--temperature" for `cactus run`.
     proc = await asyncio.create_subprocess_exec(

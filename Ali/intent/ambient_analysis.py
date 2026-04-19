@@ -403,8 +403,16 @@ def _assemble_prompt(
             "directly helps answer a question, define a term the user can "
             "see, or suggest an action about what's open."
         )
+    import datetime as _dt
+    today = _dt.date.today()
+    today_line = (
+        f"Today's date is {today.isoformat()} "
+        f"({today.strftime('%A, %B %d, %Y')}). "
+        "All dates in your output MUST be today or later — never a past date."
+    )
     return (
         f"{_SYSTEM}\n\n"
+        f"{today_line}\n\n"
         f"{_HISTORY_PREAMBLE}\n{hist_block}\n\n"
         f"CURRENT SCREEN CONTEXT:\n{screen_block}\n\n"
         f"{_PREVIOUS_JSON_PREAMBLE}\n{prev_block}\n\n"
@@ -476,8 +484,14 @@ def _assemble_cactus_prompt(
     tail = [rewrite_self_pronouns(line) for line in (history[-4:] if history else [])]
     hist_block = "\n".join(f"- {line}" for line in tail) or "(empty)"
     checklist_block = _format_pending_checklist_block()
+    import datetime as _dt
+    today = _dt.date.today()
+    today_line = (
+        f"Today is {today.isoformat()}. All dates must be today or later."
+    )
     return (
         f"{_CACTUS_SYSTEM}\n\n"
+        f"{today_line}\n\n"
         f"TASKS ALREADY ON CHECKLIST:\n{checklist_block}\n\n"
         f"CURRENT TRANSCRIPT:\n{hist_block}\n\n"
         "JSON output:"
