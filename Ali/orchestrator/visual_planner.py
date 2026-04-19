@@ -16,27 +16,17 @@ from config.settings import CACTUS_GEMMA4_MODEL
 from intent.schema import IntentObject, KnownGoal
 
 ALLOWED_ACTION_TYPES = {
-    "navigate",
-    "click_text",
-    "click_selector",
-    "type_selector",
-    "upload_file",
-    "scroll",
-    "wait_for_text",
+    # Delegates a complete browser task (e.g. "go to example.com and tell me the
+    # title") to the browser sub-agent. The planner should emit ONE of these
+    # for any browser goal — the sub-agent handles navigation, DOM reading,
+    # form filling, and multi-step flows autonomously on the user's real
+    # Chrome. See executors/browser/agent_client.py.
+    "browser_task",
+    # Local / UI actions. Kept for non-browser goals (iMessage, Mail, Calendar).
     "ask_user",
-    "run_script",
-    "author_script",
-    "compose_mail",
     "complete",
     "abort",
 }
-
-_ATTACHMENT_ROLES = ("attachment", "deck", "document")
-
-# Actions that must not be gated behind the confirmation prompt even if the
-# planner accidentally marks them irreversible — safe by construction.
-_ALWAYS_SAFE_ACTION_TYPES = {"run_script", "author_script"}
-
 CACTUS_CLI = shutil.which("cactus")
 
 
@@ -54,12 +44,7 @@ class NextAction:
             raise ValueError(f"Unsupported action_type: {self.action_type}")
         if self.safety_level not in {"safe", "irreversible"}:
             raise ValueError(f"Invalid safety_level: {self.safety_level}")
-        if self.action_type in _ALWAYS_SAFE_ACTION_TYPES:
-            if self.safety_level != "safe":
-                raise ValueError(
-                    f"Action {self.action_type} must be safe"
-                )
-        elif self.safety_level == "irreversible" and not self.confirm_required:
+        if self.safety_level == "irreversible" and not self.confirm_required:
             raise ValueError("Irreversible actions must require confirmation")
 
 
@@ -116,66 +101,37 @@ async def _choose_with_cactus(
 
 
 def _build_prompt(intent: IntentObject, observation: dict[str, Any], collected_data: dict[str, Any]) -> str:
-    disk_context = _disk_context(collected_data)
-    script_catalog = _script_catalog(collected_data)
-
-    instructions = (
-        "You are a strict action planner for a local desktop voice agent.\n"
-        "Based on the goal, current observation, and state data, return exactly one JSON object.\n"
-        "Allowed action_type: navigate, click_text, click_selector, type_selector, upload_file, "
-        "scroll, wait_for_text, ask_user, run_script, author_script, complete, abort.\n"
-        "Required fields: action_type, reason, expected_outcome, safety_level, confirm_required, params.\n"
+    return (
+        "You are the planner for a local desktop voice agent. You delegate work\n"
+        "to tools. Return exactly one JSON object.\n"
+        "\n"
+        "Allowed action_type:\n"
+        "  - browser_task: delegate a browser task to the browser sub-agent.\n"
+        "      Use for any goal that needs a web browser (apply to a job,\n"
+        "      send LinkedIn DM, read Gmail, check a site, etc.).\n"
+        "      params.task must be a complete natural-language task description\n"
+        "      with concrete targets (URLs, form fields, message body). Use\n"
+        "      ${slot} placeholders for resume path, contact name, etc.\n"
+        "      Example params: {\\\"task\\\": \\\"Go to apply.ycombinator.com,\n"
+        "      fill the Fall 2026 application using ${resume}, and pause for\n"
+        "      confirmation before clicking Submit.\\\"}\n"
+        "  - ask_user: need more info from the user. params.question required.\n"
+        "  - complete: task finished successfully.\n"
+        "  - abort: cannot proceed. params.reason should explain why.\n"
+        "\n"
+        "Required fields: action_type, reason, expected_outcome, safety_level,\n"
+        "confirm_required, params.\n"
         "safety_level must be safe or irreversible.\n"
         "If action is irreversible, confirm_required must be true.\n"
-        "upload_file.params.file_role must match one of disk_context.role when disk_context is non-empty.\n"
-        "Prefer an existing script from script_catalog via run_script "
-        "(params={name, args: {...}}). Only when no catalog entry fits, emit "
-        "author_script (params={name, runtime, description, params, body}); "
-        "the orchestrator will validate and persist it. "
-        "run_script and author_script are always safe.\n"
+        "For browser_task, set safety_level=irreversible when the task sends,\n"
+        "submits, posts, or books; confirm_required=true in that case.\n"
         "Output only JSON.\n\n"
+        f"intent_goal={intent.goal.value}\n"
+        f"intent_target={json.dumps(intent.target, ensure_ascii=True)}\n"
+        f"intent_slots={json.dumps(intent.slots, ensure_ascii=True)}\n"
+        f"observation={json.dumps(observation, ensure_ascii=True)}\n"
+        f"collected_data={json.dumps(collected_data, ensure_ascii=True)}\n"
     )
-    return (
-        instructions
-        + f"intent_goal={intent.goal.value}\n"
-        + f"intent_target={json.dumps(intent.target, ensure_ascii=True)}\n"
-        + f"intent_slots={json.dumps(intent.slots, ensure_ascii=True)}\n"
-        + f"observation={json.dumps(observation, ensure_ascii=True)}\n"
-        + f"disk_context={json.dumps(disk_context, ensure_ascii=True)}\n"
-        + f"script_catalog={json.dumps(script_catalog, ensure_ascii=True)}\n"
-        + f"collected_data={json.dumps(_slim_collected_data(collected_data), ensure_ascii=True)}\n"
-    )
-
-
-def _disk_context(collected_data: dict[str, Any]) -> list[dict[str, str]]:
-    resolved = collected_data.get("resolved_local_files") or {}
-    if not isinstance(resolved, dict):
-        return []
-    entries: list[dict[str, str]] = []
-    from pathlib import Path as _Path
-
-    for role, path in list(resolved.items())[:6]:
-        if not isinstance(path, str) or not path:
-            continue
-        p = _Path(path)
-        entries.append({"role": role, "basename": p.name, "parent": p.parent.name})
-    return entries
-
-
-def _script_catalog(collected_data: dict[str, Any]) -> list[dict[str, Any]]:
-    catalog = collected_data.get("script_catalog")
-    if isinstance(catalog, list):
-        return catalog[:12]
-    return []
-
-
-def _slim_collected_data(collected_data: dict[str, Any]) -> dict[str, Any]:
-    # Avoid repeating the catalog and resolved_local_files inside collected_data
-    # since we emit them as dedicated blocks.
-    slim = dict(collected_data)
-    slim.pop("script_catalog", None)
-    slim.pop("last_observation", None)
-    return slim
 
 
 def _parse_next_action(raw: str) -> NextAction:
@@ -201,122 +157,23 @@ def _fallback_action(
     url = (observation.get("url") or "").lower()
     scope = observation.get("scope", "")
 
-    if intent.goal == KnownGoal.APPLY_TO_JOB:
-        if "apply.ycombinator.com" not in url:
-            return NextAction(
-                action_type="navigate",
-                reason="Ensure browser is at YC Apply before form actions.",
-                expected_outcome="YC Apply page is open.",
-                safety_level="safe",
-                confirm_required=False,
-                params={"url": "https://apply.ycombinator.com"},
-            )
-        if not collected_data.get("yc_form_filled"):
-            return NextAction(
-                action_type="upload_file",
-                reason="Run YC form fill phase using known slots and resume.",
-                expected_outcome="Known fields become populated.",
-                safety_level="safe",
-                confirm_required=False,
-                params={"mode": "yc_apply_fill"},
-            )
-        return NextAction(
-            action_type="click_text",
-            reason="Submit application once form fill stage completed.",
-            expected_outcome="YC submission completes.",
-            safety_level="irreversible",
-            confirm_required=True,
-            params={"text": "Submit", "mode": "yc_apply_submit"},
+    if intent.requires_browser:
+        slot_hint = ""
+        if "resume" in intent.uses_local_data:
+            slot_hint = " Use ${resume} to reference the user's resume file."
+        base_task = intent.raw_transcript or "Complete the user request."
+        target_json = json.dumps(intent.target, ensure_ascii=True)
+        slots_json = json.dumps(intent.slots, ensure_ascii=True)
+        task_text = (
+            f"{base_task} Target: {target_json}. Slots: {slots_json}.{slot_hint}"
         )
-
-    if intent.goal == KnownGoal.FIND_FILE:
-        script_result = collected_data.get("script_result")
-        if isinstance(script_result, dict) and script_result.get("name") == "reveal_in_finder":
-            return NextAction(
-                action_type="complete",
-                reason="Revealed the file in Finder.",
-                expected_outcome="User sees the file highlighted in a Finder window.",
-                safety_level="safe",
-                confirm_required=False,
-                params={},
-            )
-        resolved = collected_data.get("resolved_local_files") or {}
-        found_path = resolved.get("found") if isinstance(resolved, dict) else None
-        if found_path:
-            return NextAction(
-                action_type="run_script",
-                reason="Reveal the located file in Finder for the user.",
-                expected_outcome="A Finder window opens highlighting the file.",
-                safety_level="safe",
-                confirm_required=False,
-                params={"name": "reveal_in_finder", "args": {"path": found_path}},
-            )
-        # No resolution. First step: ask for clarification. Any later step
-        # means we already asked and still have nothing — abort so the loop
-        # doesn't burn through max_steps re-asking the same question.
-        if step_index > 0:
-            query = (collected_data.get("slots") or {}).get("file_query") or "(unknown)"
-            return NextAction(
-                action_type="abort",
-                reason=f"No local file matched query={query!r}.",
-                expected_outcome="Orchestration stops so the user can refine.",
-                safety_level="safe",
-                confirm_required=False,
-                params={},
-            )
         return NextAction(
-            action_type="ask_user",
-            reason="Could not resolve a local file matching the request.",
-            expected_outcome="User clarifies or names the file.",
-            safety_level="safe",
-            confirm_required=False,
-            params={"question": "Which file are you looking for? A more specific name helps."},
-        )
-
-    if intent.goal == KnownGoal.SEND_EMAIL:
-        resolved = collected_data.get("resolved_local_files") or {}
-        attachments: list[str] = []
-        if isinstance(resolved, dict):
-            for role in _ATTACHMENT_ROLES:
-                value = resolved.get(role)
-                if isinstance(value, str) and value:
-                    attachments.append(value)
-        slots = collected_data.get("slots") or {}
-        to = str(slots.get("to") or intent.target.get("value") or "")
-        subject = str(slots.get("subject") or slots.get("title") or "")
-        body = str(slots.get("body") or "")
-        return NextAction(
-            action_type="compose_mail",
-            reason="Draft a mail message with any resolved attachments.",
-            expected_outcome="Mail opens a new draft addressed and optionally attached.",
-            safety_level="safe",
-            confirm_required=False,
-            params={
-                "to": to,
-                "subject": subject,
-                "body": body,
-                "attachments": attachments,
-                "send": False,
-            },
-        )
-
-    if intent.goal == KnownGoal.SEND_MESSAGE:
-        if not collected_data.get("contact_resolved"):
-            return NextAction(
-                action_type="ask_user",
-                reason="Resolve contact before drafting a send action.",
-                expected_outcome="Contact address available.",
-                safety_level="safe",
-                confirm_required=False,
-                params={"question": "Resolve contact via local contacts now?"},
-            )
-        return NextAction(
-            action_type="abort",
-            reason="Generic fallback does not send messages automatically.",
-            expected_outcome="Wait for explicit user command.",
-            safety_level="safe",
-            confirm_required=False,
-            params={},
+            action_type="browser_task",
+            reason="Delegate to browser sub-agent — fallback path.",
+            expected_outcome="Browser sub-agent completes the task and returns a final answer.",
+            safety_level="irreversible" if intent.requires_submission else "safe",
+            confirm_required=bool(intent.requires_submission),
+            params={"task": task_text},
         )
 
     if scope == "desktop" and step_index == 0:

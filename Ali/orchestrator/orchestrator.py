@@ -7,7 +7,6 @@ import asyncio
 import time
 
 from config.settings import DRY_RUN, VISION_FIRST_ENABLED, VISION_MAX_ACTION_STEPS
-from intent.file_resolve import enrich_intent_with_resolved_files
 from intent.schema import IntentObject, KnownGoal
 from orchestrator.state import TaskState, TaskStatus
 from orchestrator.visual_planner import NextAction, choose_next_action
@@ -21,11 +20,12 @@ class Orchestrator:
     def __init__(self):
         from executors.local.applescript import AppleScriptExecutor
         from executors.local.filesystem import FilesystemExecutor
+        from executors.browser.agent_client import LocalAgentClient
         from executors.local.script_runtime import catalog_summary, load_catalog
 
         self._local_fs = FilesystemExecutor()
         self._local_as = AppleScriptExecutor()
-        self._browser = None
+        self._browser_agent = LocalAgentClient()
         self._script_catalog = load_catalog()
         self._catalog_summary = catalog_summary
         self._reload_catalog = load_catalog
@@ -35,9 +35,6 @@ class Orchestrator:
             print(f"[orchestrator] Unknown intent: '{intent.raw_transcript}' — cannot act.")
             return
 
-        await enrich_intent_with_resolved_files(intent, intent.raw_transcript)
-
-        resolved = dict(intent.slots.get("resolved_local_files", {}) or {})
         state = TaskState(
             goal=intent.goal,
             plan_name="vision-first-observe-loop",
@@ -46,12 +43,8 @@ class Orchestrator:
                 **intent.slots,
                 "slots": intent.slots,
                 **{k: k for k in intent.uses_local_data},
-                "resolved_local_files": resolved,
-                "script_catalog": self._catalog_summary(self._script_catalog),
             },
         )
-        if "resume" in resolved:
-            state.collected_data.setdefault("resume_path", resolved["resume"])
         state.status = TaskStatus.RUNNING
 
         if not VISION_FIRST_ENABLED:
@@ -154,21 +147,9 @@ class Orchestrator:
             print(f"[orchestrator] Done: {state.goal}")
 
     async def _execute_action(self, intent: IntentObject, action: NextAction, data: dict):
-        if action.action_type == "navigate":
-            return await self._run_browser("navigate", {"url": action.params["url"]})
-        if action.action_type == "upload_file":
-            if action.params.get("mode") != "yc_apply_fill":
-                raise ValueError("Unsupported upload_file mode")
-            resume_path = _path_for_file_action(data, action.params, self._local_fs)
-            await self._run_browser(
-                "yc_apply_fill",
-                {"resume_path": resume_path, "slots": data.get("slots", {})},
-            )
-            return {"resume_path": resume_path, "yc_form_filled": True}
-        if action.action_type == "click_text":
-            if action.params.get("mode") != "yc_apply_submit":
-                raise ValueError("Unsupported click_text mode")
-            return await self._run_browser("yc_apply_submit", {})
+        if action.action_type == "browser_task":
+            task_text = self._resolve_task_slots(action.params.get("task", ""), data)
+            return await self._run_browser_agent(task_text)
         if action.action_type == "ask_user":
             approved = await ask_confirmation(action.params.get("question", action.reason))
             return {"user_confirmed": approved}
@@ -178,7 +159,7 @@ class Orchestrator:
             return await self._handle_author_script(action, data)
         if action.action_type == "compose_mail":
             return self._handle_compose_mail(action, data)
-        if action.action_type in {"wait_for_text", "scroll", "click_selector", "type_selector"}:
+        if action.action_type in {"wait_for_text", "scroll", "click_selector", "type_selector", "navigate", "click_text", "upload_file"}:
             return {"noop_action": action.action_type}
         raise ValueError(f"Unsupported action_type: {action.action_type}")
 
@@ -198,106 +179,82 @@ class Orchestrator:
                 elif role in data and isinstance(data[role], str):
                     args[key] = data[role]
         result = await run_script(name, args, self._script_catalog)
-        print(
-            f"[orchestrator][script] name={name} returncode={result.returncode} "
-            f"duration_ms={result.duration_ms}"
-        )
+        print(f"[orchestrator][script] name={name} returncode={result.returncode} duration_ms={result.duration_ms}")
         if not result.ok():
             snippet = (result.stderr or result.stdout).strip().splitlines()
             detail = snippet[-1] if snippet else "script failed"
             raise RuntimeError(f"script {name!r} exited {result.returncode}: {detail}")
-        return {
-            "script_result": {
-                "name": result.name,
-                "returncode": result.returncode,
-                "duration_ms": result.duration_ms,
-                "stdout_snippet": result.stdout[:200],
-            }
-        }
+        return {"script_result": {"name": result.name, "returncode": result.returncode, "duration_ms": result.duration_ms, "stdout_snippet": result.stdout[:200]}}
 
     def _handle_compose_mail(self, action: NextAction, data: dict) -> dict:
         params = action.params or {}
-        to = str(params.get("to") or "")
-        subject = str(params.get("subject") or "")
-        body = str(params.get("body") or "")
-        send = bool(params.get("send", False))
-
-        attachments = params.get("attachments")
-        if not attachments:
-            resolved = data.get("resolved_local_files") or {}
-            attachments = []
-            if isinstance(resolved, dict):
-                for role in ("attachment", "deck", "document"):
-                    value = resolved.get(role)
-                    if isinstance(value, str) and value:
-                        attachments.append(value)
-        self._local_as.compose_mail(
-            to=to,
-            subject=subject,
-            body=body,
-            send=send,
-            attachments=attachments or None,
-        )
-        return {"mail_composed": True, "attachments_used": list(attachments or [])}
+        resolved = data.get("resolved_local_files") or {}
+        attachments = params.get("attachments") or [v for role in ("attachment", "deck", "document") for v in ([resolved.get(role)] if isinstance(resolved, dict) and resolved.get(role) else [])]
+        self._local_as.compose_mail(to=str(params.get("to") or ""), subject=str(params.get("subject") or ""), body=str(params.get("body") or ""), send=bool(params.get("send", False)), attachments=attachments or None)
+        return {"mail_composed": True}
 
     async def _handle_author_script(self, action: NextAction, data: dict) -> dict:
-        from executors.local.script_runtime import (
-            ScriptParam,
-            ScriptValidationError,
-            persist_script,
-        )
+        from executors.local.script_runtime import ScriptParam, ScriptValidationError, persist_script
 
         params = action.params or {}
-        name = str(params.get("name") or "").strip()
-        runtime = str(params.get("runtime") or "").strip()
-        description = str(params.get("description") or "").strip()
-        body = str(params.get("body") or "")
-        raw_params = params.get("params") or []
         parsed_params: list[ScriptParam] = []
-        for entry in raw_params:
-            if not isinstance(entry, dict):
-                continue
-            try:
-                parsed_params.append(
-                    ScriptParam(
-                        name=str(entry.get("name", "")).strip(),
-                        type=str(entry.get("type", "string")).strip() or "string",
-                        required=bool(entry.get("required", True)),
-                        default=(None if entry.get("default") is None else str(entry.get("default"))),
-                    )
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"invalid author_script param: {exc}") from exc
-
+        for entry in (params.get("params") or []):
+            if isinstance(entry, dict):
+                parsed_params.append(ScriptParam(name=str(entry.get("name", "")), type=str(entry.get("type", "string")) or "string", required=bool(entry.get("required", True)), default=(None if entry.get("default") is None else str(entry.get("default")))))
         try:
-            spec = persist_script(
-                name=name,
-                runtime=runtime,
-                description=description,
-                params=tuple(parsed_params),
-                body=body,
-            )
+            spec = persist_script(name=str(params.get("name") or ""), runtime=str(params.get("runtime") or ""), description=str(params.get("description") or ""), params=tuple(parsed_params), body=str(params.get("body") or ""))
         except ScriptValidationError as exc:
-            print(f"[orchestrator][script] author rejected name={name} reason={exc}")
             raise RuntimeError(f"author_script rejected: {exc}") from exc
-
         self._script_catalog = self._reload_catalog()
-        catalog_list = self._catalog_summary(self._script_catalog)
-        print(
-            f"[orchestrator][script] authored name={spec.name} runtime={spec.runtime} "
-            f"params={len(spec.params)}"
-        )
-        return {
-            "authored_script": spec.name,
-            "script_catalog": catalog_list,
-        }
+        return {"authored_script": spec.name, "script_catalog": self._catalog_summary(self._script_catalog)}
 
-    async def _run_local(self, action: str, params: dict, data: dict | None = None):
+    def _resolve_task_slots(self, task: str, data: dict) -> str:
+        """Substitute ${resume}, ${contact_X}, etc. with local values. The
+        planner emits placeholders so sensitive data never hits the LLM that
+        generates the task string."""
+        # Resume: resolve lazily
+        if "${resume}" in task:
+            resume_path = data.get("resume_path") or self._local_fs.find_by_alias("resume")
+            task = task.replace("${resume}", resume_path or "")
+            data["resume_path"] = resume_path
+        # Any ${contact_NAME}
+        import re as _re
+        for match in _re.findall(r"\$\{contact_([A-Za-z0-9_]+)\}", task):
+            address = self._local_as.resolve_contact(match.replace("_", " "))
+            task = task.replace(f"${{contact_{match}}}", address or "")
+        return task
+
+    async def _run_browser_agent(self, task: str) -> dict:
+        """Hand a natural-language task to the browser sub-agent. The sub-agent
+        owns the agent loop (navigation, DOM reading, tool calls) and returns
+        a terminal TaskStatus. We surface awaiting_confirmation back to the
+        user, relay their choice, and continue until terminal."""
+        print(f"[orchestrator] browser_task → sub-agent: {task[:120]}...")
+        handle = await self._browser_agent.run_task(task=task, session_id="local")
+        if handle.state in ("error", "cancelled", "timeout"):
+            raise RuntimeError(handle.error or f"sub-agent {handle.state}")
+
+        while True:
+            status = await self._browser_agent.poll_until_paused_or_terminal(handle.id)
+            if status.state == "awaiting_confirmation":
+                summary = status.confirmation.summary if status.confirmation else "Proceed?"
+                payload = status.confirmation.payload if status.confirmation else {}
+                detail = "\n".join(f"  {k}: {v}" for k, v in (payload or {}).items())
+                approved = await ask_confirmation(f"{summary}\n{detail}\n\nProceed?")
+                await self._browser_agent.send_message(handle.id, "yes, proceed" if approved else "no, cancel")
+                if not approved:
+                    return {"aborted_by_user": True}
+                continue
+            if status.state == "complete":
+                print(f"[orchestrator] browser_task complete: {status.answer}")
+                return {"browser_answer": status.answer or "done"}
+            if status.state in ("error", "cancelled", "timeout"):
+                raise RuntimeError(status.error or f"sub-agent {status.state}")
+
+    async def _run_local(self, action: str, params: dict):
         if action == "find_file":
-            data = data or {}
-            path = _path_for_file_action(data, params, self._local_fs)
-            role = params.get("file_role") or params.get("alias") or "resume"
-            return {"resume_path": path, "resolved_role": role, "resolved_path": path}
+            path = self._local_fs.find_by_alias(params["alias"])
+            return {"resume_path": path}
         if action == "resolve_contact":
             address = self._local_as.resolve_contact(params["name"])
             return {"contact": address, "contact_resolved": True}
@@ -314,58 +271,16 @@ class Orchestrator:
             return {}
         raise ValueError(f"Unknown local action: {action}")
 
-    async def _run_browser(self, action: str, params: dict):
-        if self._browser is None:
-            try:
-                from executors.browser.browser import BrowserExecutor
-            except ModuleNotFoundError as e:
-                raise RuntimeError(
-                    "Browser executor is unavailable. Install Playwright to run browser actions."
-                ) from e
-            self._browser = BrowserExecutor()
-
-        if action == "navigate":
-            await self._browser.navigate(params["url"])
-            return {}
-        if action == "yc_apply_fill":
-            await self._browser.yc_apply_fill(params["resume_path"], params.get("slots", {}))
-            return {}
-        if action == "yc_apply_submit":
-            await self._browser.yc_apply_submit()
-            return {}
-        if action == "capture_observation":
-            return await self._browser.capture_observation(label=params.get("label", "browser"))
-        raise ValueError(f"Unknown browser action: {action}")
-
     async def _observe(self, intent: IntentObject, label: str) -> dict:
+        """Observation for the outer planner. For browser goals we return a
+        minimal scope marker — the sub-agent is responsible for seeing the
+        page itself. For desktop goals we capture a screenshot via AppleScript."""
         if intent.requires_browser:
-            return await self._run_browser("capture_observation", {"label": label})
+            return {"scope": "browser", "label": label}
         return self._local_as.capture_observation(label=label)
 
     def _is_dry_run_skip_action(self, action: NextAction) -> bool:
         return DRY_RUN and action.safety_level == "irreversible"
-
-
-def _path_for_file_action(data: dict, params: dict, local_fs) -> str:
-    """
-    Resolve an absolute file path for actions like upload_file / find_file /
-    run_script. Preference order:
-      1. resolved_local_files[params.file_role]
-      2. resolved_local_files[params.alias]  (legacy callers)
-      3. data["resume_path"] when the role is "resume" (or unspecified)
-      4. FilesystemExecutor.find_by_alias(role)
-    """
-    resolved = data.get("resolved_local_files") or {}
-    role = params.get("file_role") or params.get("alias") or "resume"
-    if isinstance(resolved, dict):
-        candidate = resolved.get(role)
-        if isinstance(candidate, str) and candidate:
-            return candidate
-    if role == "resume":
-        existing = data.get("resume_path")
-        if isinstance(existing, str) and existing:
-            return existing
-    return local_fs.find_by_alias(role)
 
 
 def _resolve_params(params: dict, data: dict) -> dict:
