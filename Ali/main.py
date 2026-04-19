@@ -100,13 +100,11 @@ def _build_overlay() -> tuple["TranscriptionOverlay", Callable[[], None]]:
         except (ValueError, OSError):
             pass
 
-        # Tasks side panel (right edge of screen). Created here on the Qt
-        # main thread alongside the overlay. Uses a shared global store
-        # that the agent thread writes into when ambient surfaces a
-        # tier-3 suggestion; the panel polls for refresh at 4Hz.
+        # Tasks live INLINE in the main overlay — rendered as cards
+        # below the conversation history in the same window. No separate
+        # right-edge panel.
         try:
             from executors.local.tasks_store import TasksStore
-            from ui.tasks_panel import TasksPanel
             global _tasks_store
             _tasks_store = TasksStore()
 
@@ -114,15 +112,15 @@ def _build_overlay() -> tuple["TranscriptionOverlay", Callable[[], None]]:
                 _schedule_task_approval(tid)
 
             def _dismiss(tid: str) -> None:
-                _tasks_store.mark(tid, "dismissed")  # type: ignore[union-attr]
-                if _tasks_panel is not None:
-                    _tasks_panel.refresh()
+                if _tasks_store is not None:
+                    _tasks_store.mark(tid, "dismissed")
+                overlay.refresh_tasks()
 
-            global _tasks_panel
-            _tasks_panel = TasksPanel(app, _tasks_store, _approve, _dismiss)
-            print(f"[tasks] panel up — {len(_tasks_store.pending())} pending from previous sessions")
-        except Exception as exc:  # pragma: no cover — don't block UI on panel issues
-            print(f"[tasks] panel init failed: {exc}")
+            overlay.set_tasks_source(_tasks_store, _approve, _dismiss)
+            overlay.refresh_tasks()
+            print(f"[tasks] inline in overlay — {len(_tasks_store.pending())} pending from previous sessions")
+        except Exception as exc:  # pragma: no cover — don't block UI on task issues
+            print(f"[tasks] init failed: {exc}")
 
         def _run_qt() -> None:
             try:
@@ -157,7 +155,7 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
     agent_loop = asyncio.get_running_loop()
     command_lock = asyncio.Lock()
 
-    # Publish to module globals so the Qt-thread TasksPanel callbacks
+    # Publish to module globals so the Qt-thread tasks callbacks
     # can reach the agent loop and the overlay from outside this scope.
     global _agent_loop, _overlay_ref
     _agent_loop = agent_loop
@@ -531,7 +529,6 @@ _active_meeting: "MeetingCapture | None" = None  # type: ignore[name-defined]
 # Shared handles across Qt thread + agent asyncio loop. Populated during
 # startup; mutated only from their owning threads.
 _tasks_store = None       # type: ignore[assignment]    # TasksStore
-_tasks_panel = None       # type: ignore[assignment]    # TasksPanel
 _agent_loop: "asyncio.AbstractEventLoop | None" = None
 _overlay_ref = None       # set from the agent thread once it has the overlay
 
@@ -540,21 +537,21 @@ def _schedule_task_approval(task_id: str) -> None:
     """Qt-thread callback from the TasksPanel. Marks the task as
     'executing', then hops onto the agent asyncio loop to run the
     multi-tool execution pipeline."""
-    global _tasks_store, _tasks_panel, _agent_loop, _overlay_ref
+    global _tasks_store, _agent_loop, _overlay_ref
     if _tasks_store is None:
         return
     task = _tasks_store.get(task_id)
     if task is None:
         return
     _tasks_store.mark(task_id, "executing")
-    if _tasks_panel is not None:
-        _tasks_panel.refresh()
+    if _overlay_ref is not None:
+        _overlay_ref.refresh_tasks()
 
     if _agent_loop is None or _overlay_ref is None:
         # Shouldn't happen once startup is complete.
         _tasks_store.mark(task_id, "failed")
-        if _tasks_panel is not None:
-            _tasks_panel.refresh()
+        if _overlay_ref is not None:
+            _overlay_ref.refresh_tasks()
         return
 
     import asyncio as _asyncio
@@ -568,7 +565,7 @@ async def _execute_task_from_store(task_id: str) -> None:
     For Stage 1 this is a one-shot (single AppleScript / opencli call);
     Stage 2 will replace this with a multi-tool local_agent loop."""
     from intent.ambient_analysis import AmbientAnalysis
-    global _tasks_store, _tasks_panel, _overlay_ref
+    global _tasks_store, _overlay_ref
     if _tasks_store is None or _overlay_ref is None:
         return
     task = _tasks_store.get(task_id)
@@ -592,8 +589,8 @@ async def _execute_task_from_store(task_id: str) -> None:
         _tasks_store.append_progress(task_id, f"error: {exc}")
         _tasks_store.mark(task_id, "failed")
     finally:
-        if _tasks_panel is not None:
-            _tasks_panel.refresh()
+        if _overlay_ref is not None:
+            _overlay_ref.refresh_tasks()
 
 # Ambient listen (glass-style) — runs forever in background when
 # VOICE_AGENT_AMBIENT=1. Does not own user commands; only surfaces
@@ -711,8 +708,8 @@ async def _run_ambient_capture(overlay) -> None:
                     slots=action.get("slots") or {},
                 )
                 agent_log("tasks:add", f"{task.id} {enriched_analysis.headline[:80]}")
-                if _tasks_panel is not None:
-                    _tasks_panel.refresh()
+        if _overlay_ref is not None:
+            _overlay_ref.refresh_tasks()
 
             # Keep the transient yellow pill as a "NEW TASK" hint so the
             # user notices even if they weren't looking at the panel.

@@ -83,6 +83,14 @@ class _MacGlobalHotkeyBridge(QObject):
 
 # Citation chip geometry (used by the disk-index answer panel).
 CITATION_ROW_H = 26
+# Inline Tasks section (renders under the conversation within the same pill)
+TASK_DIVIDER_H = 16
+TASK_HEADER_H  = 22
+TASK_CARD_H    = 72
+TASK_CARD_GAP  = 6
+TASK_BTN_W     = 44
+TASK_BTN_H     = 22
+TASK_BTN_GAP   = 6
 CITATION_CHIP_PAD_X = 10
 CITATION_CHIP_GAP = 8
 
@@ -410,6 +418,14 @@ class TranscriptionOverlay(QWidget):
         # mousePressEvent to open the underlying file when clicked.
         self._citations: list[dict] = []
         self._citation_hit_rects: list[tuple[QRect, str]] = []
+        # Inline Tasks section, rendered below the conversation history.
+        # Main.py sets _tasks_store + callbacks; paintEvent renders each
+        # pending task as a card, and mousePressEvent hit-tests the
+        # approve/dismiss buttons against _task_hit_rects.
+        self._tasks_store = None        # type: ignore[assignment]
+        self._on_task_approve: Callable[[str], None] | None = None
+        self._on_task_dismiss: Callable[[str], None] | None = None
+        self._task_hit_rects: list[tuple[QRect, str, str]] = []
         self._drag_offset: QPoint | None = None
         self._pulse_on = True
         self._recording = False
@@ -635,6 +651,24 @@ class TranscriptionOverlay(QWidget):
 
     # ── Input ────────────────────────────────────────────────────────────────
 
+    def set_tasks_source(
+        self,
+        store,
+        on_approve: Callable[[str], None],
+        on_dismiss: Callable[[str], None],
+    ) -> None:
+        """Attach the shared TasksStore + approve/dismiss callbacks.
+        Tasks render as cards below the conversation history in the same
+        overlay window."""
+        self._tasks_store = store
+        self._on_task_approve = on_approve
+        self._on_task_dismiss = on_dismiss
+
+    def refresh_tasks(self) -> None:
+        """Thread-safe: request a repaint on the next poll tick so new
+        tasks show up immediately without waiting for the next push()."""
+        self._q.put(("__refresh__", ""))
+
     def set_on_double_click_ptt(self, fn: Callable[[], None]) -> None:
         """Register a handler that fires when the user double-clicks the
         pill (anywhere that isn't a close button or citation chip).
@@ -706,6 +740,19 @@ class TranscriptionOverlay(QWidget):
             for rect, path in self._citation_hit_rects:
                 if rect.contains(int(x), int(y)):
                     _open_citation_target(path)
+                    return
+            # Task card buttons (Approve / Dismiss) — hit-test in the
+            # inline Tasks section.
+            for rect, task_id, action in self._task_hit_rects:
+                if rect.contains(int(x), int(y)):
+                    cb = self._on_task_approve if action == "approve" else self._on_task_dismiss
+                    if cb is not None:
+                        try:
+                            cb(task_id)
+                        except Exception:
+                            pass
+                    # Trigger a refresh so the card disappears right away.
+                    self.refresh_tasks()
                     return
             self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
@@ -884,6 +931,15 @@ class TranscriptionOverlay(QWidget):
         self._autohide_timer.stop()
         self._pulse_timer.stop()
 
+        # Task list changed — repaint/resize without touching conversation
+        # history. Triggered from refresh_tasks() (thread-safe queue push).
+        if state == "__refresh__":
+            if self._history or self._has_pending_tasks():
+                self._set_size(W_FULL, self._calc_height())
+                self._present()
+                self.update()
+            return
+
         if state == "hidden":
             self._dock_mode = DOCK_TOP
             self._do_hide()
@@ -1054,6 +1110,14 @@ class TranscriptionOverlay(QWidget):
         self._present()
         self.update()
 
+    def _has_pending_tasks(self) -> bool:
+        if self._tasks_store is None:
+            return False
+        try:
+            return bool(self._tasks_store.pending())
+        except Exception:
+            return False
+
     def _calc_height(self) -> int:
         PAD_TOP = 18
         PAD_BOT = 18
@@ -1070,6 +1134,12 @@ class TranscriptionOverlay(QWidget):
         if self._citations:
             # Citation chips render in one horizontal row under the body.
             h += CITATION_ROW_H + 6
+        # Tasks section: divider + header + one card per pending task.
+        if self._has_pending_tasks():
+            pending = self._tasks_store.pending()  # type: ignore[union-attr]
+            h += TASK_DIVIDER_H + TASK_HEADER_H
+            h += len(pending) * (TASK_CARD_H + TASK_CARD_GAP)
+            h += 6
         h += PAD_BOT
         return min(MAX_H, max(H_PILL, h))
 
@@ -1499,6 +1569,81 @@ class TranscriptionOverlay(QWidget):
             y += CITATION_ROW_H + 6
         else:
             self._citation_hit_rects = []
+
+        # Inline Tasks section: pending tier-3 items render as cards,
+        # each with Approve (✓ green) / Dismiss (✗ dim) buttons. Hit
+        # rects stash into self._task_hit_rects for mousePressEvent.
+        self._task_hit_rects = []
+        if self._has_pending_tasks():
+            y = self._paint_tasks(p, y, w, pad)
+
+    def _paint_tasks(self, p: QPainter, y: int, w: int, pad: int) -> int:
+        pending = self._tasks_store.pending()  # type: ignore[union-attr]
+        # Divider
+        p.setPen(QPen(DIVIDER_C, 0.8))
+        p.drawLine(QPoint(pad, y + TASK_DIVIDER_H // 2),
+                   QPoint(w - pad, y + TASK_DIVIDER_H // 2))
+        y += TASK_DIVIDER_H
+        # Header "Tasks  ·  N pending"
+        p.setPen(DIM)
+        p.setFont(self._font_small)
+        p.drawText(
+            QRect(pad, y, w - pad * 2, TASK_HEADER_H),
+            int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
+            f"Tasks  ·  {len(pending)} pending",
+        )
+        y += TASK_HEADER_H
+        # Cards
+        from ui.tasks_panel import _slot_preview      # reuse the formatter
+        card_w = w - pad * 2
+        for task in pending:
+            card_rect = QRect(pad, y, card_w, TASK_CARD_H)
+            p.setBrush(QColor(35, 35, 42, 230))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(card_rect, 10, 10)
+            # Headline
+            p.setPen(FG)
+            p.setFont(self._font_label)
+            p.drawText(
+                QRect(card_rect.x() + 12, card_rect.y() + 8, card_w - 24, 22),
+                int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
+                (task.headline or "").strip()[:48],
+            )
+            # Slots preview
+            p.setPen(DIM)
+            p.setFont(self._font_small)
+            sub = _slot_preview(task.action_text, task.slots)
+            p.drawText(
+                QRect(card_rect.x() + 12, card_rect.y() + 30, card_w - 24, 20),
+                int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
+                sub,
+            )
+            # Buttons
+            btn_y = card_rect.y() + card_rect.height() - TASK_BTN_H - 8
+            approve = QRect(
+                card_rect.x() + card_w - (TASK_BTN_W * 2 + TASK_BTN_GAP) - 12,
+                btn_y, TASK_BTN_W, TASK_BTN_H,
+            )
+            dismiss = QRect(
+                card_rect.x() + card_w - TASK_BTN_W - 12,
+                btn_y, TASK_BTN_W, TASK_BTN_H,
+            )
+            p.setBrush(GREEN)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(approve, 6, 6)
+            p.setPen(Qt.GlobalColor.white)
+            p.setFont(self._font_label)
+            p.drawText(approve, Qt.AlignmentFlag.AlignCenter, "✓")
+            p.setBrush(QColor(50, 50, 58, 230))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRoundedRect(dismiss, 6, 6)
+            p.setPen(DIM)
+            p.drawText(dismiss, Qt.AlignmentFlag.AlignCenter, "✗")
+
+            self._task_hit_rects.append((approve, task.id, "approve"))
+            self._task_hit_rects.append((dismiss, task.id, "dismiss"))
+            y += TASK_CARD_H + TASK_CARD_GAP
+        return y
 
     # ── Timers ────────────────────────────────────────────────────────────────
 

@@ -37,8 +37,11 @@ DEBOUNCE_SECONDS = 2.0
 # the "Ali, do X" voice shortcut. Works without macOS Accessibility
 # permissions because it's just substring-matching on Deepgram text.
 import re as _re
+# Direct address: must have "ali" token, optionally prefixed by a
+# greeting. Earlier version allowed "hey" alone which fired on every
+# sentence starting with "Hey so …".
 _DIRECT_ADDRESS_RE = _re.compile(
-    r"^\s*(?:hey\s+|ok\s+|okay\s+)?(?:ali|hey)\s*[,:\s]+(.+)$",
+    r"^\s*(?:hey\s+|ok\s+|okay\s+)?ali\s*[,:\s]+(.+)$",
     _re.IGNORECASE,
 )
 # Matches a turn that is JUST "Ali" / "Hey Ali" / "Okay Ali" (no body).
@@ -46,7 +49,7 @@ _DIRECT_ADDRESS_RE = _re.compile(
 # DIRECT_ADDRESS_ARM_SECONDS so natural flow "Ali… [pause] …what is X?"
 # works the same as "Ali, what is X?".
 _BARE_DIRECT_ADDRESS_RE = _re.compile(
-    r"^\s*(?:hey\s+|ok\s+|okay\s+)?(?:ali)\s*[.!?,:]*\s*$",
+    r"^\s*(?:hey\s+|ok\s+|okay\s+)?ali\s*[.!?,:]*\s*$",
     _re.IGNORECASE,
 )
 DIRECT_ADDRESS_ARM_SECONDS = 8.0
