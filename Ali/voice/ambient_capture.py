@@ -32,6 +32,40 @@ AMBIENT_HISTORY_TURNS = 30
 # it as a completed utterance.
 DEBOUNCE_SECONDS = 2.0
 
+# Turns that begin with any of these direct-address prefixes skip the
+# 5-final wait and fire a focused single-turn analysis immediately —
+# the "Ali, do X" voice shortcut. Works without macOS Accessibility
+# permissions because it's just substring-matching on Deepgram text.
+import re as _re
+_DIRECT_ADDRESS_RE = _re.compile(
+    r"^\s*(?:hey\s+|ok\s+|okay\s+)?(?:ali|hey)\s*[,:\s]+(.+)$",
+    _re.IGNORECASE,
+)
+# Matches a turn that is JUST "Ali" / "Hey Ali" / "Okay Ali" (no body).
+# When heard, we arm the next non-empty turn as direct-address for
+# DIRECT_ADDRESS_ARM_SECONDS so natural flow "Ali… [pause] …what is X?"
+# works the same as "Ali, what is X?".
+_BARE_DIRECT_ADDRESS_RE = _re.compile(
+    r"^\s*(?:hey\s+|ok\s+|okay\s+)?(?:ali)\s*[.!?,:]*\s*$",
+    _re.IGNORECASE,
+)
+DIRECT_ADDRESS_ARM_SECONDS = 8.0
+
+
+def _strip_direct_address(text: str) -> str | None:
+    """If `text` begins with an 'Ali, …' / 'hey Ali …' prefix, return the
+    command body with the wake phrase stripped. Otherwise return None."""
+    m = _DIRECT_ADDRESS_RE.match(text or "")
+    if not m:
+        return None
+    body = (m.group(1) or "").strip()
+    return body or None
+
+
+def _is_bare_direct_address(text: str) -> bool:
+    """True if the whole turn is just 'Ali' / 'Hey Ali' / 'OK Ali.' etc."""
+    return bool(_BARE_DIRECT_ADDRESS_RE.match(text or ""))
+
 
 def _log(tag: str, text: str) -> None:
     # All ambient events go through the unified agent log. Prefix with
@@ -72,6 +106,10 @@ class AmbientCapture:
         # asyncio loop so no lock is needed.
         self._pending_parts: list[str] = []
         self._debounce_handle: asyncio.TimerHandle | None = None
+        # Epoch time (monotonic) until which the NEXT turn should be
+        # treated as direct-address because the user just said a bare
+        # "Ali" to get the agent's attention.
+        self._direct_armed_until: float = 0.0
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -116,18 +154,17 @@ class AmbientCapture:
 
     def _ingest_final(self, text: str) -> None:
         """Append a raw Deepgram final to the pending buffer + restart the
-        debounce timer. Runs on the asyncio loop — no threading concerns."""
+        debounce timer. Runs on the asyncio loop — no threading concerns.
+
+        We INTENTIONALLY do NOT push intermediate previews to the overlay
+        anymore — that caused the pill to stack a new line for every
+        Deepgram partial ('are you using cats', 'are you using cats yes',
+        'are you using cats yes and this'…). The overlay only sees the
+        committed turn once silence elapses."""
         text = (text or "").strip()
         if not text:
             return
         self._pending_parts.append(text)
-        # Live ticker: show the growing text so the user sees each final
-        # arrive even before the turn commits.
-        joined_preview = " ".join(self._pending_parts)
-        try:
-            self._on_final(joined_preview)
-        except Exception:
-            pass
         # Restart the silence timer.
         if self._debounce_handle is not None:
             self._debounce_handle.cancel()
@@ -144,6 +181,49 @@ class AmbientCapture:
             return
         turn = " ".join(self._pending_parts).strip()
         self._pending_parts = []
+        # Now that the turn is committed, surface it once to the overlay.
+        try:
+            self._on_final(turn)
+        except Exception:
+            pass
+
+        # Direct-address fast path: "Ali, do X" / "Hey Ali what is IRR"
+        # fires a focused single-turn analysis right now, no 5-wait.
+        # Also: bare "Ali" with nothing after primes the NEXT turn to
+        # count as direct-address within DIRECT_ADDRESS_ARM_SECONDS.
+        import time as _time
+        direct_body: str | None = _strip_direct_address(turn)
+
+        if direct_body is None and _is_bare_direct_address(turn):
+            self._direct_armed_until = _time.monotonic() + DIRECT_ADDRESS_ARM_SECONDS
+            with self._lock:
+                self._history.append(turn)
+            _log(
+                "direct-arm",
+                f"heard '{turn[:40]}' — next turn within {int(DIRECT_ADDRESS_ARM_SECONDS)}s treated as direct",
+            )
+            return
+
+        if direct_body is None and _time.monotonic() < self._direct_armed_until:
+            # Disarm and treat this turn as direct-address.
+            self._direct_armed_until = 0.0
+            direct_body = turn
+
+        if direct_body:
+            with self._lock:
+                # Still add to history so the next passive analysis can
+                # reference it, but reset the trigger counter — otherwise
+                # every direct address would eat a slot toward the
+                # next 5-turn window.
+                self._history.append(turn)
+                total = len(self._history)
+                self._finals_since_trigger = 0
+                in_flight = self._analysis_in_flight
+            _log("direct", f'{total:>2}: "{direct_body[:120]}" ↳ direct-address fast path')
+            if not in_flight:
+                self._schedule_direct_analysis(direct_body)
+            return
+
         with self._lock:
             self._history.append(turn)
             self._finals_since_trigger += 1
@@ -161,6 +241,49 @@ class AmbientCapture:
         _log("final", f'{total:>2}: "{turn[:120]}" {marker}')
         if should_trigger:
             self._schedule_analysis()
+
+    def _schedule_direct_analysis(self, body: str) -> None:
+        """Fire focused analysis on JUST the direct-address turn."""
+        if self._analysis_in_flight:
+            return
+        self._analysis_in_flight = True
+        if self._loop:
+            self._loop.create_task(self._do_direct_analysis(body))
+
+    async def _do_direct_analysis(self, body: str) -> None:
+        """Same pipeline as _do_analysis but the 'history' is just the
+        single direct-address utterance. The ambient_analysis prompt
+        works fine on a one-line history — tier 1/2/3 routes identically."""
+        from intent.ambient_analysis import analyse
+
+        try:
+            screen_app, screen_title, image = "", "", b""
+            if self._screen_observer is not None:
+                ctx = self._screen_observer.latest_context()
+                screen_app = ctx.app
+                screen_title = ctx.window_title
+                image = ctx.image_bytes
+            result = await analyse(
+                [body],
+                self._previous,
+                screen_app=screen_app,
+                screen_window_title=screen_title,
+                screen_image_bytes=image,
+            )
+            if result.should_surface():
+                self._previous = result
+                _log("direct:surface", f"tier-{result.tier}: {result.headline[:100]}")
+                if result.detail:
+                    _log("direct:detail", result.detail[:240])
+                if result.action:
+                    _log("direct:action", str(result.action)[:240])
+                self._on_suggestion(result)
+            else:
+                _log("direct:silent", f"tier-{result.tier} (no answer for {body[:80]!r})")
+        except Exception as e:
+            _log("direct:error", str(e)[:240])
+        finally:
+            self._analysis_in_flight = False
 
     def _schedule_analysis(self) -> None:
         # Run in background; buffer continues to receive finals meanwhile.

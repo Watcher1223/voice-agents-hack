@@ -444,6 +444,10 @@ class TranscriptionOverlay(QWidget):
         # right-click dismisses. Main.py registers the callbacks via
         # set_pending_confirm(); we clear on click or ambient_ack push.
         self._pending_confirm_cbs: tuple[Callable[[], None], Callable[[], None]] | None = None
+        # Double-click the pill anywhere (outside close/citations) to
+        # trigger push-to-talk — works without macOS Accessibility or
+        # Input Monitoring permissions, unlike the backtick hotkey.
+        self._on_double_click_ptt: Callable[[], None] | None = None
 
         self._font_label = QFont(".AppleSystemUIFont", 15, QFont.Weight.Bold)
         self._font_body  = QFont(".AppleSystemUIFont", 14)
@@ -630,6 +634,28 @@ class TranscriptionOverlay(QWidget):
         invoke_right_option_up()
 
     # ── Input ────────────────────────────────────────────────────────────────
+
+    def set_on_double_click_ptt(self, fn: Callable[[], None]) -> None:
+        """Register a handler that fires when the user double-clicks the
+        pill (anywhere that isn't a close button or citation chip).
+        Zero-permissions alternative to the backtick hotkey."""
+        self._on_double_click_ptt = fn
+
+    def mouseDoubleClickEvent(self, e) -> None:  # type: ignore[override]
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        x, y = e.position().x(), e.position().y()
+        if self._hit_close(x, y):
+            return
+        # Skip if clicking a citation chip.
+        for rect, _ in self._citation_hit_rects:
+            if rect.contains(int(x), int(y)):
+                return
+        if self._on_double_click_ptt is not None:
+            try:
+                self._on_double_click_ptt()
+            except Exception:
+                pass
 
     def set_pending_confirm(
         self,

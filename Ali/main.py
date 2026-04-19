@@ -100,6 +100,30 @@ def _build_overlay() -> tuple["TranscriptionOverlay", Callable[[], None]]:
         except (ValueError, OSError):
             pass
 
+        # Tasks side panel (right edge of screen). Created here on the Qt
+        # main thread alongside the overlay. Uses a shared global store
+        # that the agent thread writes into when ambient surfaces a
+        # tier-3 suggestion; the panel polls for refresh at 4Hz.
+        try:
+            from executors.local.tasks_store import TasksStore
+            from ui.tasks_panel import TasksPanel
+            global _tasks_store
+            _tasks_store = TasksStore()
+
+            def _approve(tid: str) -> None:
+                _schedule_task_approval(tid)
+
+            def _dismiss(tid: str) -> None:
+                _tasks_store.mark(tid, "dismissed")  # type: ignore[union-attr]
+                if _tasks_panel is not None:
+                    _tasks_panel.refresh()
+
+            global _tasks_panel
+            _tasks_panel = TasksPanel(app, _tasks_store, _approve, _dismiss)
+            print(f"[tasks] panel up — {len(_tasks_store.pending())} pending from previous sessions")
+        except Exception as exc:  # pragma: no cover — don't block UI on panel issues
+            print(f"[tasks] panel init failed: {exc}")
+
         def _run_qt() -> None:
             try:
                 app.exec()
@@ -132,6 +156,12 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
     menu_bar = MenuBar()
     agent_loop = asyncio.get_running_loop()
     command_lock = asyncio.Lock()
+
+    # Publish to module globals so the Qt-thread TasksPanel callbacks
+    # can reach the agent loop and the overlay from outside this scope.
+    global _agent_loop, _overlay_ref
+    _agent_loop = agent_loop
+    _overlay_ref = overlay
 
     warmup()   # pre-load Whisper so first transcription is instant
 
@@ -468,6 +498,13 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
         else:
             request_ptt_session_from_wake(overlay)
 
+    # Zero-permissions PTT: double-click the overlay pill for the same
+    # effect as pressing backtick. Works even when macOS hasn't granted
+    # Accessibility / Input Monitoring to the app bundle.
+    if hasattr(overlay, "set_on_double_click_ptt"):
+        overlay.set_on_double_click_ptt(_on_backtick)
+
+
     menu_bar.set_status("ready")
 
     async for audio_bytes in listen_for_command(
@@ -490,6 +527,73 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
 
 
 _active_meeting: "MeetingCapture | None" = None  # type: ignore[name-defined]
+
+# Shared handles across Qt thread + agent asyncio loop. Populated during
+# startup; mutated only from their owning threads.
+_tasks_store = None       # type: ignore[assignment]    # TasksStore
+_tasks_panel = None       # type: ignore[assignment]    # TasksPanel
+_agent_loop: "asyncio.AbstractEventLoop | None" = None
+_overlay_ref = None       # set from the agent thread once it has the overlay
+
+
+def _schedule_task_approval(task_id: str) -> None:
+    """Qt-thread callback from the TasksPanel. Marks the task as
+    'executing', then hops onto the agent asyncio loop to run the
+    multi-tool execution pipeline."""
+    global _tasks_store, _tasks_panel, _agent_loop, _overlay_ref
+    if _tasks_store is None:
+        return
+    task = _tasks_store.get(task_id)
+    if task is None:
+        return
+    _tasks_store.mark(task_id, "executing")
+    if _tasks_panel is not None:
+        _tasks_panel.refresh()
+
+    if _agent_loop is None or _overlay_ref is None:
+        # Shouldn't happen once startup is complete.
+        _tasks_store.mark(task_id, "failed")
+        if _tasks_panel is not None:
+            _tasks_panel.refresh()
+        return
+
+    import asyncio as _asyncio
+    _asyncio.run_coroutine_threadsafe(
+        _execute_task_from_store(task_id), _agent_loop
+    )
+
+
+async def _execute_task_from_store(task_id: str) -> None:
+    """Run the stored task through the existing ambient execute path.
+    For Stage 1 this is a one-shot (single AppleScript / opencli call);
+    Stage 2 will replace this with a multi-tool local_agent loop."""
+    from intent.ambient_analysis import AmbientAnalysis
+    global _tasks_store, _tasks_panel, _overlay_ref
+    if _tasks_store is None or _overlay_ref is None:
+        return
+    task = _tasks_store.get(task_id)
+    if task is None:
+        return
+    analysis = AmbientAnalysis(
+        tier=3,
+        headline=task.headline,
+        detail=task.detail,
+        action={
+            "kind": task.action_kind,
+            "text": task.action_text,
+            "slots": dict(task.slots),
+        },
+        raw_json="",
+    )
+    try:
+        await _execute_ambient_action(analysis, _overlay_ref)
+        _tasks_store.mark(task_id, "done")
+    except Exception as exc:
+        _tasks_store.append_progress(task_id, f"error: {exc}")
+        _tasks_store.mark(task_id, "failed")
+    finally:
+        if _tasks_panel is not None:
+            _tasks_panel.refresh()
 
 # Ambient listen (glass-style) — runs forever in background when
 # VOICE_AGENT_AMBIENT=1. Does not own user commands; only surfaces
@@ -589,20 +693,37 @@ async def _run_ambient_capture(overlay) -> None:
                 agent_loop.create_task(_execute_ambient_action(analysis, overlay))
                 return
 
-            # NEEDS_CONFIRM — enrich NOW (not at execute time) so the user
-            # sees the resolved recipient, attachment, etc. on the pill
-            # before they commit. Store the enriched analysis in
-            # _pending_confirmation so we don't re-enrich on click.
+            # NEEDS_CONFIRM — enrich NOW (not at execute time) so the
+            # task card shows the resolved recipient / attachment.
             enriched_analysis = _enrich_analysis_for_preview(analysis)
             preview = _format_action_preview(enriched_analysis)
 
+            # Primary surfacing: add to the right-edge tasks panel. User
+            # approves there at their own pace; items persist across
+            # sessions via ~/.ali/tasks.json.
+            if _tasks_store is not None:
+                action = enriched_analysis.action or {}
+                task = _tasks_store.add(
+                    headline=enriched_analysis.headline,
+                    detail=enriched_analysis.detail,
+                    action_kind=action.get("kind", "local"),
+                    action_text=action.get("text", ""),
+                    slots=action.get("slots") or {},
+                )
+                agent_log("tasks:add", f"{task.id} {enriched_analysis.headline[:80]}")
+                if _tasks_panel is not None:
+                    _tasks_panel.refresh()
+
+            # Keep the transient yellow pill as a "NEW TASK" hint so the
+            # user notices even if they weren't looking at the panel.
+            # It auto-expires; the panel is the source of truth.
             global _pending_confirmation
             _pending_confirmation = {
                 "analysis": enriched_analysis,
                 "deadline": time.monotonic() + _PENDING_CONFIRMATION_WINDOW_S,
                 "safety": safety,
             }
-            overlay.push("ambient_confirm", preview)
+            overlay.push("ambient_confirm", f"📋 {preview}")
 
             def _on_click_confirm() -> None:
                 global _pending_confirmation
