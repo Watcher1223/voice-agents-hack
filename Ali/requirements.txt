@@ -81,3 +81,4 @@ tqdm>=4.66.0
 # The Python bindings (cactus_init / cactus_complete / cactus_destroy) are
 # available after the source install via the generated Python package.
 # ─────────────────────────────────────────────────────────────────────────────
+openai>=1.40  # for tts-1-hd voice (speak.py)
