@@ -57,14 +57,17 @@ CACTUS_AVAILABLE = CACTUS_CLI is not None
 SYSTEM_PROMPT = """You are an intent classifier for a voice agent.
 Given a voice transcript, output a JSON object with EXACTLY these fields:
 {
-  "goal": one of [apply_to_job, send_message, send_email, add_calendar_event, open_url, find_file, unknown],
+  "goal": one of [apply_to_job, send_message, send_email, add_calendar_event, open_url, find_file, ask_knowledge, unknown],
   "target": {"type": "url_or_search|contact|file", "value": "..."},
   "uses_local_data": ["resume" | "cover_letter" | "attachment" | "document" | "deck" | "contacts" | "calendar" | ...],
   "requires_browser": true|false,
   "requires_submission": true|false,
   "slots": { ...goal-specific key-value pairs extracted from the transcript, including "file_query" when the user references a file... }
 }
-Use "find_file" for requests like "find my resume", "where is X", "open my deck".
+Use "find_file" for imperative requests like "find my resume", "where is X", "open my deck".
+Use "ask_knowledge" for questions the agent should answer from the user's files or identity
+(e.g. "who am I", "what's my email", "what did my contract say about termination",
+"summarize my notes about OKRs", "when did I last update my resume").
 Include "attachment" / "document" / "deck" in uses_local_data whenever the
 user asks to attach, send, or email a file.
 Output ONLY the JSON. No explanation."""
@@ -337,6 +340,44 @@ def _extract_file_query(transcript: str, trigger: str) -> str:
     return tail.rstrip(".?! ").strip() or transcript.strip()
 
 
+_KNOWLEDGE_QUESTION_STARTS = (
+    "who ",
+    "whose ",
+    "what ",
+    "what's ",
+    "whats ",
+    "when ",
+    "where ",
+    "why ",
+    "how ",
+    "do i ",
+    "am i ",
+    "is my ",
+    "are my ",
+    "was my ",
+    "were my ",
+    "tell me about ",
+    "summarize ",
+    "summarise ",
+)
+
+
+def _is_knowledge_question(transcript: str) -> bool:
+    """Question-shaped utterances that should route through RAG over the disk index."""
+    t = (transcript or "").strip().lower()
+    if not t:
+        return False
+    # Explicit question mark is a strong signal.
+    if t.endswith("?"):
+        return True
+    # Keep imperative file-reveal phrasing ("find/open my X") off this path —
+    # those are handled above.
+    for kw in ("find my", "open my", "show me my", "reveal my", "locate my"):
+        if kw in t:
+            return False
+    return any(t.startswith(prefix) for prefix in _KNOWLEDGE_QUESTION_STARTS)
+
+
 def _rule_based_parse(transcript: str) -> IntentObject:
     """Keyword fallback covering the three core demo flows."""
     t = transcript.lower()
@@ -391,6 +432,17 @@ def _rule_based_parse(transcript: str) -> IntentObject:
                 slots={"file_query": query},
                 raw_transcript=transcript,
             )
+
+    if _is_knowledge_question(transcript):
+        return IntentObject(
+            goal=KnownGoal.ASK_KNOWLEDGE,
+            target={"type": "question", "value": transcript.strip()},
+            uses_local_data=["index"],
+            requires_browser=False,
+            requires_submission=False,
+            slots={"question": transcript.strip()},
+            raw_transcript=transcript,
+        )
 
     if any(kw in t for kw in ["text", "message", "imessage"]):
         contact, body = _extract_contact_and_body(transcript)

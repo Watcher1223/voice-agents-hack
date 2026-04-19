@@ -153,6 +153,10 @@ async def _resolve_role(
             if aliased is not None:
                 return aliased
 
+        indexed = _disk_index_first(intent, transcript, role, state)
+        if indexed is not None:
+            return indexed
+
         if not CACTUS_CLI:
             if FILE_RESOLVER_USE_SPOTLIGHT:
                 chosen = await _naive_mdfind_fallback(intent, role, state)
@@ -213,6 +217,77 @@ async def _resolve_role(
         )
         _finalize(state, exit_reason="error", outcome="failure")
         return None
+
+
+def _disk_index_first(
+    intent: IntentObject,
+    transcript: str,
+    role: str,
+    state: "_ResolverState",
+) -> Path | None:
+    """Try the pre-built laptop-wide SQLite/FTS index before falling through to
+    Spotlight + Cactus. Uses filename + content hits ranked by FTS5 BM25.
+
+    We only accept the top hit if its basename shares a term with the query —
+    otherwise we prefer the slower Cactus/Spotlight path that can reason about
+    synonyms ("resume" ↔ "CV"). The alias path above already handles those
+    common cases, so we don't need Cactus to synthesise them here.
+    """
+    try:
+        from executors.local.disk_index import index_exists, search_files
+    except Exception:
+        return None
+    if not index_exists():
+        return None
+    query = _query_for_role(intent, role, transcript)
+    if not query or len(query.strip()) < 2:
+        return None
+    try:
+        hits = search_files(query, limit=12)
+    except Exception as exc:
+        _emit("disk_index", role=role, result="error", detail=str(exc)[:120])
+        return None
+    if not hits:
+        return None
+    # Synthetic data-source hits (Contacts / Calendar / Messages) live under
+    # the ``ali://`` scheme; they're useful for RAG answers but can't be
+    # revealed in Finder, so drop them from the file-reveal candidate list.
+    hits = [h for h in hits if not h.path.startswith("ali://")]
+    if not hits:
+        return None
+    q_terms = {t for t in re.split(r"[^A-Za-z0-9]+", query.lower()) if len(t) >= 3}
+    preferred, penalised = _preferred_extensions(role, query)
+    scored: list[tuple[Path, tuple]] = []
+    for h in hits:
+        name_terms = {t for t in re.split(r"[^A-Za-z0-9]+", h.name.lower()) if t}
+        if q_terms and not q_terms.intersection(name_terms):
+            continue
+        p = Path(h.path)
+        scored.append((p, _rank_candidate(p, preferred, penalised, query)))
+    if not scored:
+        return None
+    scored.sort(key=lambda kv: kv[1])
+    best = scored[0][0]
+    try:
+        if not best.exists():
+            return None
+    except OSError:
+        return None
+    _emit(
+        "disk_index",
+        role=role,
+        result="hit",
+        basename=best.name,
+        candidates=len(hits),
+    )
+    _finalize(
+        state,
+        exit_reason="disk_index_hit",
+        outcome="success",
+        slot=role,
+        basename=best.name,
+    )
+    return best
 
 
 def _alias_for_found_query(

@@ -153,3 +153,50 @@ FILE_WALK_MAX_FILES = _env_int("VOICE_AGENT_FILE_WALK_MAX_FILES", 500)
 FILE_WALK_MAX_DEPTH = _env_int("VOICE_AGENT_FILE_WALK_MAX_DEPTH", 4)
 
 FILE_RESOLVE_DEBUG = _env_bool("VOICE_AGENT_FILE_RESOLVE_DEBUG", False)
+
+# ── Disk index (laptop-wide content + embeddings) ────────────────────────────
+# Local-first retrieval-augmented Q&A over the user's files + macOS data.
+# Default is a focused scope: the three docs folders, /Applications, plus
+# Contacts / Calendar / Messages. Set ALI_INDEX_FULL_DISK=1 (or pass
+# `--full-disk` on the CLI) for a full home-directory scan.
+
+INDEX_DIR: Path = Path(os.path.expanduser(
+    os.environ.get("ALI_INDEX_DIR", "~/.cache/ali/index")
+))
+
+INDEX_FULL_DISK = _env_bool("ALI_INDEX_FULL_DISK", False)
+
+_DEFAULT_SCAN_ROOTS = "~/Documents,~/Downloads,~/Desktop,/Applications"
+_FULL_DISK_ROOTS = "~,/Applications"
+
+INDEX_SCAN_ROOTS: list[Path] = _parse_search_roots(
+    os.environ.get(
+        "ALI_INDEX_SCAN_ROOTS",
+        _FULL_DISK_ROOTS if INDEX_FULL_DISK else _DEFAULT_SCAN_ROOTS,
+    )
+)
+
+INDEX_MAX_FILE_BYTES = _env_int("ALI_INDEX_MAX_FILE_BYTES", 5_000_000)
+INDEX_EMBED_MODEL = os.environ.get(
+    "ALI_INDEX_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+)
+INDEX_CHUNK_TOKENS = _env_int("ALI_INDEX_CHUNK_TOKENS", 400)
+INDEX_ENABLE_EMBEDDINGS = _env_bool("ALI_INDEX_EMBEDDINGS", True)
+
+# Comma-separated list of non-filesystem data sources to index alongside the
+# filesystem walk. Each entry names a module under
+# `executors/local/disk_index/sources/`. Set to "" to disable all of them.
+INDEX_SOURCES: list[str] = [
+    name.strip().lower()
+    for name in os.environ.get(
+        "ALI_INDEX_SOURCES", "contacts,calendar,messages"
+    ).split(",")
+    if name.strip()
+]
+
+# How far back to go when indexing time-ordered sources (Messages, Calendar).
+INDEX_SOURCE_HISTORY_DAYS = _env_int("ALI_INDEX_SOURCE_HISTORY_DAYS", 365)
+
+# Local-first RAG. Default: 100% on-device via Cactus/Gemma 4. Set to 1 to
+# allow falling back to Gemini if Cactus is unavailable for answer generation.
+ALI_ALLOW_CLOUD_FALLBACK = _env_bool("ALI_ALLOW_CLOUD_FALLBACK", False)

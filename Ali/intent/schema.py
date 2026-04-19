@@ -16,6 +16,7 @@ class KnownGoal(str, Enum):
     OPEN_URL = "open_url"
     FIND_FILE = "find_file"
     CAPTURE_MEETING = "capture_meeting"
+    ASK_KNOWLEDGE = "ask_knowledge"
     UNKNOWN = "unknown"
 
 
