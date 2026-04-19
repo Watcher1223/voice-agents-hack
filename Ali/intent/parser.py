@@ -92,7 +92,7 @@ Goal definitions (read carefully — pick the most specific one):
   "open my <thing>" is find_file when <thing> is a document/file type; it is open_url when <thing> is a web service (linkedin, gmail, github, etc.).
   slots: {"file_query": str}
 
-- capture_meeting: start live meeting transcription/notes (e.g. "start meeting capture", "take notes for this meeting", "listen to this meeting").
+- capture_meeting: start live transcription/notes so Ali can pick up action items and act on them (e.g. "start meeting capture", "take notes for this meeting", "listen", "just listen", "listen in", "listen up"). Bare "listen" / "listen in" (no tail) is always capture_meeting, NOT send_message. A longer utterance like "listen to my concerns" is NOT capture_meeting — that's conversational, classify as unknown.
   slots: {}
 
 - ask_knowledge: the user is asking a question that should be answered from their local files/identity/notes (e.g. "who am I", "what's my email", "when did I last update my resume", "summarize my OKR notes", "what did my contract say about termination").
@@ -132,6 +132,12 @@ Transcript: "who am I"
 {"goal":"ask_knowledge","target":{"type":"question","value":"who am I"},"uses_local_data":["index"],"requires_browser":false,"requires_submission":false,"slots":{"question":"who am I"}}
 
 Transcript: "start meeting capture"
+{"goal":"capture_meeting","target":{},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{}}
+
+Transcript: "listen"
+{"goal":"capture_meeting","target":{},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{}}
+
+Transcript: "just listen"
 {"goal":"capture_meeting","target":{},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{}}
 
 Output ONLY the JSON object. No prose, no markdown fences, no explanation."""
@@ -491,11 +497,19 @@ def _rule_based_parse(transcript: str) -> IntentObject:
             raw_transcript=transcript,
         )
 
+    # Exact-match whitelist for short `listen`-style triggers. Substring
+    # matching would false-fire on natural speech ("listen to my concerns",
+    # "listen to this song"), so we require an exact normalised form.
+    _listen_triggers = {
+        "listen", "listen in", "listen up", "just listen",
+        "listen and note", "start listening", "listen to this",
+    }
+    _t_norm = t.strip().rstrip(".!?").strip()
     if any(kw in t for kw in [
         "start meeting", "capture meeting", "meeting capture",
         "listen to meeting", "take notes", "record meeting",
         "start capture", "capture this",
-    ]):
+    ]) or _t_norm in _listen_triggers:
         return IntentObject(
             goal=KnownGoal.CAPTURE_MEETING,
             target={},

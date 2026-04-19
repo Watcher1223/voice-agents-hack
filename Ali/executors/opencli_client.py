@@ -12,12 +12,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from config.settings import OPENCLI_NODE_BIN, OPENCLI_ENTRY
+
+# Bound the subprocess call so a bad Node version (which drops into an
+# interactive REPL and waits on stdin forever) can't wedge the agent's
+# command_lock. Adapters like `linkedin timeline` need a few seconds to
+# pull a DOM snapshot from the bridge extension, so default generously.
+_OPENCLI_TIMEOUT_S = float(os.environ.get("ALI_OPENCLI_TIMEOUT_S", "15"))
 
 _INTENTS_PATH = Path(__file__).resolve().parent.parent / "config" / "opencli_intents.json"
 
@@ -108,8 +115,32 @@ async def run_intent(intent: OpenCliIntent, groups: list[str]) -> OpenCliResult:
         *command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        # Close stdin so an incompatible Node (which tries to enter a REPL
+        # when it can't parse the entry file) gets EOF immediately instead
+        # of hanging waiting for input.
+        stdin=asyncio.subprocess.DEVNULL,
     )
-    stdout_b, stderr_b = await proc.communicate()
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=_OPENCLI_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=1.0)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+        return OpenCliResult(
+            ok=False,
+            rows=[],
+            raw_stdout="",
+            raw_stderr=f"opencli timed out after {_OPENCLI_TIMEOUT_S}s",
+            returncode=-1,
+            command=command,
+        )
     stdout = stdout_b.decode("utf-8", errors="replace")
     stderr = stderr_b.decode("utf-8", errors="replace")
     rows: list[dict[str, Any]] = []

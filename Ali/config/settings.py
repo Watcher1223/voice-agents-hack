@@ -60,14 +60,24 @@ AMBIENT_SPEAK_ENABLED = os.environ.get(
 ).lower() in {"1", "true", "yes"}
 # OpenCLI requires Node >= 22.19. Bypass the shebang and invoke node+entry
 # directly so a stale `env node` in PATH can't resolve to an older version.
-OPENCLI_NODE_BIN = os.environ.get(
-    "OPENCLI_NODE_BIN",
-    "/Users/apple/.nvm/versions/node/v22.22.2/bin/node",
-)
-OPENCLI_ENTRY = os.environ.get(
-    "OPENCLI_ENTRY",
-    "/Users/apple/.nvm/versions/node/v22.22.2/lib/node_modules/@jackwener/opencli/dist/src/main.js",
-)
+# Defaults are derived from `which node` so this works on any dev's machine
+# as long as they've run `nvm use 22` (or have Node 22+ as their default).
+# Override with OPENCLI_NODE_BIN / OPENCLI_ENTRY if the setup is non-standard.
+import shutil as _shutil
+
+_NODE_BIN_ON_PATH = _shutil.which("node") or ""
+_OPENCLI_ENTRY_FROM_NODE = ""
+if _NODE_BIN_ON_PATH:
+    _candidate = (
+        Path(_NODE_BIN_ON_PATH).resolve().parent.parent
+        / "lib" / "node_modules" / "@jackwener" / "opencli"
+        / "dist" / "src" / "main.js"
+    )
+    if _candidate.exists():
+        _OPENCLI_ENTRY_FROM_NODE = str(_candidate)
+
+OPENCLI_NODE_BIN = os.environ.get("OPENCLI_NODE_BIN", _NODE_BIN_ON_PATH)
+OPENCLI_ENTRY = os.environ.get("OPENCLI_ENTRY", _OPENCLI_ENTRY_FROM_NODE)
 
 # ── Whisper fallback ──────────────────────────────────────────────────────────
 WHISPER_MODEL_SIZE = "base.en"   # tiny.en | base.en | small.en
