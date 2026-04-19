@@ -636,13 +636,13 @@ async def _run_ambient_capture(overlay) -> None:
         pass
 
     def _on_final(text: str) -> None:
-        # Show one short line per final so the pill visibly ticks with
-        # the speaker — without flooding. Overlay trims to the last
-        # ~8 lines, and surfaced tiers (or the initial 'Ali listening')
-        # stay pinned above them.
+        # One line per committed turn. The overlay word-wraps, so let
+        # long sentences occupy multiple display lines rather than
+        # truncating to a fixed char count. Cap only at 240 chars to
+        # protect against runaway utterances.
         snippet = text.strip()
-        if len(snippet) > 56:
-            snippet = snippet[:55].rstrip() + "…"
+        if len(snippet) > 240:
+            snippet = snippet[:237].rstrip() + "…"
         overlay.push("assistant", f"· {snippet}")
         # Confirmation listener: if there's a pending action waiting on
         # "yes" / "no", try to consume this final transcript.
