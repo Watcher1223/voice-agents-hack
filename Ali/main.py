@@ -414,16 +414,14 @@ async def _run_ambient_capture(overlay) -> None:
     agent_loop = asyncio.get_running_loop()
 
     def _on_interim(text: str) -> None:
-        # Ambient doesn't want to flood the overlay with every partial word.
-        # Interim goes to the log/console only; the pill updates on finals
-        # and on tier surfaces.
+        # Partial words only go to the log / console — never the overlay.
         pass
 
     def _on_final(text: str) -> None:
-        # Show the most recent committed utterance as a small transcript
-        # line. This keeps the overlay visible between analyses so the user
-        # knows the agent is hearing them.
-        overlay.push("assistant", f"· heard: {text[:160]}")
+        # Per feedback: stop flooding the overlay with every utterance.
+        # Finals are written to ~/.ali/agent.log by AmbientCapture already;
+        # the overlay should only show surfaced tiers + action progress,
+        # not a running transcript.
         # Confirmation listener: if there's a pending action waiting on
         # "yes" / "no", try to consume this final transcript.
         global _pending_confirmation
@@ -556,6 +554,60 @@ async def _execute_ambient_action(analysis, overlay) -> None:
         overlay.push("ambient_ack", f"✗ {headline[:140]}: {e}")
 
 
+def _enrich_local_slots(
+    text: str,
+    slots: dict,
+    headline: str,
+    detail: str,
+) -> dict:
+    """Chain the tools we already have to fill missing slots before a
+    local action fires. This is the 'agentic' bit — instead of opening
+    Mail.app empty we first resolve 'Hanzi' → her email address via the
+    Contacts AppleScript, and if the detail mentions a file (pitch deck,
+    resume, cv) we find it via Spotlight and attach it.
+
+    Mutates and returns the slots dict."""
+    from executors.local.applescript import AppleScriptExecutor
+    from executors.local.filesystem import FilesystemExecutor
+    from observer.agent_log import log as agent_log
+    import re
+
+    applescript = AppleScriptExecutor()
+    fs = FilesystemExecutor()
+
+    if text in ("compose_mail", "send_email"):
+        to = str(slots.get("to", "")).strip()
+        # If `to` is a name (no @), try Contacts resolution.
+        if to and "@" not in to:
+            resolved = applescript.resolve_contact(to)
+            if resolved:
+                agent_log("enrich:resolve_contact", f"{to!r} → {resolved}")
+                slots["to"] = resolved
+        # File-attachment hint: if the detail mentions a file alias,
+        # look it up via FilesystemExecutor and attach.
+        text_blob = f"{headline} {detail}".lower()
+        for alias in ("pitch deck", "deck", "resume", "cv", "cover letter"):
+            if alias in text_blob:
+                path = fs.find_by_alias(alias.replace(" ", ""))
+                if path:
+                    atts = slots.get("attachments") or []
+                    if path not in atts:
+                        atts.append(path)
+                    slots["attachments"] = atts
+                    agent_log("enrich:find_file", f"alias={alias!r} → {path}")
+                    break
+
+    if text in ("send_imessage", "send_message"):
+        contact = str(slots.get("contact", "")).strip()
+        if contact and "@" not in contact and not contact.startswith("+"):
+            resolved = applescript.resolve_contact(contact)
+            if resolved:
+                agent_log("enrich:resolve_contact", f"{contact!r} → {resolved}")
+                slots["contact"] = resolved
+
+    return slots
+
+
 async def _execute_ambient_local(
     text: str, slots: dict, headline: str, detail: str, overlay
 ) -> None:
@@ -567,18 +619,24 @@ async def _execute_ambient_local(
     from observer.agent_log import log as agent_log
     import subprocess
 
+    # Chain our available tools to fill in missing context before firing.
+    slots = _enrich_local_slots(text, dict(slots), headline, detail)
     applescript = AppleScriptExecutor()
 
-    if text == "compose_mail":
+    if text == "compose_mail" or text == "send_email":
         to = str(slots.get("to", "")).strip()
         subject = str(slots.get("subject", headline[:80])).strip()
         body = str(slots.get("body", detail or "")).strip()
-        # If there's no recipient, still open Mail.app with subject/body so
-        # the user can type the To: field. compose_mail defaults send=False,
-        # which just activates the draft window — the user reviews + sends.
-        applescript.compose_mail(to=to, subject=subject, body=body, send=False)
-        overlay.push("ambient_ack", f"✓ Mail draft: {subject[:80] or 'new message'}")
-        agent_log("ambient:local:done", f"compose_mail to={to!r} subject={subject[:60]!r}")
+        attachments = slots.get("attachments") or None
+        applescript.compose_mail(
+            to=to, subject=subject, body=body, send=False, attachments=attachments,
+        )
+        att_note = f" · attached {len(attachments)}" if attachments else ""
+        overlay.push("ambient_ack", f"✓ Mail draft · {subject[:70] or 'new'}{att_note}")
+        agent_log(
+            "ambient:local:done",
+            f"compose_mail to={to!r} subj={subject[:60]!r} atts={attachments!r}",
+        )
         return
 
     if text == "send_imessage":
