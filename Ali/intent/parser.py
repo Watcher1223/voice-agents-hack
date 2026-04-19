@@ -54,23 +54,87 @@ CACTUS_CLI = shutil.which("cactus")
 CACTUS_AVAILABLE = CACTUS_CLI is not None
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an intent classifier for a voice agent.
-Given a voice transcript, output a JSON object with EXACTLY these fields:
+SYSTEM_PROMPT = """You are an intent classifier for a voice agent called Ali.
+Given a voice transcript, output ONE JSON object with EXACTLY these fields:
 {
-  "goal": one of [apply_to_job, send_message, send_email, add_calendar_event, open_url, find_file, ask_knowledge, unknown],
-  "target": {"type": "url_or_search|contact|file", "value": "..."},
-  "uses_local_data": ["resume" | "cover_letter" | "attachment" | "document" | "deck" | "contacts" | "calendar" | ...],
+  "goal": one of [apply_to_job, send_message, send_email, add_calendar_event, open_url, find_file, capture_meeting, ask_knowledge, unknown],
+  "target": {"type": "url|contact|file|question|calendar", "value": "..."},
+  "uses_local_data": list of strings drawn from [resume, cover_letter, attachment, document, deck, contacts, calendar, index],
   "requires_browser": true|false,
   "requires_submission": true|false,
-  "slots": { ...goal-specific key-value pairs extracted from the transcript, including "file_query" when the user references a file... }
+  "slots": { goal-specific key/value pairs extracted from the transcript }
 }
-Use "find_file" for imperative requests like "find my resume", "where is X", "open my deck".
-Use "ask_knowledge" for questions the agent should answer from the user's files or identity
-(e.g. "who am I", "what's my email", "what did my contract say about termination",
-"summarize my notes about OKRs", "when did I last update my resume").
-Include "attachment" / "document" / "deck" in uses_local_data whenever the
-user asks to attach, send, or email a file.
-Output ONLY the JSON. No explanation."""
+
+Goal definitions (read carefully — pick the most specific one):
+
+- apply_to_job: the user wants to SUBMIT an application to a job/program/accelerator (e.g. "apply to YC", "apply to the Stripe role"). NOT for "apply a filter", "apply settings", "apply the patch".
+  slots: {"company": str, "role": str?, "batch": str?}
+  requires_browser: true, requires_submission: true.
+
+- send_message: send an iMessage/SMS/chat to a specific person (e.g. "text Hanzi I'm late", "message Corinne saying hi").
+  Trigger words ONLY count when they're verbs ("text X...", "message X..."). NOT for "the next message said...", "text on the slide", "the text of the doc".
+  slots: {"contact": str, "body": str}
+  uses_local_data: ["contacts"], requires_submission: true.
+
+- send_email: compose/send an email, usually with a file attachment (e.g. "email Sam the deck", "send the Q1 doc to my boss").
+  slots: {"to": str?, "subject": str?, "body": str?, "file_query": str?}
+  uses_local_data: include "attachment" when a file is referenced. requires_submission: true.
+
+- add_calendar_event: create a calendar event/meeting/reminder (e.g. "schedule a meeting with Sam Tuesday at 3", "add dentist Friday noon").
+  slots: {"title": str, "when": str?, "duration_minutes": int?, "attendees": list[str]?}
+  uses_local_data: ["calendar"], requires_submission: true.
+
+- open_url: open a website or web service (e.g. "open my linkedin", "go to docs.google.com", "open gmail").
+  slots: {"url": str}  (use https://www.<service>.com if only a service name is given)
+  requires_browser: false (we just launch the URL), requires_submission: false.
+
+- find_file: locate/reveal a LOCAL file or folder (e.g. "find my resume", "where is my 2024 tax return", "open my Q1 deck", "show me my cover letter").
+  "open my <thing>" is find_file when <thing> is a document/file type; it is open_url when <thing> is a web service (linkedin, gmail, github, etc.).
+  slots: {"file_query": str}
+
+- capture_meeting: start live meeting transcription/notes (e.g. "start meeting capture", "take notes for this meeting", "listen to this meeting").
+  slots: {}
+
+- ask_knowledge: the user is asking a question that should be answered from their local files/identity/notes (e.g. "who am I", "what's my email", "when did I last update my resume", "summarize my OKR notes", "what did my contract say about termination").
+  Question-shaped utterances ending in "?" usually belong here unless they are clearly an imperative.
+  slots: {"question": str}
+  uses_local_data: ["index"].
+
+- unknown: only when none of the above fit.
+
+Examples:
+
+Transcript: "apply to YC with my resume"
+{"goal":"apply_to_job","target":{"type":"url","value":"apply.ycombinator.com"},"uses_local_data":["resume"],"requires_browser":true,"requires_submission":true,"slots":{"company":"YC"}}
+
+Transcript: "apply the filter to these photos"
+{"goal":"unknown","target":{},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{}}
+
+Transcript: "the next message says the deadline is Friday"
+{"goal":"unknown","target":{},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{}}
+
+Transcript: "text Corinne I'll be ten minutes late"
+{"goal":"send_message","target":{"type":"contact","value":"Corinne"},"uses_local_data":["contacts"],"requires_browser":false,"requires_submission":true,"slots":{"contact":"Corinne","body":"I'll be ten minutes late"}}
+
+Transcript: "schedule a meeting with Sam Tuesday at 3"
+{"goal":"add_calendar_event","target":{"type":"calendar","value":""},"uses_local_data":["calendar"],"requires_browser":false,"requires_submission":true,"slots":{"title":"Meeting with Sam","when":"Tuesday at 3","attendees":["Sam"]}}
+
+Transcript: "open my resume"
+{"goal":"find_file","target":{"type":"file","value":"resume"},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{"file_query":"resume"}}
+
+Transcript: "open my linkedin"
+{"goal":"open_url","target":{"type":"url","value":"https://www.linkedin.com"},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{"url":"https://www.linkedin.com"}}
+
+Transcript: "email me the Q1 deck"
+{"goal":"send_email","target":{"type":"contact","value":""},"uses_local_data":["attachment"],"requires_browser":false,"requires_submission":true,"slots":{"file_query":"Q1 deck"}}
+
+Transcript: "who am I"
+{"goal":"ask_knowledge","target":{"type":"question","value":"who am I"},"uses_local_data":["index"],"requires_browser":false,"requires_submission":false,"slots":{"question":"who am I"}}
+
+Transcript: "start meeting capture"
+{"goal":"capture_meeting","target":{},"uses_local_data":[],"requires_browser":false,"requires_submission":false,"slots":{}}
+
+Output ONLY the JSON object. No prose, no markdown fences, no explanation."""
 
 
 async def parse_intent(transcript: str) -> IntentObject:
@@ -78,32 +142,10 @@ async def parse_intent(transcript: str) -> IntentObject:
     Parse a raw transcript into an IntentObject.
 
     Priority:
-      1. Rule-based  — instant, 100% reliable for the 3 demo flows
-      2. Gemini      — handles anything the rules don't recognise
-      3. Cactus      — on-device fallback if Gemini is unavailable
+      1. Gemini  — primary classifier (fast, schema-aware, handles nuance)
+      2. Cactus  — on-device fallback when Gemini is unavailable
+      3. Rule-based  — last-ditch offline fallback (keyword heuristics)
     """
-    # Rule-based covers the demo flows instantly — don't burn a network call for those
-    rule = _rule_based_parse(transcript)
-    # #region agent log
-    _dlog(
-        "intent:parse_intent:rule",
-        "rule-based candidate evaluated",
-        {"transcript": transcript, "rule_goal": rule.goal.value},
-        "H12",
-    )
-    # #endregion
-    if rule.goal.value != "unknown":
-        # #region agent log
-        _dlog(
-            "intent:parse_intent:final",
-            "rule-based intent selected",
-            {"transcript": transcript, "final_goal": rule.goal.value, "source": "rule"},
-            "H12",
-        )
-        # #endregion
-        return rule
-
-    # Unknown intent — ask Gemini
     if GEMINI_AVAILABLE:
         try:
             gem = await _parse_with_gemini(transcript)
@@ -140,7 +182,7 @@ async def parse_intent(transcript: str) -> IntentObject:
             # #endregion
             return cat
         except Exception as e:
-            print(f"[intent] Cactus failed ({e}), returning unknown intent")
+            print(f"[intent] Cactus failed ({e}), using rule fallback")
             # #region agent log
             _dlog(
                 "intent:parse_intent:cactus_error",
@@ -150,15 +192,16 @@ async def parse_intent(transcript: str) -> IntentObject:
             )
             # #endregion
 
+    rule = _rule_based_parse(transcript)
     # #region agent log
     _dlog(
         "intent:parse_intent:final",
-        "fallback unknown intent selected",
-        {"transcript": transcript, "final_goal": rule.goal.value, "source": "fallback_unknown"},
+        "rule-based intent selected (offline fallback)",
+        {"transcript": transcript, "final_goal": rule.goal.value, "source": "rule"},
         "H12",
     )
     # #endregion
-    return rule  # already unknown
+    return rule
 
 
 async def _parse_with_gemini(transcript: str) -> IntentObject:
@@ -172,7 +215,8 @@ async def _parse_with_gemini(transcript: str) -> IntentObject:
             contents=prompt,
             config=_genai.types.GenerateContentConfig(
                 temperature=0.0,
-                max_output_tokens=256,
+                max_output_tokens=384,
+                response_mime_type="application/json",
             ),
         )
         return response.text
@@ -197,16 +241,49 @@ async def _parse_with_cactus(transcript: str) -> IntentObject:
 
 
 def _parse_json_response(raw: str, transcript: str) -> IntentObject:
-    raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
-    data = json.loads(raw)
+    """
+    Parse an LLM JSON response into an IntentObject with defensive coercion.
+
+    Raises RuntimeError on hard failures (malformed JSON, non-object payload)
+    so the caller can fall through to the next backend.
+    """
+    if not raw:
+        raise RuntimeError("empty response from LLM")
+
+    cleaned = raw.strip()
+    cleaned = re.sub(r"^```(?:json)?|```$", "", cleaned, flags=re.MULTILINE).strip()
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"invalid JSON: {e}") from e
+
+    if not isinstance(data, dict):
+        raise RuntimeError(f"expected JSON object, got {type(data).__name__}")
+
+    raw_goal = str(data.get("goal", "unknown")).strip().lower()
+    goal = KnownGoal._value2member_map_.get(raw_goal, KnownGoal.UNKNOWN)
+
+    target = data.get("target", {})
+    if not isinstance(target, dict):
+        target = {}
+
+    uses_local_data = data.get("uses_local_data", [])
+    if not isinstance(uses_local_data, list):
+        uses_local_data = []
+    uses_local_data = [str(x) for x in uses_local_data if isinstance(x, (str, int, float))]
+
+    slots = data.get("slots", {})
+    if not isinstance(slots, dict):
+        slots = {}
+
     return IntentObject(
-        goal=KnownGoal(data.get("goal", "unknown")),
-        target=data.get("target", {}),
-        uses_local_data=data.get("uses_local_data", []),
-        requires_browser=data.get("requires_browser", False),
-        requires_submission=data.get("requires_submission", False),
-        slots=data.get("slots", {}),
+        goal=goal,
+        target=target,
+        uses_local_data=uses_local_data,
+        requires_browser=bool(data.get("requires_browser", False)),
+        requires_submission=bool(data.get("requires_submission", False)),
+        slots=slots,
         raw_transcript=transcript,
     )
 

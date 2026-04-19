@@ -187,7 +187,6 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 menu_bar.set_status("parsing intent")
                 print("[2/3] Parsing intent...")
                 intent = await parse_intent(transcript)
-                intent = _normalize_voice_intent(intent, transcript)
                 print(f"      → goal={intent.goal.value}  slots={intent.slots}")
                 # #region agent log
                 try:
@@ -1552,87 +1551,6 @@ def _should_inline_wake_tail(tail: str) -> bool:
         return False
     return len(words) >= 3
 
-
-
-def _normalize_voice_intent(intent, transcript: str):
-    """
-    Post-parse guardrail for wake-voice ambiguity.
-    If parser returns SEND_EMAIL for utterances that sound like opening a file,
-    remap to FIND_FILE so we avoid unrelated planner/screenshot flows.
-    """
-    try:
-        from intent.schema import KnownGoal
-    except Exception:
-        return intent
-
-    text = (transcript or "").lower()
-    if intent.goal != KnownGoal.SEND_EMAIL:
-        return intent
-
-    has_email_words = any(w in text for w in ("email", "mail", "gmail", "inbox", "send to"))
-    looks_like_open = any(w in text for w in ("open", "find", "show", "reveal", "locate", "resume", "cv"))
-    if has_email_words or not looks_like_open:
-        return intent
-
-    file_like_words = ("resume", "cv", "cover letter", "pdf", "doc", "docx", "deck", "file", "folder")
-    web_like_words = ("linkedin", "github", "notion", "gmail", "inbox", "twitter", "x.com", "website", "site", "url")
-    looks_file_like = any(w in text for w in file_like_words)
-    looks_web_like = any(w in text for w in web_like_words) and not looks_file_like
-
-    if looks_web_like:
-        intent.goal = KnownGoal.OPEN_URL
-        service = _extract_web_service(text)
-        url = f"https://www.{service}.com" if service else "https://www.google.com"
-        if isinstance(intent.target, dict):
-            intent.target = {"type": "url", "value": url}
-        if isinstance(intent.slots, dict):
-            intent.slots["url"] = url
-        # #region agent log
-        try:
-            import json as _j, os as _o, time as _t
-            _p = "/Users/alspenceramitojr/Desktop/Ali/.cursor/debug-4ea166.log"
-            _o.makedirs(_o.path.dirname(_p), exist_ok=True)
-            with open(_p, "a") as _f:
-                _f.write(_j.dumps({"sessionId":"4ea166","hypothesisId":"H10",
-                    "location":"main:intent_remap_send_email_to_open_url",
-                    "message":"remapped likely misclassified send_email to open_url",
-                    "data":{"transcript": transcript, "url": url},
-                    "timestamp": int(_t.time()*1000)})+"\n")
-                _f.flush()
-        except Exception:
-            pass
-        # #endregion
-        return intent
-
-    # #region agent log
-    try:
-        import json as _j, os as _o, time as _t
-        _p = "/Users/alspenceramitojr/Desktop/Ali/.cursor/debug-4ea166.log"
-        _o.makedirs(_o.path.dirname(_p), exist_ok=True)
-        with open(_p, "a") as _f:
-            _f.write(_j.dumps({"sessionId":"4ea166","hypothesisId":"H10",
-                "location":"main:intent_remap_send_email_to_find_file",
-                "message":"remapped likely misclassified send_email to find_file",
-                "data":{"transcript": transcript, "slots": intent.slots},
-                "timestamp": int(_t.time()*1000)})+"\n")
-            _f.flush()
-    except Exception:
-        pass
-    # #endregion
-
-    intent.goal = KnownGoal.FIND_FILE
-    if isinstance(intent.slots, dict):
-        fq = intent.slots.get("file_query")
-        if not isinstance(fq, str) or not fq.strip():
-            intent.slots["file_query"] = "resume"
-    return intent
-
-
-def _extract_web_service(text: str) -> str | None:
-    for token in ("linkedin", "github", "notion", "gmail", "twitter"):
-        if token in text:
-            return token
-    return None
 
 
 def _run_agent(overlay: "TranscriptionOverlay") -> None:
