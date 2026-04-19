@@ -147,7 +147,7 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
     # Ambient listen loop (glass-style) runs in parallel with PTT when the
     # flag is on. It does NOT intercept user commands — it only surfaces
     # suggestions (tier 1-3) into the overlay. PTT still works.
-    from config.settings import AMBIENT_ENABLED
+    from config.settings import AMBIENT_ENABLED, SYS_AUDIO_ENABLED
     if not AMBIENT_ENABLED:
         print(
             "[ambient] disabled — task checklist will stay empty. Set "
@@ -155,6 +155,27 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
             "loose utterances.",
             flush=True,
         )
+    else:
+        if SYS_AUDIO_ENABLED:
+            print(
+                "[ambient] sysaudio ON — FaceTime / Zoom / Meet remote "
+                "audio will be transcribed alongside the mic. First run "
+                "will trigger macOS Screen Recording permission; if you "
+                "see 'no SysAudio binary found', build it with:\n"
+                "  cd Ali && swiftc -O -framework ScreenCaptureKit "
+                "-framework AVFoundation -framework CoreMedia "
+                "-framework CoreGraphics -o tools/bin/sysaudio "
+                "tools/sysaudio.swift",
+                flush=True,
+            )
+        else:
+            print(
+                "[ambient] sysaudio OFF — only mic audio is captured, so "
+                "remote speakers on a FaceTime / Zoom call are invisible "
+                "to the task checklist. Set VOICE_AGENT_SYS_AUDIO=1 to "
+                "enable.",
+                flush=True,
+            )
 
     async def _handle_transcript(transcript: str) -> None:
         async with command_lock:
@@ -385,55 +406,6 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 print("[3/3] Executing...")
                 menu_bar.set_status("running")
                 overlay.push("action", f"Running: {goal_label}…")
-
-                # Flights: call Kiwi MCP for real structured results. Pick the
-                # cheapest, speak its summary, open Kiwi's booking deeplink.
-                if intent.goal == KnownGoal.FIND_FLIGHTS:
-                    from executors.flights import search_flights, format_flight_summary, FlightSearchError
-                    from voice.speak import speak
-                    try:
-                        flights = await search_flights(intent.slots)
-                    except FlightSearchError as e:
-                        overlay.push("error", f"Flight search failed: {e}")
-                        speak(str(e))
-                        return
-                    except Exception as e:
-                        overlay.push("error", f"Flight search error: {e}")
-                        speak("I couldn't reach the flight search service.")
-                        return
-                    if not flights:
-                        overlay.push("done", "No flights found")
-                        speak("I couldn't find any flights for that route.")
-                        return
-                    top = flights[0]
-                    # Header
-                    origin_code = top.get("flyFrom", intent.slots.get("origin", ""))
-                    dest_code   = top.get("flyTo",   intent.slots.get("destination", ""))
-                    date_label  = f"  {intent.slots.get('depart_date', '')}" if intent.slots.get("depart_date") else ""
-                    overlay.push("assistant", f"Flights  {origin_code} → {dest_code}{date_label}")
-                    # List up to top 5 results
-                    for i, f in enumerate(flights[:5], 1):
-                        overlay.push("assistant", f"  {i}.  {format_flight_summary(f)}")
-                    speak(f"Found {len(flights[:5])} flights. Cheapest is {top.get('price')} dollars, {format_flight_summary(top).split('•')[-1].strip()}.")
-                    deeplink = top.get("deepLink")
-                    if deeplink:
-                        _open_url_local(deeplink)
-                    # Add calendar event(s) for the flight date(s)
-                    try:
-                        import json as _json
-                        from executors.calendar import add_flight_events
-                        n = add_flight_events(intent.slots, top)
-                        if n > 0:
-                            label = "events" if n > 1 else "event"
-                            overlay.push("assistant", f"Added {n} calendar {label}")
-                            overlay.push("cited_paths", _json.dumps([
-                                {"label": "Open Calendar", "path": "ali://calendar/"}
-                            ]))
-                            speak(f"I've added {n} calendar {label} for your trip.")
-                    except Exception:
-                        pass
-                    return
-
 
                 # Browser-shaped intents (open_url, apply_to_job, anything the
                 # parser flagged requires_browser=True) all enter the same
@@ -887,6 +859,19 @@ async def _run_find_flights_flow(
         f"Cheapest is {int(cheapest.get('price') or 0)} dollars to "
         f"{cheapest.get('flyTo', destination)}."
     )
+
+    # Add calendar event for the flight
+    try:
+        from executors.calendar import add_flight_events
+        n = add_flight_events(slots, cheapest)
+        if n > 0:
+            cal_label = "events" if n > 1 else "event"
+            overlay.push("cited_paths", _json.dumps([
+                {"label": "Open Calendar", "path": "ali://calendar/"}
+            ], ensure_ascii=False))
+            speak(f"I've added {n} calendar {cal_label} for your trip.")
+    except Exception:
+        pass
 
 
 async def _split_body_and_extra_actions(
@@ -1364,6 +1349,20 @@ async def _execute_ambient_find_flights(
         f"Cheapest is {int(cheapest.get('price') or 0)} dollars to "
         f"{cheapest.get('flyTo', destination)}."
     )
+
+    # Add calendar event for the flight
+    try:
+        from executors.calendar import add_flight_events
+        n = add_flight_events(slots, cheapest)
+        if n > 0:
+            cal_label = "events" if n > 1 else "event"
+            overlay.push("cited_paths", _json.dumps([
+                {"label": "Open Calendar", "path": "ali://calendar/"}
+            ], ensure_ascii=False))
+            speak(f"I've added {n} calendar {cal_label} for your trip.")
+    except Exception:
+        pass
+
     agent_log("tool:find_flights:done", f"top_price={top[0].get('price')} count={len(items)}")
 
 
