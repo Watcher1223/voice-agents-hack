@@ -123,18 +123,9 @@ class AmbientCapture:
         # treated as direct-address because the user just said a bare
         # "Ali" to get the agent's attention.
         self._direct_armed_until: float = 0.0
-        # Conversation-mode classifier state. Re-detected periodically;
-        # guides the prompt injection. Keyword-based so it's free.
-        from intent.conversation_modes import Mode as _Mode
-        self._mode: _Mode = _Mode.GENERIC
-        self._mode_checked_at_turn: int = 0
 
     def stop(self) -> None:
         self._stop_event.set()
-
-    @property
-    def mode(self):
-        return self._mode
 
     async def run(self) -> None:
         from voice.deepgram_stream import (
@@ -142,6 +133,7 @@ class AmbientCapture:
             start_meeting_audio,
             stop_meeting_audio,
         )
+        from config.settings import SYS_AUDIO_ENABLED
 
         self._loop = asyncio.get_event_loop()
         start_meeting_audio()
@@ -159,12 +151,27 @@ class AmbientCapture:
                 return
             self._loop.call_soon_threadsafe(self._ingest_final, text)
 
-        stream_thread = threading.Thread(
+        mic_thread = threading.Thread(
             target=stream_transcription_sync,
             args=(self._stop_event, _interim, _final),
             daemon=True,
         )
-        stream_thread.start()
+        mic_thread.start()
+
+        # Parallel system-audio stream: captures the Mac's output (remote
+        # FaceTime/Zoom voices) via ScreenCaptureKit. Shares the same
+        # debounce buffer so both mic and system turns interleave into one
+        # rolling transcript.
+        sys_thread: threading.Thread | None = None
+        if SYS_AUDIO_ENABLED:
+            from voice.sysaudio_stream import stream_sysaudio_transcription_sync
+            sys_thread = threading.Thread(
+                target=stream_sysaudio_transcription_sync,
+                args=(self._stop_event, _interim, _final),
+                daemon=True,
+            )
+            sys_thread.start()
+            _log("sysaudio", "started (ScreenCaptureKit → Deepgram)")
 
         try:
             while not self._stop_event.is_set():
@@ -172,7 +179,9 @@ class AmbientCapture:
         finally:
             self._stop_event.set()
             stop_meeting_audio()
-            stream_thread.join(timeout=3.0)
+            mic_thread.join(timeout=3.0)
+            if sys_thread is not None:
+                sys_thread.join(timeout=3.0)
 
     def _ingest_final(self, text: str) -> None:
         """Append a raw Deepgram final to the pending buffer + restart the
@@ -320,7 +329,6 @@ class AmbientCapture:
                 screen_app=screen_app,
                 screen_window_title=screen_title,
                 screen_image_bytes=image,
-                mode=self._mode,
             )
             if result.should_surface():
                 self._previous = result
@@ -351,20 +359,33 @@ class AmbientCapture:
 
     async def _do_analysis(self) -> None:
         from intent.ambient_analysis import analyse
-        from intent.conversation_modes import detect_mode
+        from config.settings import GEMMA_SILENCE_ENABLED
 
         try:
             with self._lock:
                 history_snapshot = list(self._history)
                 total = len(history_snapshot)
-            # Re-classify conversation mode every 6 committed turns.
-            # Keyword-based so it's free; emit a log line on transition.
-            if total - self._mode_checked_at_turn >= 6 or self._mode_checked_at_turn == 0:
-                new_mode = detect_mode(history_snapshot)
-                if new_mode != self._mode:
-                    _log("mode", f"{self._mode.value} → {new_mode.value}")
-                    self._mode = new_mode
-                self._mode_checked_at_turn = total
+            # Optional local pre-gate (VOICE_AGENT_GEMMA_SILENCE=1): run
+            # Gemma first to decide whether anything in the window is worth
+            # surfacing. If it says 'silent', skip the cloud Gemini call
+            # entirely. Eval: skips 53% of Gemini calls, 5% FN on windows
+            # that DID contain signal. Any sidecar failure → fall through.
+            if GEMMA_SILENCE_ENABLED:
+                try:
+                    from intent.gemma_classifier import should_surface_gemma
+                    verdict = should_surface_gemma(history_snapshot)
+                    if verdict is False:
+                        _log("gemma-gate", f"silent (skipped Gemini call, {total} turns)")
+                        return
+                    if verdict is True:
+                        _log("gemma-gate", f"surface (forwarding to Gemini)")
+                    else:
+                        # Gemma returned None — sidecar unreachable, timed
+                        # out, or emitted unparseable output. Continue to
+                        # Gemini so we never drop signal on an infra hiccup.
+                        _log("gemma-gate-fallback", "no verdict (forwarding to Gemini)")
+                except Exception as e:
+                    _log("gemma-gate-error", str(e)[:160])
             screen_app, screen_title, image = "", "", b""
             if self._screen_observer is not None:
                 ctx = self._screen_observer.latest_context()
@@ -377,7 +398,6 @@ class AmbientCapture:
                 screen_app=screen_app,
                 screen_window_title=screen_title,
                 screen_image_bytes=image,
-                mode=self._mode,
             )
             if result.should_surface():
                 self._previous = result

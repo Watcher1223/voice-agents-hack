@@ -25,6 +25,26 @@ CACTUS_API_KEY = os.environ.get("CACTUS_API_KEY", "")
 # ── Cactus / Gemma 4 ─────────────────────────────────────────────────────────
 CACTUS_GEMMA4_MODEL = "google/gemma-4-E2B-it"
 
+# Route specific ambient-pipeline decisions through the local Gemma-4 sidecar
+# instead of the default (keyword heuristic for mode, always-call-Gemini for
+# silence). Both flags are opt-in — if the sidecar is down or a call times out
+# the caller transparently falls back to the original behaviour, so turning
+# these on can only *improve* the pipeline, never break it.
+#
+#   VOICE_AGENT_GEMMA_SILENCE=1  — Local pre-gate: if Gemma says "silent" we
+#                                  skip the Gemini ambient-analysis call.
+#                                  Eval: skips 53% of Gemini calls with 5% FN.
+GEMMA_SILENCE_ENABLED = os.environ.get("VOICE_AGENT_GEMMA_SILENCE", "0").lower() in {"1", "true", "yes"}
+
+# System-audio capture via ScreenCaptureKit helper at tools/bin/SysAudio.app.
+# When enabled, a second Deepgram stream runs alongside the mic stream with
+# audio piped from the Mac's output — this lets Ali transcribe the OTHER
+# side of a FaceTime/Zoom/Meet call (voices that only exist in the speaker
+# output, not the mic). First run will trigger the macOS Screen Recording
+# permission prompt; after granting, relaunch. Falls through silently if
+# the helper binary is missing or permission is denied.
+SYS_AUDIO_ENABLED = os.environ.get("VOICE_AGENT_SYS_AUDIO", "0").lower() in {"1", "true", "yes"}
+
 # ── Cactus VL (browser sub-agent) ────────────────────────────────────────────
 # The browser sub-agent runs inside a Chrome extension whose LLM is configured
 # via chrome.storage.local. scripts/cactus_server.py is the HTTP sidecar the

@@ -1,0 +1,60 @@
+{"id":"surface_001","label":"surface","reason":"factual_question","window":["remind me what IRR stands for","I can never keep it straight","yeah same"]}
+{"id":"surface_002","label":"surface","reason":"factual_question","window":["when did openai announce their series c","I think it was 2023","but I'm not 100% sure"]}
+{"id":"surface_003","label":"surface","reason":"jargon","window":["we should look into constitutional ai","what does that actually mean","anthropic invented it"]}
+{"id":"surface_004","label":"surface","reason":"action_email","window":["I need to follow up with hanzi about the deck","she wanted it before friday","I'll send one tonight"]}
+{"id":"surface_005","label":"surface","reason":"action_calendar","window":["add lunch with ethan to my calendar tomorrow at noon","got it","thanks"]}
+{"id":"surface_006","label":"surface","reason":"factual_question","window":["who was the first ceo of openai","sam right","but before that"]}
+{"id":"surface_007","label":"surface","reason":"action_search","window":["I want to check recent news about stripe","see if they've announced the ipo","nothing concrete yet"]}
+{"id":"surface_008","label":"surface","reason":"jargon","window":["he mentioned mixture of experts","wait is that the moe thing","yeah like what mistral does"]}
+{"id":"surface_009","label":"surface","reason":"factual_question","window":["what's the difference between llama 3 and llama 3.1","the context length I think","but also the training data"]}
+{"id":"surface_010","label":"surface","reason":"action_email","window":["draft a quick reply to that thread","saying I can do thursday at 3","and cc korin"]}
+{"id":"surface_011","label":"surface","reason":"action_search","window":["remind me what flashattention 2 does","the paper from stanford right","tri dao's work"]}
+{"id":"surface_012","label":"surface","reason":"factual_question","window":["how big is anthropic now","I think a thousand people","maybe more"]}
+{"id":"surface_013","label":"surface","reason":"jargon","window":["we're using rlhf for fine-tuning","what does that stand for again","reinforcement learning from human feedback"]}
+{"id":"surface_014","label":"surface","reason":"action_calendar","window":["schedule a one hour sync with the design team for next tuesday","morning works","afternoon too"]}
+{"id":"surface_015","label":"surface","reason":"factual_question","window":["what's y combinator's acceptance rate","I've heard low single digits","but it varies"]}
+{"id":"surface_016","label":"surface","reason":"action_message","window":["send a text to hanzi saying I'm running 10 minutes late","she's waiting at the cafe","already left"]}
+{"id":"surface_017","label":"surface","reason":"jargon","window":["he used the word zero-knowledge proof","like the crypto thing","for privacy"]}
+{"id":"surface_018","label":"surface","reason":"factual_question","window":["when was y combinator founded","I always forget","two thousand five"]}
+{"id":"surface_019","label":"surface","reason":"action_search","window":["can we find the latest on nvidia's q1 earnings","the call was yesterday","I missed it"]}
+{"id":"surface_020","label":"surface","reason":"factual_question","window":["what does karpathy do now","he left openai right","started eureka labs I think"]}
+{"id":"surface_021","label":"surface","reason":"jargon","window":["the vendor mentioned slos","service level objectives","yeah for uptime"]}
+{"id":"surface_022","label":"surface","reason":"action_email","window":["email the investors the new deck","include the metrics slide","and the traction chart"]}
+{"id":"surface_023","label":"surface","reason":"factual_question","window":["what's a typical saas gross margin","seventies, eighties","high for software"]}
+{"id":"surface_024","label":"surface","reason":"jargon","window":["they said LTV over CAC needs to be three","what's that","lifetime value over acquisition cost"]}
+{"id":"surface_025","label":"surface","reason":"action_calendar","window":["put a reminder for the pitch rehearsal thursday 2pm","I'll need 45 minutes","ok"]}
+{"id":"surface_026","label":"surface","reason":"factual_question","window":["where did airbnb start","san francisco","yeah 2008"]}
+{"id":"surface_027","label":"surface","reason":"action_search","window":["pull up the hacker news top stories","I haven't checked all morning","anything about gemma"]}
+{"id":"surface_028","label":"surface","reason":"jargon","window":["he said our runway is 18 months","runway meaning burn until broke","yeah"]}
+{"id":"surface_029","label":"surface","reason":"factual_question","window":["how many teslas were produced last year","I don't remember","around 1.8m"]}
+{"id":"surface_030","label":"surface","reason":"action_email","window":["reply to her email saying tuesday works","cc the team","got it"]}
+{"id":"silent_001","label":"silent","reason":"smalltalk","window":["how's your day","pretty good","same","coffee"]}
+{"id":"silent_002","label":"silent","reason":"smalltalk","window":["the weather is nice","yeah finally","i'm going for a walk","enjoy"]}
+{"id":"silent_003","label":"silent","reason":"filler","window":["ok","yeah","sure","mhm"]}
+{"id":"silent_004","label":"silent","reason":"repetition","window":["so what I was saying","yeah","so what I was saying","right"]}
+{"id":"silent_005","label":"silent","reason":"greeting","window":["hey","hi","how's it going","good you"]}
+{"id":"silent_006","label":"silent","reason":"smalltalk","window":["did you see the game","nah","I'll watch the highlights","same"]}
+{"id":"silent_007","label":"silent","reason":"filler","window":["let me think","hmm","yeah","one sec"]}
+{"id":"silent_008","label":"silent","reason":"smalltalk","window":["nice shirt","thanks","where'd you get it","uniqlo"]}
+{"id":"silent_009","label":"silent","reason":"ambient_noise","window":["can you hear me","yeah now","okay","alright"]}
+{"id":"silent_010","label":"silent","reason":"smalltalk","window":["I'm hungry","same","what do you want","anything is fine"]}
+{"id":"silent_011","label":"silent","reason":"filler","window":["right right","yeah","totally","for sure"]}
+{"id":"silent_012","label":"silent","reason":"smalltalk","window":["long week","same","almost over","friday tomorrow"]}
+{"id":"silent_013","label":"silent","reason":"repetition","window":["what I wanted to say","yeah","what I was going to say","got it"]}
+{"id":"silent_014","label":"silent","reason":"greeting","window":["good morning","morning","coffee","yes please"]}
+{"id":"silent_015","label":"silent","reason":"ambient_noise","window":["sorry what","I said the thing","oh gotcha","yeah"]}
+{"id":"silent_016","label":"silent","reason":"smalltalk","window":["cool","nice","yeah","for sure"]}
+{"id":"silent_017","label":"silent","reason":"filler","window":["anyway","yeah","so","hmm"]}
+{"id":"silent_018","label":"silent","reason":"smalltalk","window":["I need a vacation","same","where would you go","somewhere warm"]}
+{"id":"silent_019","label":"silent","reason":"repetition","window":["and the other thing","yeah","and the other thing was","right"]}
+{"id":"silent_020","label":"silent","reason":"smalltalk","window":["traffic was bad","always is","I know","hate it"]}
+{"id":"silent_021","label":"silent","reason":"filler","window":["um","yeah","like","I think"]}
+{"id":"silent_022","label":"silent","reason":"greeting","window":["bye","see you later","have a good one","thanks"]}
+{"id":"silent_023","label":"silent","reason":"ambient_noise","window":["are you there","yeah","it cut out","sorry"]}
+{"id":"silent_024","label":"silent","reason":"smalltalk","window":["my legs are tired","long walk","yeah","worth it though"]}
+{"id":"silent_025","label":"silent","reason":"filler","window":["okay so","yeah","so then","right"]}
+{"id":"silent_026","label":"silent","reason":"smalltalk","window":["I love fall","the leaves","it's nice","yeah"]}
+{"id":"silent_027","label":"silent","reason":"repetition","window":["my point is","yeah","my point being","got it"]}
+{"id":"silent_028","label":"silent","reason":"greeting","window":["welcome","hey","thanks for coming","of course"]}
+{"id":"silent_029","label":"silent","reason":"smalltalk","window":["did you eat","yeah earlier","i'm not hungry yet","maybe soon"]}
+{"id":"silent_030","label":"silent","reason":"ambient_noise","window":["one second","yeah","okay I'm back","sorry about that"]}

@@ -8,6 +8,12 @@ build/
 .env
 *.log
 .DS_Store
+
+# Compiled sysaudio binary + TCC-bound .app bundle. Rebuild locally via:
+#   swiftc -O -framework CoreAudio -framework AudioToolbox \
+#          -framework AVFoundation -framework CoreMedia \
+#          -o tools/bin/sysaudio tools/sysaudio.swift
+tools/bin/
 *.wav
 *.tmp
 

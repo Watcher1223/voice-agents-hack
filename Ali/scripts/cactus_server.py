@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,12 @@ import uvicorn
 # ── Deferred cactus import so tests can import this module without the SDK ────
 _MODEL = None
 _loaded_model: str | None = None
+# Cactus's C-level engine is not thread-safe. FastAPI runs sync handlers in a
+# threadpool, so two overlapping requests will stomp on the shared _MODEL state
+# and segfault (observed as exit 139 after the first concurrent call). A
+# single global lock serialises every completion — adds no measurable latency
+# since the model is already the bottleneck.
+_MODEL_LOCK = threading.Lock()
 
 log = logging.getLogger("cactus_server")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -160,13 +167,15 @@ def complete(req: CompleteRequest):
     t0 = time.time()
     try:
         from cactus import cactus_complete  # type: ignore  # lazy import
-        raw = cactus_complete(
-            _MODEL,
-            json.dumps(req.messages),
-            json.dumps(options),
-            json.dumps(tools_wrapped),
-            None,  # no streaming callback
-        )
+        # Serialise the FFI call — cactus's engine is not thread-safe.
+        with _MODEL_LOCK:
+            raw = cactus_complete(
+                _MODEL,
+                json.dumps(req.messages),
+                json.dumps(options),
+                json.dumps(tools_wrapped),
+                None,  # no streaming callback
+            )
         result = json.loads(raw)
     except HTTPException:
         raise

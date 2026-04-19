@@ -547,11 +547,15 @@ def _extract_flight_slots(transcript: str) -> dict:
 
     slots: dict = {"origin": origin, "destination": destination}
 
-    # Date phrase: grab what follows "on"/"next"/"tomorrow"/"in" and hand to
-    # the parser. Fine if nothing matches — date is optional.
-    d = re.search(r"(?:\b(?:on|next|tomorrow|in this|in)\b\s*)([a-z0-9\s]+?)(?:[,.?!]|$)", t)
+    # Date phrase: scan for any chunk that _parse_when_phrase can handle.
+    # Fine if nothing matches — date is optional.
+    d = re.search(
+        r"\b(tomorrow|next\s+weekend|in\s+\d+\s+(?:day|days|week|weeks)|"
+        r"(?:on\s+)?(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?)\b",
+        t,
+    )
     if d:
-        date_str = _parse_when_phrase(d.group(0).strip(), datetime.date.today())
+        date_str = _parse_when_phrase(d.group(1), datetime.date.today())
         if date_str:
             slots["depart_date"] = date_str
 

@@ -79,15 +79,43 @@ def stream_transcription_sync(
             sample_rate=SAMPLE_RATE,
         ) as connection:
 
+            from collections import Counter
             from config.vocab import apply_corrections
+
+            def _dominant_speaker(words) -> int | None:
+                """Deepgram tags each word with an integer speaker id. Pick
+                the majority speaker for the utterance — brief cross-talk
+                between speakers shouldn't flip the label."""
+                try:
+                    counts = Counter(
+                        getattr(w, "speaker", None)
+                        for w in (words or [])
+                        if getattr(w, "speaker", None) is not None
+                    )
+                    if counts:
+                        return counts.most_common(1)[0][0]
+                except Exception:
+                    pass
+                return None
 
             def _on_message(msg) -> None:
                 if not isinstance(msg, ListenV1Results):
                     return
                 try:
-                    text = msg.channel.alternatives[0].transcript.strip()
+                    alt = msg.channel.alternatives[0]
+                    text = (alt.transcript or "").strip()
                     if not text:
                         return
+                    spk = _dominant_speaker(getattr(alt, "words", None))
+                    # Prefix "[Me-S0]" / "[Me-S1]" so the ambient prompt
+                    # can distinguish who said what. The "Me-" prefix
+                    # pairs with "[Remote-Sn]" on the parallel sysaudio
+                    # stream (voice/sysaudio_stream.py) so the model can
+                    # attribute commitments to the right side of the call.
+                    if spk is not None:
+                        text = f"[Me-S{spk}] {text}"
+                    else:
+                        text = f"[Me] {text}"
                     if msg.is_final:
                         on_final(apply_corrections(text))
                     else:
