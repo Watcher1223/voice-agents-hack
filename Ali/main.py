@@ -711,16 +711,11 @@ async def _run_ambient_capture(overlay) -> None:
         if _overlay_ref is not None:
             _overlay_ref.refresh_tasks()
 
-            # Keep the transient yellow pill as a "NEW TASK" hint so the
-            # user notices even if they weren't looking at the panel.
-            # It auto-expires; the panel is the source of truth.
+            # No yellow pill — the task card in the right column IS the
+            # review surface. Dropping the duplicate avoids the truncated
+            # preview line that felt like visual noise.
             global _pending_confirmation
-            _pending_confirmation = {
-                "analysis": enriched_analysis,
-                "deadline": time.monotonic() + _PENDING_CONFIRMATION_WINDOW_S,
-                "safety": safety,
-            }
-            overlay.push("ambient_confirm", f"📋 {preview}")
+            _pending_confirmation = None
 
             def _on_click_confirm() -> None:
                 global _pending_confirmation
@@ -881,12 +876,18 @@ def _enrich_local_slots(
 
     if text in ("compose_mail", "send_email"):
         to = str(slots.get("to", "")).strip()
-        # If `to` is a name (no @), try Contacts resolution.
+        # If `to` is a name (no @), try Contacts resolution. Swallow any
+        # failure (Contacts.app not running, name not found) so the task
+        # still lands in the panel with the unresolved name — the user
+        # sees it and can edit in Mail.app.
         if to and "@" not in to:
-            resolved = applescript.resolve_contact(to)
-            if resolved:
-                agent_log("enrich:resolve_contact", f"{to!r} → {resolved}")
-                slots["to"] = resolved
+            try:
+                resolved = applescript.resolve_contact(to)
+                if resolved:
+                    agent_log("enrich:resolve_contact", f"{to!r} → {resolved}")
+                    slots["to"] = resolved
+            except Exception as exc:
+                agent_log("enrich:resolve_contact_failed", f"{to!r}: {exc}")
         # File-attachment hint: if the detail mentions a common file
         # alias, try to find it via FilesystemExecutor. find_by_alias
         # raises when an alias is missing or unresolved — that's fine
@@ -920,10 +921,13 @@ def _enrich_local_slots(
     if text in ("send_imessage", "send_message"):
         contact = str(slots.get("contact", "")).strip()
         if contact and "@" not in contact and not contact.startswith("+"):
-            resolved = applescript.resolve_contact(contact)
-            if resolved:
-                agent_log("enrich:resolve_contact", f"{contact!r} → {resolved}")
-                slots["contact"] = resolved
+            try:
+                resolved = applescript.resolve_contact(contact)
+                if resolved:
+                    agent_log("enrich:resolve_contact", f"{contact!r} → {resolved}")
+                    slots["contact"] = resolved
+            except Exception as exc:
+                agent_log("enrich:resolve_contact_failed", f"{contact!r}: {exc}")
 
     return slots
 

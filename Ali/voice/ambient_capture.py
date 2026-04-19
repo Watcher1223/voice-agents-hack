@@ -31,6 +31,12 @@ AMBIENT_HISTORY_TURNS = 30
 # Gives the speaker time to finish a thought before the analyzer counts
 # it as a completed utterance.
 DEBOUNCE_SECONDS = 2.0
+# Silence-based trigger: if the user has committed at least one turn
+# since the last analysis AND goes quiet for N seconds, fire analysis
+# anyway even if we haven't hit the 5-turn threshold. Prevents 3-sentence
+# thoughts from sitting unprocessed while the user moves on to other
+# things. 8s is long enough to avoid mid-sentence-pause false fires.
+SILENCE_TRIGGER_SECONDS = 8.0
 
 # Turns that begin with any of these direct-address prefixes skip the
 # 5-final wait and fire a focused single-turn analysis immediately —
@@ -109,6 +115,10 @@ class AmbientCapture:
         # asyncio loop so no lock is needed.
         self._pending_parts: list[str] = []
         self._debounce_handle: asyncio.TimerHandle | None = None
+        # Silence-based trigger timer. Reset every time a turn is
+        # committed; fires SILENCE_TRIGGER_SECONDS after the most recent
+        # commit if there's anything un-analysed.
+        self._silence_handle: asyncio.TimerHandle | None = None
         # Epoch time (monotonic) until which the NEXT turn should be
         # treated as direct-address because the user just said a bare
         # "Ali" to get the agent's attention.
@@ -244,6 +254,35 @@ class AmbientCapture:
         _log("final", f'{total:>2}: "{turn[:120]}" {marker}')
         if should_trigger:
             self._schedule_analysis()
+        else:
+            # Arm silence trigger so we don't leave the user hanging if
+            # they stop talking after 3 sentences.
+            self._reset_silence_timer()
+
+    def _reset_silence_timer(self) -> None:
+        """Start/restart the silence trigger. Fires after
+        SILENCE_TRIGGER_SECONDS if there are un-analysed finals."""
+        if self._silence_handle is not None:
+            self._silence_handle.cancel()
+            self._silence_handle = None
+        if self._loop is None:
+            return
+        with self._lock:
+            if self._finals_since_trigger == 0 or self._analysis_in_flight:
+                return
+        self._silence_handle = self._loop.call_later(
+            SILENCE_TRIGGER_SECONDS, self._fire_silence_trigger
+        )
+
+    def _fire_silence_trigger(self) -> None:
+        self._silence_handle = None
+        with self._lock:
+            if self._finals_since_trigger == 0 or self._analysis_in_flight:
+                return
+            count = self._finals_since_trigger
+            self._finals_since_trigger = 0
+        _log("silence-trigger", f"↳ firing analysis after {SILENCE_TRIGGER_SECONDS:.0f}s silence ({count} turns pending)")
+        self._schedule_analysis()
 
     def _schedule_direct_analysis(self, body: str) -> None:
         """Fire focused analysis on JUST the direct-address turn."""
@@ -290,6 +329,10 @@ class AmbientCapture:
 
     def _schedule_analysis(self) -> None:
         # Run in background; buffer continues to receive finals meanwhile.
+        # Also cancel any pending silence trigger — we're firing now.
+        if self._silence_handle is not None:
+            self._silence_handle.cancel()
+            self._silence_handle = None
         if self._analysis_in_flight:
             return
         self._analysis_in_flight = True

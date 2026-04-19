@@ -83,11 +83,12 @@ class _MacGlobalHotkeyBridge(QObject):
 
 # Citation chip geometry (used by the disk-index answer panel).
 CITATION_ROW_H = 26
-# Inline Tasks section (renders under the conversation within the same pill)
-TASK_DIVIDER_H = 16
-TASK_HEADER_H  = 22
-TASK_CARD_H    = 72
-TASK_CARD_GAP  = 6
+# Tasks render in a column on the RIGHT of the conversation when present.
+TASKS_COL_W    = 320   # width of the tasks column
+TASKS_COL_GAP  = 12    # gap between conversation column and tasks column
+TASK_HEADER_H  = 26
+TASK_CARD_H    = 82
+TASK_CARD_GAP  = 8
 TASK_BTN_W     = 44
 TASK_BTN_H     = 22
 TASK_BTN_GAP   = 6
@@ -935,7 +936,7 @@ class TranscriptionOverlay(QWidget):
         # history. Triggered from refresh_tasks() (thread-safe queue push).
         if state == "__refresh__":
             if self._history or self._has_pending_tasks():
-                self._set_size(W_FULL, self._calc_height())
+                self._set_size(self._calc_width(), self._calc_height())
                 self._present()
                 self.update()
             return
@@ -1106,7 +1107,7 @@ class TranscriptionOverlay(QWidget):
             self._history.append((text, FG, "assistant"))
 
         self._history = self._history[-MAX_HIST:]
-        self._set_size(W_FULL, self._calc_height())
+        self._set_size(self._calc_width(), self._calc_height())
         self._present()
         self.update()
 
@@ -1118,7 +1119,19 @@ class TranscriptionOverlay(QWidget):
         except Exception:
             return False
 
+    def _calc_width(self) -> int:
+        """Pill widens when the tasks column is visible."""
+        if self._has_pending_tasks():
+            return W_FULL + TASKS_COL_GAP + TASKS_COL_W
+        return W_FULL
+
     def _calc_height(self) -> int:
+        """Max of conversation column height and tasks column height."""
+        conv_h = self._calc_conv_height()
+        tasks_h = self._calc_tasks_height()
+        return min(MAX_H, max(H_PILL, conv_h, tasks_h))
+
+    def _calc_conv_height(self) -> int:
         PAD_TOP = 18
         PAD_BOT = 18
         SEP = 10      # separator under user transcript
@@ -1134,14 +1147,15 @@ class TranscriptionOverlay(QWidget):
         if self._citations:
             # Citation chips render in one horizontal row under the body.
             h += CITATION_ROW_H + 6
-        # Tasks section: divider + header + one card per pending task.
-        if self._has_pending_tasks():
-            pending = self._tasks_store.pending()  # type: ignore[union-attr]
-            h += TASK_DIVIDER_H + TASK_HEADER_H
-            h += len(pending) * (TASK_CARD_H + TASK_CARD_GAP)
-            h += 6
         h += PAD_BOT
-        return min(MAX_H, max(H_PILL, h))
+        return h
+
+    def _calc_tasks_height(self) -> int:
+        if not self._has_pending_tasks():
+            return 0
+        pending = self._tasks_store.pending()  # type: ignore[union-attr]
+        # Pad top + header + cards (including gaps) + pad bottom
+        return 18 + TASK_HEADER_H + len(pending) * (TASK_CARD_H + TASK_CARD_GAP) + 18
 
     def _set_size(self, w: int, h: int, *, animated: bool = True) -> None:
         self._reposition(w, h, animated=animated)
@@ -1515,13 +1529,17 @@ class TranscriptionOverlay(QWidget):
             )
 
     def _paint_expanded(self, p: QPainter) -> None:
-        w, h = self.width(), self.height()
+        h = self.height()
         pad = PAD_H_EXPANDED
+        # Conversation occupies the LEFT column (fixed W_FULL wide);
+        # tasks occupy the right column if present. Width here is the
+        # conversation column width, not self.width().
+        conv_w = W_FULL
 
-        # Subtle × button
+        # Subtle × button at the right edge of the CONVERSATION column.
         p.setPen(FAINT)
         p.setFont(self._font_close)
-        p.drawText(QRect(w - 30, 8, 20, 20), Qt.AlignmentFlag.AlignCenter, "×")
+        p.drawText(QRect(conv_w - 30, 8, 20, 20), Qt.AlignmentFlag.AlignCenter, "×")
 
         if not self._history:
             return
@@ -1537,13 +1555,13 @@ class TranscriptionOverlay(QWidget):
                 if len(display) > 58:
                     display = display[:55] + "…"
                 p.drawText(
-                    QRect(pad, y, w - pad * 2 - 24, 20),
+                    QRect(pad, y, conv_w - pad * 2 - 24, 20),
                     int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
                     display,
                 )
                 y += 24
                 p.setPen(QPen(DIVIDER_C, 0.8))
-                p.drawLine(QPoint(pad, y), QPoint(w - pad, y))
+                p.drawLine(QPoint(pad, y), QPoint(conv_w - pad, y))
                 y += 12
             else:
                 lines = max(1, (len(text) + 46) // 47)
@@ -1551,7 +1569,7 @@ class TranscriptionOverlay(QWidget):
                 p.setPen(colour)
                 p.setFont(self._font_body)
                 _flags = int(Qt.TextFlag.TextWordWrap) | int(Qt.AlignmentFlag.AlignLeft)
-                p.drawText(QRect(pad, y, w - pad * 2, th), _flags, text)
+                p.drawText(QRect(pad, y, conv_w - pad * 2, th), _flags, text)
                 y += th + 8
 
         # Clickable citation chips — painted as pill-shaped links after the
@@ -1570,55 +1588,63 @@ class TranscriptionOverlay(QWidget):
         else:
             self._citation_hit_rects = []
 
-        # Inline Tasks section: pending tier-3 items render as cards,
-        # each with Approve (✓ green) / Dismiss (✗ dim) buttons. Hit
-        # rects stash into self._task_hit_rects for mousePressEvent.
+        # Tasks render in the RIGHT column of the overlay (when present).
+        # Hit rects stash into self._task_hit_rects for mousePressEvent.
         self._task_hit_rects = []
         if self._has_pending_tasks():
-            y = self._paint_tasks(p, y, w, pad)
+            self._paint_tasks_right_column(p)
 
-    def _paint_tasks(self, p: QPainter, y: int, w: int, pad: int) -> int:
+    def _paint_tasks_right_column(self, p: QPainter) -> None:
+        """Render tasks as a vertical stack of cards in the right column.
+        Column spans (W_FULL+GAP) to self.width() horizontally, top of
+        the overlay to self.height() vertically."""
         pending = self._tasks_store.pending()  # type: ignore[union-attr]
-        # Divider
+        col_x = W_FULL + TASKS_COL_GAP
+        col_w = TASKS_COL_W
+        pad = 14
+        y = 16
+
+        # Subtle vertical divider between conversation and tasks
         p.setPen(QPen(DIVIDER_C, 0.8))
-        p.drawLine(QPoint(pad, y + TASK_DIVIDER_H // 2),
-                   QPoint(w - pad, y + TASK_DIVIDER_H // 2))
-        y += TASK_DIVIDER_H
-        # Header "Tasks  ·  N pending"
+        p.drawLine(QPoint(W_FULL + 3, 18), QPoint(W_FULL + 3, self.height() - 18))
+
+        # Header
         p.setPen(DIM)
         p.setFont(self._font_small)
         p.drawText(
-            QRect(pad, y, w - pad * 2, TASK_HEADER_H),
+            QRect(col_x + pad, y, col_w - pad * 2, TASK_HEADER_H),
             int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
             f"Tasks  ·  {len(pending)} pending",
         )
         y += TASK_HEADER_H
+
         # Cards
         from ui.tasks_panel import _slot_preview      # reuse the formatter
-        card_w = w - pad * 2
+        card_w = col_w - pad * 2
         for task in pending:
-            card_rect = QRect(pad, y, card_w, TASK_CARD_H)
+            card_rect = QRect(col_x + pad, y, card_w, TASK_CARD_H)
             p.setBrush(QColor(35, 35, 42, 230))
             p.setPen(Qt.PenStyle.NoPen)
             p.drawRoundedRect(card_rect, 10, 10)
-            # Headline
+            # Headline — allow wrapping for long task names
             p.setPen(FG)
             p.setFont(self._font_label)
             p.drawText(
                 QRect(card_rect.x() + 12, card_rect.y() + 8, card_w - 24, 22),
                 int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
-                (task.headline or "").strip()[:48],
+                self._truncate_label((task.headline or "").strip(), 34),
             )
-            # Slots preview
+            # Slot preview — two lines, wrapped
             p.setPen(DIM)
             p.setFont(self._font_small)
             sub = _slot_preview(task.action_text, task.slots)
             p.drawText(
-                QRect(card_rect.x() + 12, card_rect.y() + 30, card_w - 24, 20),
-                int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
-                sub,
+                QRect(card_rect.x() + 12, card_rect.y() + 28, card_w - 24, 32),
+                int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignTop)
+                | int(Qt.TextFlag.TextWordWrap),
+                self._truncate_label(sub, 80),
             )
-            # Buttons
+            # Buttons anchored to the bottom-right of each card
             btn_y = card_rect.y() + card_rect.height() - TASK_BTN_H - 8
             approve = QRect(
                 card_rect.x() + card_w - (TASK_BTN_W * 2 + TASK_BTN_GAP) - 12,
@@ -1643,7 +1669,11 @@ class TranscriptionOverlay(QWidget):
             self._task_hit_rects.append((approve, task.id, "approve"))
             self._task_hit_rects.append((dismiss, task.id, "dismiss"))
             y += TASK_CARD_H + TASK_CARD_GAP
-        return y
+
+    @staticmethod
+    def _truncate_label(s: str, n: int) -> str:
+        s = (s or "").strip()
+        return s if len(s) <= n else s[: n - 1].rstrip() + "…"
 
     # ── Timers ────────────────────────────────────────────────────────────────
 

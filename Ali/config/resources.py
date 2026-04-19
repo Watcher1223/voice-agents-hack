@@ -20,4 +20,7 @@ KNOWN_CONTACTS: dict[str, str] = {
     "ethan sandoval": "etsandoval@hmc.edu",
     "korin":          "korintajima@gmail.com",
     "korin tajima":   "korintajima@gmail.com",
+    # Add yourself + any other frequent recipients here. Voice flows
+    # like "send myself a reminder" work once 'me' / your first name
+    # is in this map.
 }
