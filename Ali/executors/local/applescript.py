@@ -82,17 +82,32 @@ class AppleScriptExecutor:
     def resolve_contact(self, name: str) -> str:
         """
         Return a phone number or iMessage email for a contact name.
-        Checks the hardcoded KNOWN_CONTACTS map first (fast, no app needed),
-        then falls back to querying Contacts.app.
+        Checks the KNOWN_CONTACTS map first (exact, then fuzzy for STT
+        mishearings like 'henzi'/'hamsi' → 'hanzi'), then falls back to
+        querying Contacts.app.
         """
-        # Check hardcoded map first (case-insensitive)
+        import difflib
+
+        # 1. Exact match in KNOWN_CONTACTS.
         key = name.lower().strip()
         if key in KNOWN_CONTACTS:
             address = KNOWN_CONTACTS[key]
-            print(f"[contacts] Resolved '{name}' → {address} (from known contacts)")
+            print(f"[contacts] Resolved '{name}' → {address} (exact)")
             return address
 
-        # Fall back to Contacts.app — launch it if not running
+        # 2. Fuzzy match — covers STT variants without hand-listing them.
+        # cutoff=0.72 accepts 1-char edits on short names ('henzi'~'hanzi')
+        # but rejects unrelated names ('ethan' won't match 'hanzi').
+        matches = difflib.get_close_matches(
+            key, list(KNOWN_CONTACTS.keys()), n=1, cutoff=0.72
+        )
+        if matches:
+            matched = matches[0]
+            address = KNOWN_CONTACTS[matched]
+            print(f"[contacts] Resolved '{name}' → {address} (fuzzy → {matched!r})")
+            return address
+
+        # 3. Fall back to Contacts.app — launch it if not running
         print(f"[contacts] Looking up '{name}' in Contacts.app...")
         script = f"""
         tell application "Contacts"

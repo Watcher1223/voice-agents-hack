@@ -9,17 +9,15 @@ FILE_ALIASES: dict[str, str] = {
     "resume": "~/Desktop/Omondi, Alspencer 03.03.2026.pdf",
 }
 
-# Hardcoded contacts — checked before querying Contacts.app.
-# Keys are lowercase name variants Whisper might produce.
-# Values are phone numbers (+1XXXXXXXXXX) or iMessage emails.
-# --- Alspencer --- a lot of hardcoded shit here.
+# Canonical name → address. STT mishearings ("henzi", "hamsi") are
+# handled by a fuzzy matcher at lookup time — no need to enumerate them
+# here. Keep this list short: only the names you actually want to
+# trigger without saying a full email.
 KNOWN_CONTACTS: dict[str, str] = {
     "hanzi":          "hanzili0217@gmail.com",
     "hanzi li":       "hanzili0217@gmail.com",
     "ethan":          "etsandoval@hmc.edu",
     "ethan sandoval": "etsandoval@hmc.edu",
     "korin":          "korintajima@gmail.com",
-    "corin":          "korintajima@gmail.com",   # common Whisper mishearing
-    "corinne":        "korintajima@gmail.com",   # another common mishearing
     "korin tajima":   "korintajima@gmail.com",
 }

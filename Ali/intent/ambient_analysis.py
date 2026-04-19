@@ -163,6 +163,26 @@ def _best_effort_json(raw: str) -> tuple[dict[str, Any] | None, str]:
     return None, cleaned
 
 
+def _contacts_block() -> str:
+    """List the user's known contacts so Gemini can emit emails / iMessage
+    addresses directly in action_slots instead of names that later need
+    fuzzy matching. Loaded from config.resources.KNOWN_CONTACTS."""
+    try:
+        from config.resources import KNOWN_CONTACTS
+        items = []
+        seen: set[str] = set()
+        for name, addr in KNOWN_CONTACTS.items():
+            if addr in seen:
+                continue  # skip secondary alias rows
+            items.append(f"- {name.title()} → {addr}")
+            seen.add(addr)
+        if items:
+            return "KNOWN CONTACTS (prefer emitting the email in action_slots):\n" + "\n".join(items)
+    except Exception:
+        pass
+    return "KNOWN CONTACTS: (none configured)"
+
+
 def _assemble_prompt(
     history: list[str],
     previous: AmbientAnalysis | None,
@@ -183,6 +203,7 @@ def _assemble_prompt(
         )
     return (
         f"{_SYSTEM}\n\n"
+        f"{_contacts_block()}\n\n"
         f"{_HISTORY_PREAMBLE}\n{hist_block}\n\n"
         f"CURRENT SCREEN CONTEXT:\n{screen_block}\n\n"
         f"{_PREVIOUS_JSON_PREAMBLE}\n{prev_block}\n\n"
