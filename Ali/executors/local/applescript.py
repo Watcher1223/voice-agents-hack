@@ -133,19 +133,60 @@ class AppleScriptExecutor:
         _run_applescript(script)
         print(f"[messages] Sent iMessage to {contact}: {body}")
 
-    def compose_mail(self, to: str, subject: str, body: str, send: bool = False):
+    def compose_mail(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        send: bool = False,
+        attachments: list[str] | None = None,
+    ):
         action = "send theMessage" if send else "activate"
         safe_body = body.replace('"', '\\"')
+        safe_subject = subject.replace('"', '\\"')
+
+        validated: list[str] = []
+        for raw in attachments or []:
+            if not isinstance(raw, str) or not raw:
+                continue
+            path = Path(raw).expanduser()
+            if not path.is_absolute() or not path.exists():
+                print(f"[mail] skipping attachment (not an absolute existing path): {raw!r}")
+                continue
+            if '"' in str(path):
+                print(f"[mail] skipping attachment (unsafe quote in path): {raw!r}")
+                continue
+            validated.append(str(path))
+
+        attachment_block = ""
+        if validated:
+            lines = []
+            for abs_path in validated:
+                lines.append(
+                    "                tell content\n"
+                    "                    make new attachment with properties "
+                    f"{{file name:POSIX file \"{abs_path}\"}} at after last paragraph\n"
+                    "                end tell"
+                )
+            attachment_block = "\n".join(lines) + "\n"
+
         script = f"""
         tell application "Mail"
-            set theMessage to make new outgoing message with properties {{subject:"{subject}", content:"{safe_body}", visible:true}}
+            set theMessage to make new outgoing message with properties {{subject:"{safe_subject}", content:"{safe_body}", visible:true}}
             tell theMessage
                 make new to recipient at end of to recipients with properties {{address:"{to}"}}
-            end tell
+{attachment_block}            end tell
             {action}
         end tell
         """
-        _run_applescript(script)
+        try:
+            _run_applescript(script)
+        except AppleScriptExecutionError as exc:
+            if validated:
+                print(f"[mail] attachment injection failed; retrying without attachments: {exc}")
+                self.compose_mail(to=to, subject=subject, body=body, send=send, attachments=None)
+            else:
+                raise
 
     def create_calendar_event(self, title: str, date: str, time: str, attendees: list[str] = []):
         date_str = f"{date} {time}" if time else date

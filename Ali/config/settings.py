@@ -20,7 +20,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 CACTUS_API_KEY = os.environ.get("CACTUS_API_KEY", "")
 
 # ── Cactus / Gemma 4 ─────────────────────────────────────────────────────────
-CACTUS_GEMMA4_MODEL = "google/gemma-4-E2B-it"
+# CACTUS_GEMMA4_MODEL = "google/gemma-4-E2B-it"
+CACTUS_GEMMA4_MODEL = "google/functiongemma-270m-it"
 
 # ── Whisper fallback ──────────────────────────────────────────────────────────
 WHISPER_MODEL_SIZE = "base.en"   # tiny.en | base.en | small.en
@@ -50,3 +51,59 @@ MESSAGES_APP = "Messages"
 MAIL_APP = "Mail"
 CALENDAR_APP = "Calendar"
 CONTACTS_APP = "Contacts"
+
+# ── File resolver ─────────────────────────────────────────────────────────────
+# Local-only resolver that turns natural-language transcripts into concrete
+# file paths using Spotlight (mdfind) + Cactus-proposed predicates.
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "1" if default else "0")
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _parse_search_roots(raw: str) -> list[Path]:
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for chunk in raw.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        try:
+            resolved = Path(item).expanduser().resolve()
+        except OSError:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        if not resolved.exists() or not resolved.is_dir():
+            continue
+        seen.add(key)
+        roots.append(resolved)
+    return roots
+
+
+FILE_RESOLVER_ENABLED = _env_bool("VOICE_AGENT_FILE_RESOLVER", True)
+FILE_RESOLVER_ALIAS_FIRST = _env_bool("VOICE_AGENT_FILE_RESOLVER_ALIAS_FIRST", True)
+FILE_RESOLVER_USE_SPOTLIGHT = _env_bool("VOICE_AGENT_USE_SPOTLIGHT", True)
+
+FILE_SEARCH_ROOTS: list[Path] = _parse_search_roots(
+    os.environ.get(
+        "VOICE_AGENT_FILE_SEARCH_ROOTS",
+        "~/Desktop,~/Documents,~/Downloads",
+    )
+)
+
+FILE_PREDICATE_MAX_ROUNDS = _env_int("VOICE_AGENT_FILE_PREDICATE_MAX_ROUNDS", 2)
+FILE_MDFIND_MAX_RESULTS = _env_int("VOICE_AGENT_FILE_MDFIND_MAX_RESULTS", 40)
+FILE_INDEX_MAX_CHARS = _env_int("VOICE_AGENT_FILE_INDEX_MAX_CHARS", 2000)
+FILE_WALK_MAX_FILES = _env_int("VOICE_AGENT_FILE_WALK_MAX_FILES", 500)
+FILE_WALK_MAX_DEPTH = _env_int("VOICE_AGENT_FILE_WALK_MAX_DEPTH", 4)
+
+FILE_RESOLVE_DEBUG = _env_bool("VOICE_AGENT_FILE_RESOLVE_DEBUG", False)

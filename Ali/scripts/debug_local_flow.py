@@ -84,7 +84,47 @@ def _make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable vision-first orchestration loop and use static plans only.",
     )
+    parser.add_argument(
+        "--ui",
+        action="store_true",
+        help=(
+            "Stream overlay events to the Tauri/React UI over ws://127.0.0.1:8765. "
+            "Start the UI separately (cd Ali/ui-app && npm run tauri dev)."
+        ),
+    )
+    parser.add_argument(
+        "--ui-hold-seconds",
+        type=float,
+        default=6.0,
+        help="Keep the UI bridge open for this many seconds after the run (default: 6.0).",
+    )
     return parser
+
+
+class _NullOverlay:
+    """No-op overlay used when --ui is not passed."""
+
+    def push(self, state: str, text: str = "") -> None:  # noqa: D401
+        return None
+
+    def run_forever(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _build_overlay(use_ui: bool):
+    if not use_ui:
+        return _NullOverlay()
+    try:
+        from ui.web_overlay import TranscriptionOverlay  # type: ignore[import-not-found]
+    except Exception as exc:
+        print(f"[debug][warn] --ui requested but web overlay unavailable: {exc}")
+        return _NullOverlay()
+    overlay = TranscriptionOverlay()
+    print("[debug] UI bridge live on ws://127.0.0.1:8765 — open the Tauri UI now.")
+    return overlay
 
 
 def _print_runtime_info() -> None:
@@ -156,6 +196,11 @@ def _record_wav_file(
         f"[debug] Recording mic input for {record_seconds:.1f}s "
         f"(device #{selected_index}, rate={sample_rate}) -> {out_path}"
     )
+    import time as _time
+    for n in (3, 2, 1):
+        print(f"[debug]   …speak in {n}")
+        _time.sleep(1)
+    print("[debug] >>> SPEAK NOW <<<")
     frames: list[bytes] = []
     try:
         for _ in range(frame_count):
@@ -249,43 +294,67 @@ async def main() -> int:
     run_preflight_checks()
     _print_runtime_info()
 
-    transcript = await _get_transcript(args)
-    print(f"[debug] Transcript: {transcript!r}")
+    overlay = _build_overlay(args.ui)
 
-    intent = await parse_intent(transcript)
-    print("[debug] Parsed intent:")
-    print(json.dumps(asdict(intent), indent=2, default=str))
+    try:
+        overlay.push("recording", "")
+        overlay.push("transcribing", "Listening...")
+        transcript = await _get_transcript(args)
+        print(f"[debug] Transcript: {transcript!r}")
+        overlay.push("transcript", f'"{transcript}"')
 
-    plan = route_intent(intent)
-    if intent.goal.value == "unknown":
-        print("[debug] Intent is unknown; no execution plan.")
-    else:
-        print(f"[debug] Plan has {len(plan)} step(s):")
-        for idx, step in enumerate(plan):
+        intent = await parse_intent(transcript)
+        print("[debug] Parsed intent:")
+        print(json.dumps(asdict(intent), indent=2, default=str))
+        goal_label = intent.goal.value.replace("_", " ").title()
+        overlay.push("intent", goal_label)
+
+        plan = route_intent(intent)
+        if intent.goal.value == "unknown":
+            print("[debug] Intent is unknown; no execution plan.")
+        else:
+            print(f"[debug] Plan has {len(plan)} step(s):")
+            for idx, step in enumerate(plan):
+                print(
+                    f"  - step[{idx}] name={step.get('name')} "
+                    f"executor={step.get('executor')} action={step.get('action')}"
+                )
+
+        if args.execute:
+            if args.vision_loop and args.no_vision_loop:
+                raise ValueError("Pass only one of --vision-loop or --no-vision-loop")
+            if args.auto_approve:
+                # Patch the orchestrator's confirmation hook for headless debug runs.
+                import orchestrator.orchestrator as orchestrator_module
+
+                async def _always_approve(_: str) -> bool:
+                    return True
+
+                orchestrator_module.ask_confirmation = _always_approve
+                print("[debug] Confirmation gate: auto-approve enabled")
+            print("[debug] Executing orchestrator...")
+            overlay.push("action", f"Running: {goal_label}…")
+            try:
+                orchestrator = Orchestrator()
+                await orchestrator.run(intent)
+                overlay.push("done", "")
+            except Exception as exc:
+                overlay.push("error", str(exc))
+                raise
+        else:
+            print("[debug] Skipping execution (pass --execute to run orchestrator).")
+
+        if args.ui and args.ui_hold_seconds > 0:
             print(
-                f"  - step[{idx}] name={step.get('name')} "
-                f"executor={step.get('executor')} action={step.get('action')}"
+                f"[debug] Holding UI bridge open for {args.ui_hold_seconds:.1f}s "
+                "(Ctrl+C to exit early)..."
             )
-
-    if args.execute:
-        if args.vision_loop and args.no_vision_loop:
-            raise ValueError("Pass only one of --vision-loop or --no-vision-loop")
-        if args.auto_approve:
-            # Patch the orchestrator's confirmation hook for headless debug runs.
-            import orchestrator.orchestrator as orchestrator_module
-
-            async def _always_approve(_: str) -> bool:
-                return True
-
-            orchestrator_module.ask_confirmation = _always_approve
-            print("[debug] Confirmation gate: auto-approve enabled")
-        print("[debug] Executing orchestrator...")
-        orchestrator = Orchestrator(
-            vision_loop_enabled=not args.no_vision_loop,
-        )
-        await orchestrator.run(intent)
-    else:
-        print("[debug] Skipping execution (pass --execute to run orchestrator).")
+            try:
+                await asyncio.sleep(args.ui_hold_seconds)
+            except asyncio.CancelledError:
+                pass
+    finally:
+        overlay.close()
 
     return 0
 
