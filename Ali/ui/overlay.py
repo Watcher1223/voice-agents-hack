@@ -54,9 +54,11 @@ USER_NAME = "Alspencer"
 # ── Meeting mode geometry ─────────────────────────────────────────────────────
 W_MEETING       = 560
 H_MEETING_BASE  = 200    # height before any action items
-H_ACTION_ROW    = 34     # height per action item row
+H_ACTION_ROW    = 52     # height per action item row (fits 80×45 thumbnail)
 MAX_ACTIONS_SHOWN = 5
 MAX_TRANSCRIPT_CHARS = 320    # chars of rolling transcript shown
+THUMB_W         = 80
+THUMB_H         = 44
 
 
 def _time_greeting() -> str:
@@ -171,7 +173,7 @@ def _bar_heights(t: float, amplitude: float, bar_count: int = BAR_COUNT) -> list
     return heights
 
 
-USE_VIBRANCY = False   # Dynamic-Island look = pure black, not frosted glass.
+USE_VIBRANCY = True    # Frosted-glass look via NSVisualEffectView.
 
 
 def _apply_macos_overlay(win: QWidget) -> None:
@@ -303,7 +305,12 @@ class TranscriptionOverlay(QWidget):
         self._meeting_mode: bool = False
         self._meeting_transcript: str = ""   # rolling committed words (trimmed)
         self._meeting_interim: str = ""      # current partial phrase
-        self._meeting_actions: list[tuple[str, str]] = []  # (task, status)
+        # (task, status, thumb_path). thumb_path = "" until screenshot_feed
+        # captures one post-completion.
+        self._meeting_actions: list[tuple[str, str, str]] = []
+        # Pixmap cache keyed by thumb_path so we don't reload from disk
+        # every paint.
+        self._thumb_cache: dict[str, QPixmap] = {}
 
         self._dock_mode: str = DOCK_TOP
 
@@ -454,8 +461,55 @@ class TranscriptionOverlay(QWidget):
         if e.button() == Qt.MouseButton.LeftButton:
             if self._hit_close(e.position().x(), e.position().y()):
                 self._do_hide()
-            else:
-                self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                return
+            # Meeting-mode action row click → Quick-Look thumbnail + focus Chrome
+            if self._meeting_mode:
+                idx = self._hit_action_row(
+                    e.position().x(), e.position().y()
+                )
+                if idx is not None:
+                    self._open_action_browser_view(idx)
+                    return
+            self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def _hit_action_row(self, x: float, y: float) -> int | None:
+        if not self._meeting_actions:
+            return None
+        # Mirrors _paint_meeting's layout:
+        #   pad = 14 ; tx_y = 46 ; tx_h = 110 ; sep_y = 160 ; first ay = 186
+        pad = 14
+        first_ay = 46 + 110 + 4 + 26   # = 186
+        if y < first_ay:
+            return None
+        # Clicks outside the row background rect (pad..w-pad) don't count.
+        if x < pad or x > self.width() - pad:
+            return None
+        idx = int((y - first_ay) // H_ACTION_ROW)
+        if 0 <= idx < len(self._meeting_actions):
+            return idx
+        return None
+
+    def _open_action_browser_view(self, idx: int) -> None:
+        """Open the captured thumbnail in Quick Look and focus Chrome."""
+        if idx >= len(self._meeting_actions):
+            return
+        _task, _status, thumb_path = self._meeting_actions[idx]
+        # Bring Chrome to front unconditionally — even without a thumb,
+        # clicking a row is a natural "show me what's happening" gesture.
+        try:
+            from ui.screenshot_feed import focus_chrome
+            focus_chrome()
+        except Exception:
+            pass
+        if thumb_path:
+            try:
+                subprocess.Popen(
+                    ["/usr/bin/qlmanage", "-p", thumb_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
 
     def mouseMoveEvent(self, e) -> None:  # type: ignore[override]
         if self._drag_offset and (e.buttons() & Qt.MouseButton.LeftButton):
@@ -637,7 +691,7 @@ class TranscriptionOverlay(QWidget):
             return
 
         if state == "meeting_action":
-            self._meeting_actions.append((text, "Queued"))
+            self._meeting_actions.append((text, "Queued", ""))
             self._meeting_actions = self._meeting_actions[-MAX_ACTIONS_SHOWN:]
             n = len(self._meeting_actions)
             h = H_MEETING_BASE + n * H_ACTION_ROW + 12
@@ -647,11 +701,17 @@ class TranscriptionOverlay(QWidget):
 
         if state == "meeting_action_update":
             # text = "task_description|status"
+            # status may be the literal "thumb:<path>" — in that case we
+            # attach the screenshot to the row without changing its status.
             if "|" in text:
                 task, status = text.split("|", 1)
-                for i, (t, _) in enumerate(self._meeting_actions):
+                is_thumb = status.startswith("thumb:")
+                for i, (t, st, th) in enumerate(self._meeting_actions):
                     if t == task:
-                        self._meeting_actions[i] = (t, status)
+                        if is_thumb:
+                            self._meeting_actions[i] = (t, st, status[len("thumb:"):])
+                        else:
+                            self._meeting_actions[i] = (t, status, th)
                         break
             self.update()
             return
@@ -869,9 +929,33 @@ class TranscriptionOverlay(QWidget):
     def _paint_black_body(
         self, p: QPainter, shell: QPainterPath, w: int, h: int
     ) -> None:
-        """Pure black Dynamic-Island body. No border — the hardware-black look
-        comes from pixel-perfect black, not a stroke."""
-        p.fillPath(shell, QColor(0, 0, 0))
+        """Body fill. Two modes:
+          • vibrancy active → translucent dark tint so NSVisualEffectView blur
+            shows through, plus a soft white edge. (Original "liquid glass".)
+          • vibrancy off    → pure black Dynamic-Island look, no border.
+        """
+        vibrancy = getattr(self, "_vibrancy_active", False)
+        if not vibrancy:
+            p.fillPath(shell, QColor(0, 0, 0))
+            return
+
+        # Soft drop shadow for bloom.
+        for offset, alpha in ((4, 14), (2, 8)):
+            s = QPainterPath()
+            s.addRoundedRect(QRect(offset // 2, offset, w - offset, h), R_FLOATING, R_FLOATING)
+            p.fillPath(s, QColor(0, 0, 0, alpha))
+
+        # Translucent dark tint on top of the vibrancy blur.
+        p.fillPath(shell, QColor(18, 18, 22, 145))
+
+        # Glassy top-to-bottom edge.
+        border = QLinearGradient(0, 0, 0, h)
+        border.setColorAt(0.0, QColor(255, 255, 255, 68))
+        border.setColorAt(0.5, QColor(210, 220, 240, 44))
+        border.setColorAt(1.0, QColor(156, 168, 188, 30))
+        p.setPen(QPen(QBrush(border), 1.2))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(shell)
 
     def _paint_meeting(self, p: QPainter, w: int, h: int) -> None:
         """Meeting capture overlay: live transcript + action items queue."""
@@ -941,37 +1025,81 @@ class TranscriptionOverlay(QWidget):
         p.drawText(QRect(pad, sep_y + 4, 120, 18), Qt.AlignmentFlag.AlignLeft, "ACTION ITEMS")
 
         # ── Action items ──────────────────────────────────────────────────────
-        STATUS_COLOR = {
-            "Queued":  DIM,
-            "Running": BLUE,
-            "done":    GREEN,
-            "error":   ERR,
-        }
-        STATUS_LABEL = {
-            "Queued":  "Queued",
-            "Running": "Running…",
-            "done":    "✓ Done",
-            "error":   "✗ Error",
-        }
-
         ay = sep_y + 26
-        for task, status in self._meeting_actions:
-            sc    = STATUS_COLOR.get(status, DIM)
-            label = STATUS_LABEL.get(status, status)
+        for task, status, thumb_path in self._meeting_actions:
+            # "done:$189 on Delta" → green, "✓ $189 on Delta"
+            # "done"              → green, "✓ Done"
+            # "Running"           → blue (pulses via _pulse_on)
+            # "error"             → red
+            sl = status.lower()
+            if sl.startswith("done:"):
+                sc    = GREEN
+                label = "✓ " + status[5:][:32]
+            elif sl == "done":
+                sc    = GREEN
+                label = "✓ Done"
+            elif sl == "running":
+                sc    = BLUE if self._pulse_on else QColor(100, 180, 255, 120)
+                label = "Running…"
+            elif sl == "error":
+                sc    = ERR
+                label = "✗ Error"
+            elif sl == "queued":
+                sc    = DIM
+                label = "Queued"
+            else:
+                sc    = DIM
+                label = status[:20]
 
             # Subtle row background
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(255, 255, 255, 14))
             p.drawRoundedRect(pad, ay, w - pad * 2, H_ACTION_ROW - 4, 10, 10)
 
+            # Thumbnail (if captured) — painted on the right before the status label.
+            thumb_right = w - pad - 8
+            status_right_edge = thumb_right
+            if thumb_path:
+                pix = self._thumb_cache.get(thumb_path)
+                if pix is None or pix.isNull():
+                    loaded = QPixmap(thumb_path)
+                    if not loaded.isNull():
+                        pix = loaded
+                        self._thumb_cache[thumb_path] = loaded
+                if pix is not None and not pix.isNull():
+                    thumb_x = thumb_right - THUMB_W
+                    thumb_y = ay + (H_ACTION_ROW - 4 - THUMB_H) // 2
+                    thumb_path_rect = QPainterPath()
+                    thumb_path_rect.addRoundedRect(
+                        QRect(thumb_x, thumb_y, THUMB_W, THUMB_H), 6, 6
+                    )
+                    p.save()
+                    p.setClipPath(thumb_path_rect)
+                    scaled = pix.scaled(
+                        THUMB_W, THUMB_H,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    ox = (scaled.width()  - THUMB_W) // 2
+                    oy = (scaled.height() - THUMB_H) // 2
+                    p.drawPixmap(thumb_x - ox, thumb_y - oy, scaled)
+                    p.restore()
+                    # Thin border so the thumb reads as a clickable tile.
+                    p.setPen(QPen(QColor(255, 255, 255, 80), 1))
+                    p.setBrush(Qt.BrushStyle.NoBrush)
+                    p.drawPath(thumb_path_rect)
+                    status_right_edge = thumb_x - 6
+
             p.setPen(FG)
             p.setFont(self._font_small)
-            p.drawText(QRect(pad + 12, ay + 2, w - 140, H_ACTION_ROW - 6),
+            # Task label — leave room for status and thumb on the right.
+            task_right_pad = (w - status_right_edge) + 110
+            p.drawText(QRect(pad + 10, ay + 2, w - task_right_pad, H_ACTION_ROW - 6),
                        int(Qt.AlignmentFlag.AlignLeft) | int(Qt.AlignmentFlag.AlignVCenter),
                        task)
 
             p.setPen(sc)
-            p.drawText(QRect(w - 118, ay + 2, 98, H_ACTION_ROW - 6),
+            p.drawText(QRect(status_right_edge - 100, ay + 2, 100, H_ACTION_ROW - 6),
                        int(Qt.AlignmentFlag.AlignRight) | int(Qt.AlignmentFlag.AlignVCenter),
                        label)
 

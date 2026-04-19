@@ -197,6 +197,21 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     speak(reply or "I didn't catch that.")
                     return
 
+                # 2.7 — Multi-action quick path. If a single utterance
+                # packs multiple actions ("email Korin AND book a flight"),
+                # run the Gemma extractor to split them and fire each one
+                # in parallel through the shared browser client. Skips for
+                # browser-shaped / find-file intents, which have specific
+                # flows.
+                if (
+                    not _is_browser_intent(intent)
+                    and intent.goal.value not in ("find_file",)
+                    and _is_multi_action_candidate(transcript)
+                ):
+                    handled = await _run_quick_multi_action(transcript, overlay, menu_bar)
+                    if handled:
+                        return
+
                 # 3 — Execute (known intent)
                 print("[3/3] Executing...")
                 menu_bar.set_status("running")
@@ -621,11 +636,24 @@ def _is_session_reset(transcript: str) -> bool:
 
 
 def _is_browser_intent(intent) -> bool:
-    """Cold-start heuristic: does this utterance belong to the browser session?"""
+    """Cold-start heuristic: does this utterance belong to the browser session?
+
+    Email/message intents route here too — we want *progressive drafting*:
+    first utterance opens Gmail/Messages with the recipient; follow-up
+    utterances are appended to the draft via the persistent session. Avoid
+    the vision-first orchestrator for these, which tries to compose from
+    screenshots of the desktop.
+    """
     from intent.schema import KnownGoal
     if getattr(intent, "requires_browser", False):
         return True
-    return intent.goal in {KnownGoal.OPEN_URL, KnownGoal.APPLY_TO_JOB}
+    return intent.goal in {
+        KnownGoal.OPEN_URL,
+        KnownGoal.APPLY_TO_JOB,
+        KnownGoal.SEND_EMAIL,
+        KnownGoal.SEND_MESSAGE,
+        KnownGoal.ADD_CALENDAR_EVENT,
+    }
 
 
 async def _route_to_browser(transcript: str, orchestrator, overlay, menu_bar) -> None:
@@ -771,15 +799,306 @@ async def _run_meeting_capture(overlay, menu_bar) -> None:
     def _on_action_done(task: str, status: str) -> None:
         overlay.push("meeting_action_update", f"{task}|{status}")
 
-    capture = MeetingCapture(_on_interim, _on_final, _on_action_found, _on_action_done)
+    # Share a single persistent browser client with every action item. The
+    # lock serializes access so concurrent items queue rather than fight
+    # over the single Chrome session.
+    # Assumption: voice-mode's _route_to_browser is not invoked while a
+    # meeting is active — the backtick/wake paths route to capture.stop()
+    # during meetings, so no contention on this client.
+    browser_client = _get_meeting_browser_client()
+    browser_lock = asyncio.Lock()
+
+    capture = MeetingCapture(
+        _on_interim, _on_final, _on_action_found, _on_action_done,
+        browser_client=browser_client,
+        browser_lock=browser_lock,
+    )
     _active_meeting = capture
     try:
-        await capture.run()
+        results = await capture.run()
     finally:
         _active_meeting = None
         overlay.push("meeting_stop")
         menu_bar.set_status("ready")
         print("[meeting] Session ended")
+
+    # End-of-meeting spoken briefing
+    from voice.speak import speak
+    if results:
+        briefing = await _meeting_briefing(results, capture.full_transcript)
+    else:
+        briefing = "Meeting captured. No action items were detected."
+    overlay.push("assistant", briefing)
+    speak(briefing)
+
+    # Per-action confirmation dialog. Only fires for actions whose executor
+    # set a confirm_prompt (e.g. drafted emails). Each confirmation runs as
+    # a separate browser task through the same shared client.
+    await _run_confirmation_dialog(
+        capture.confirmables, overlay, browser_client, browser_lock
+    )
+
+
+_ACTION_VERBS = (
+    "email", "send", "message", "text", "mail",
+    "book", "find", "search", "draft", "schedule",
+    "call", "reply", "open", "order", "buy",
+)
+
+
+def _is_multi_action_candidate(transcript: str) -> bool:
+    """Cheap heuristic: ≥2 action verbs + conjunction suggests a multi-item utterance."""
+    t = (transcript or "").lower()
+    if " and " not in t and "," not in t:
+        return False
+    verbs_seen = sum(1 for v in _ACTION_VERBS if v in t)
+    return verbs_seen >= 2
+
+
+async def _run_quick_multi_action(transcript: str, overlay, menu_bar) -> bool:
+    """
+    Extract action items from a single utterance and run them in parallel
+    through the shared browser client (same pipeline as meeting mode).
+
+    Returns True if we handled the utterance (≥1 extracted item); False
+    lets the caller fall back to single-intent execution.
+    """
+    from intent.meeting_intelligence import extract_action_items
+    from executors.meeting_tasks import search_flight, draft_email_in_gmail, TaskResult
+    from voice.speak import speak
+
+    print(f"[multi-action] extracting tasks from: {transcript[:80]}")
+    items = await extract_action_items(transcript, [])
+    if not items:
+        print("[multi-action] no items extracted — falling back to single-intent")
+        return False
+    if len(items) < 2:
+        print(f"[multi-action] only 1 item — falling back to single-intent")
+        return False
+
+    print(f"[multi-action] {len(items)} items — running through shared client")
+
+    browser_client = _get_meeting_browser_client()
+    browser_lock = asyncio.Lock()
+
+    # Use the meeting overlay to show live chips.
+    menu_bar.set_status("running")
+    overlay.push("meeting_start")
+
+    for item in items:
+        overlay.push("meeting_action", item.get("task", ""))
+
+    results_summary: list[str] = []
+    confirmables: list[TaskResult] = []
+
+    async def _run_one(item: dict) -> None:
+        task_label = item.get("task", "")
+        item_type = item.get("type", "")
+        slots = item.get("slots", {})
+        overlay.push("meeting_action_update", f"{task_label}|Running")
+
+        result: TaskResult | None = None
+        try:
+            if item_type == "book_flight":
+                dest = slots.get("destination") or "Los Angeles"
+                date = slots.get("date") or "Tuesday"
+                origin = slots.get("origin") or ""
+                result = await search_flight(
+                    browser_client, browser_lock, dest, date, origin,
+                )
+            elif item_type == "draft_email":
+                recipient = slots.get("recipient") or ""
+                subject = slots.get("subject") or "Follow-up"
+                key_points = slots.get("key_points") or ""
+                body = (
+                    key_points
+                    or f"Hi {recipient},\n\nFollowing up per our conversation."
+                )
+                result = await draft_email_in_gmail(
+                    browser_client, browser_lock, recipient, subject, body,
+                )
+            else:
+                result = TaskResult(False, "unsupported", detail=f"type={item_type}")
+        except Exception as e:
+            print(f"[multi-action] {task_label} failed: {e}")
+            overlay.push("meeting_action_update", f"{task_label}|error")
+            return
+
+        overlay.push("meeting_action_update", f"{task_label}|{result.status_label()}")
+        if result.success:
+            results_summary.append(f"{task_label}: {result.summary}")
+            if result.confirm_prompt:
+                confirmables.append(result)
+            # Capture a Chrome thumbnail for the overlay. Non-fatal on error.
+            try:
+                from ui.screenshot_feed import capture_browser_thumb
+                loop = asyncio.get_event_loop()
+                path = await loop.run_in_executor(
+                    None, capture_browser_thumb, task_label
+                )
+                if path:
+                    overlay.push("meeting_action_update", f"{task_label}|thumb:{path}")
+            except Exception as e:
+                print(f"[multi-action] thumb capture failed: {e}")
+
+    # Run items concurrently. The shared lock inside meeting_tasks serializes
+    # the actual browser calls, so this is effectively a queue — but the
+    # overlay still sees all chips flip to Running at once and they complete
+    # in finish-order, which reads as parallel to the user.
+    await asyncio.gather(*(_run_one(it) for it in items))
+
+    overlay.push("meeting_stop")
+    menu_bar.set_status("ready")
+
+    # Briefing
+    if results_summary:
+        briefing = await _meeting_briefing(results_summary, transcript)
+    else:
+        briefing = "All done."
+    overlay.push("assistant", briefing)
+    speak(briefing)
+
+    # Confirmation dialog — same one meeting mode uses.
+    await _run_confirmation_dialog(confirmables, overlay, browser_client, browser_lock)
+    return True
+
+
+# Lazily-obtained reference to the orchestrator's persistent browser client.
+# Kept as a module global so every meeting session reuses the same Node
+# subprocess instead of spawning one per action.
+_meeting_browser_client = None
+
+
+def _get_meeting_browser_client():
+    """Return a LocalAgentClient, constructing one on first use."""
+    global _meeting_browser_client
+    if _meeting_browser_client is None:
+        from executors.browser.agent_client import LocalAgentClient
+        _meeting_browser_client = LocalAgentClient()
+    return _meeting_browser_client
+
+
+async def _run_confirmation_dialog(
+    confirmables: list,
+    overlay,
+    browser_client,
+    browser_lock: asyncio.Lock,
+) -> None:
+    """
+    After the briefing, walk each confirmable action:
+      1. TTS the confirm_prompt
+      2. Listen briefly (~5s) for yes/no via Deepgram
+      3. On yes → run confirm_task through the shared browser client
+    """
+    if not confirmables:
+        return
+
+    from voice.speak import speak
+    from voice.listen_brief import listen_brief
+
+    for item in confirmables:
+        prompt = item.confirm_prompt
+        if not prompt:
+            continue
+
+        print(f"[confirm] {prompt}")
+        overlay.push("assistant", prompt)
+        speak(prompt)
+        # Small gap so TTS finishes before Deepgram starts capturing.
+        await asyncio.sleep(0.4)
+
+        try:
+            reply = await listen_brief(timeout=6.0)
+        except Exception as e:
+            print(f"[confirm] listen failed: {e}")
+            reply = ""
+
+        decision = _interpret_yes_no(reply)
+        print(f'[confirm] heard "{reply}" → {decision}')
+
+        if decision is True and item.confirm_task:
+            import uuid as _uuid
+            session_id = f"confirm-{_uuid.uuid4().hex[:8]}"
+            overlay.push("action", f"Sending…")
+            try:
+                async with browser_lock:
+                    handle = await browser_client.run_task(
+                        item.confirm_task, session_id
+                    )
+                    status = await browser_client.poll_until_paused_or_terminal(
+                        handle.id, max_wait=60.0
+                    )
+                if status.state == "complete":
+                    msg = (status.answer or "Sent.").strip()[:200]
+                    overlay.push("assistant", msg)
+                    speak(msg)
+                else:
+                    err = status.error or status.state
+                    print(f"[confirm] send failed: {err}")
+                    overlay.push("error", f"Send failed: {err[:80]}")
+                    speak("I couldn't send it.")
+            except Exception as e:
+                print(f"[confirm] send exception: {e}")
+                overlay.push("error", f"Send error: {e}")
+                speak("I couldn't send it.")
+        elif decision is False:
+            overlay.push("assistant", "Okay, leaving it as a draft.")
+            speak("Okay, leaving it as a draft.")
+        else:
+            overlay.push("assistant", "I didn't catch that — leaving it as a draft.")
+            speak("I didn't catch that, so I'll leave it as a draft.")
+
+
+_YES_WORDS = {"yes", "yeah", "yep", "yup", "sure", "send", "send it",
+              "do it", "please", "okay", "ok", "go ahead", "confirm"}
+_NO_WORDS  = {"no", "nope", "nah", "cancel", "don't", "dont",
+              "leave it", "not now", "keep it", "not yet"}
+
+
+def _interpret_yes_no(text: str) -> bool | None:
+    """Return True=yes, False=no, None=unclear."""
+    t = (text or "").strip().lower().rstrip(".!?")
+    if not t:
+        return None
+    # Prefer longer matches first.
+    for phrase in sorted(_NO_WORDS, key=len, reverse=True):
+        if phrase in t:
+            return False
+    for phrase in sorted(_YES_WORDS, key=len, reverse=True):
+        if phrase in t:
+            return True
+    return None
+
+
+async def _meeting_briefing(results: list[str], transcript: str) -> str:
+    """Use Gemini to generate a natural spoken end-of-meeting summary."""
+    from config.settings import GEMINI_API_KEY
+    if not GEMINI_API_KEY:
+        return "Meeting done. " + ". ".join(results[:3]) + "."
+
+    items_text = "\n".join(f"- {r}" for r in results)
+    prompt = (
+        "You are Ali, an AI chief of staff. A meeting just ended. "
+        "Summarize what was accomplished in 2-3 natural spoken sentences — "
+        "no markdown, no lists, no 'Certainly!'. Be direct. Mention specific results.\n\n"
+        f"Actions completed:\n{items_text}\n\n"
+        "Spoken summary:"
+    )
+    import asyncio as _aio
+    loop = _aio.get_event_loop()
+    try:
+        from google import genai as _genai  # type: ignore
+        def _call() -> str:
+            client = _genai.Client(api_key=GEMINI_API_KEY)
+            r = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=_genai.types.GenerateContentConfig(temperature=0.3, max_output_tokens=120),
+            )
+            return (r.text or "").strip()
+        return await loop.run_in_executor(None, _call)
+    except Exception:
+        return "Meeting done. " + ". ".join(results[:3]) + "."
 
 
 def _revealed_basename(intent) -> str | None:

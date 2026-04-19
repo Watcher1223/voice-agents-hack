@@ -79,6 +79,8 @@ def stream_transcription_sync(
             sample_rate=SAMPLE_RATE,
         ) as connection:
 
+            from config.vocab import apply_corrections
+
             def _on_message(msg) -> None:
                 if not isinstance(msg, ListenV1Results):
                     return
@@ -87,7 +89,7 @@ def stream_transcription_sync(
                     if not text:
                         return
                     if msg.is_final:
-                        on_final(text)
+                        on_final(apply_corrections(text))
                     else:
                         on_interim(text)
                 except Exception:
