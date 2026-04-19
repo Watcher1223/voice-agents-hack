@@ -363,18 +363,31 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 menu_bar.set_status("running")
                 overlay.push("action", f"Running: {goal_label}…")
 
-                # Flights: build Kiwi URL and open it. No browser agent
-                # needed — Kiwi's results page is all the user wants to see.
+                # Flights: call Kiwi MCP for real structured results. Pick the
+                # cheapest, speak its summary, open Kiwi's booking deeplink.
                 if intent.goal == KnownGoal.FIND_FLIGHTS:
-                    from executors.flights import build_kiwi_url
+                    from executors.flights import search_flights, format_flight_summary, FlightSearchError
                     try:
-                        url = build_kiwi_url(intent.slots)
-                    except ValueError as e:
-                        overlay.push("error", f"Can't build flight search: {e}")
-                        speak("I didn't catch the origin or destination.")
+                        flights = await search_flights(intent.slots)
+                    except FlightSearchError as e:
+                        overlay.push("error", f"Flight search failed: {e}")
+                        speak(str(e))
                         return
-                    _open_url_local(url)
-                    overlay.push("done", f"Opened {url}")
+                    except Exception as e:
+                        overlay.push("error", f"Flight search error: {e}")
+                        speak("I couldn't reach the flight search service.")
+                        return
+                    if not flights:
+                        overlay.push("done", "No flights found")
+                        speak("I couldn't find any flights for that route.")
+                        return
+                    top = flights[0]
+                    summary = format_flight_summary(top)
+                    overlay.push("done", summary)
+                    speak(f"Found a flight for {top.get('price')} dollars, {summary.split('•')[-1].strip()}.")
+                    deeplink = top.get("deepLink")
+                    if deeplink:
+                        _open_url_local(deeplink)
                     return
 
                 # Browser-shaped intents (open_url, apply_to_job, anything the
