@@ -401,30 +401,29 @@ async def _run_ambient_capture(overlay) -> None:
     from voice.ambient_capture import AmbientCapture
     from voice.speak import speak
     from observer.screen_loop import ScreenObserver
-    from observer.meeting_detect import is_meeting_active
     from observer.agent_log import log as agent_log
     from intent.action_safety import classify as classify_safety
     from config.settings import AMBIENT_SCREEN_ENABLED, AMBIENT_SPEAK_ENABLED
     import time
 
+    # Voice is off by default. Flip VOICE_AGENT_AMBIENT_SPEAK=1 to re-enable
+    # tier 1/2 spoken readback. (Meeting-detect gate removed — too finicky.)
     def _should_speak() -> bool:
-        # Voice is off by default; and off whenever we're in a live meeting
-        # (Zoom / Meet / Slack huddle / Teams / Discord voice / Webex).
-        if not AMBIENT_SPEAK_ENABLED:
-            return False
-        if screen is not None:
-            ctx = screen.latest_context()
-            if is_meeting_active(ctx.app, ctx.window_title):
-                return False
-        return True
+        return AMBIENT_SPEAK_ENABLED
 
     agent_loop = asyncio.get_running_loop()
 
     def _on_interim(text: str) -> None:
-        overlay.push("meeting_interim", text[:120])
+        # Ambient doesn't want to flood the overlay with every partial word.
+        # Interim goes to the log/console only; the pill updates on finals
+        # and on tier surfaces.
+        pass
 
     def _on_final(text: str) -> None:
-        overlay.push("meeting_final", text[:200])
+        # Show the most recent committed utterance as a small transcript
+        # line. This keeps the overlay visible between analyses so the user
+        # knows the agent is hearing them.
+        overlay.push("assistant", f"· heard: {text[:160]}")
         # Confirmation listener: if there's a pending action waiting on
         # "yes" / "no", try to consume this final transcript.
         global _pending_confirmation
@@ -510,6 +509,11 @@ async def _run_ambient_capture(overlay) -> None:
         screen = ScreenObserver()
         screen.start()
         print("[ambient] screen observer started (event-driven snapshots)")
+
+    # Show the overlay immediately so the user always has a visible
+    # "Ali is on" indicator — not just when the first suggestion fires.
+    overlay.push("assistant", "Ali listening · ambient on")
+    agent_log("ambient:ready", "overlay pinned")
 
     capture = AmbientCapture(_on_interim, _on_final, _on_suggestion, screen_observer=screen)
     _ambient_capture = capture
