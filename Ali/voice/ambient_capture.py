@@ -123,9 +123,18 @@ class AmbientCapture:
         # treated as direct-address because the user just said a bare
         # "Ali" to get the agent's attention.
         self._direct_armed_until: float = 0.0
+        # Conversation-mode classifier state. Re-detected periodically;
+        # guides the prompt injection. Keyword-based so it's free.
+        from intent.conversation_modes import Mode as _Mode
+        self._mode: _Mode = _Mode.GENERIC
+        self._mode_checked_at_turn: int = 0
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    @property
+    def mode(self):
+        return self._mode
 
     async def run(self) -> None:
         from voice.deepgram_stream import (
@@ -311,6 +320,7 @@ class AmbientCapture:
                 screen_app=screen_app,
                 screen_window_title=screen_title,
                 screen_image_bytes=image,
+                mode=self._mode,
             )
             if result.should_surface():
                 self._previous = result
@@ -341,10 +351,20 @@ class AmbientCapture:
 
     async def _do_analysis(self) -> None:
         from intent.ambient_analysis import analyse
+        from intent.conversation_modes import detect_mode
 
         try:
             with self._lock:
                 history_snapshot = list(self._history)
+                total = len(history_snapshot)
+            # Re-classify conversation mode every 6 committed turns.
+            # Keyword-based so it's free; emit a log line on transition.
+            if total - self._mode_checked_at_turn >= 6 or self._mode_checked_at_turn == 0:
+                new_mode = detect_mode(history_snapshot)
+                if new_mode != self._mode:
+                    _log("mode", f"{self._mode.value} → {new_mode.value}")
+                    self._mode = new_mode
+                self._mode_checked_at_turn = total
             screen_app, screen_title, image = "", "", b""
             if self._screen_observer is not None:
                 ctx = self._screen_observer.latest_context()
@@ -357,6 +377,7 @@ class AmbientCapture:
                 screen_app=screen_app,
                 screen_window_title=screen_title,
                 screen_image_bytes=image,
+                mode=self._mode,
             )
             if result.should_surface():
                 self._previous = result

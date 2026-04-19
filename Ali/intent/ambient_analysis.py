@@ -188,6 +188,7 @@ def _assemble_prompt(
     previous: AmbientAnalysis | None,
     screen_app: str = "",
     screen_window_title: str = "",
+    mode = None,
 ) -> str:
     hist_block = "\n".join(f"- {line}" for line in history) or "(empty)"
     prev_block = previous.raw_json if (previous and previous.raw_json) else "(none)"
@@ -201,14 +202,27 @@ def _assemble_prompt(
             "directly helps answer a question, define a term the user can "
             "see, or suggest an action about what's open."
         )
-    return (
-        f"{_SYSTEM}\n\n"
-        f"{_contacts_block()}\n\n"
-        f"{_HISTORY_PREAMBLE}\n{hist_block}\n\n"
-        f"CURRENT SCREEN CONTEXT:\n{screen_block}\n\n"
-        f"{_PREVIOUS_JSON_PREAMBLE}\n{prev_block}\n\n"
-        "Emit your JSON object now."
-    )
+    # Mode-specific guidance (sales call, meeting, generic). When set,
+    # it appears right after the base system prompt so the tier
+    # classifier sees it before any context.
+    mode_block = ""
+    try:
+        from intent.conversation_modes import guidance_for, Mode
+        if mode is not None:
+            mode_block = guidance_for(mode)
+    except Exception:
+        mode_block = ""
+    parts = [_SYSTEM]
+    if mode_block:
+        parts.append(mode_block)
+    parts.extend([
+        _contacts_block(),
+        f"{_HISTORY_PREAMBLE}\n{hist_block}",
+        f"CURRENT SCREEN CONTEXT:\n{screen_block}",
+        f"{_PREVIOUS_JSON_PREAMBLE}\n{prev_block}",
+        "Emit your JSON object now.",
+    ])
+    return "\n\n".join(parts)
 
 
 async def analyse(
@@ -217,6 +231,7 @@ async def analyse(
     screen_app: str = "",
     screen_window_title: str = "",
     screen_image_bytes: bytes = b"",
+    mode = None,
 ) -> AmbientAnalysis:
     """Run one pass of ambient analysis over the rolling transcript. Returns
     a tier-4 (silent) result on any error so the caller never has to
@@ -230,7 +245,7 @@ async def analyse(
     if not _AVAILABLE or not history:
         return AmbientAnalysis()
 
-    prompt = _assemble_prompt(history, previous, screen_app, screen_window_title)
+    prompt = _assemble_prompt(history, previous, screen_app, screen_window_title, mode)
     loop = asyncio.get_event_loop()
 
     def _call() -> str:
