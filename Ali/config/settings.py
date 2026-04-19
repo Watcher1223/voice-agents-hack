@@ -42,6 +42,10 @@ AGENT_NODE_BIN     = os.getenv("AGENT_NODE_BIN",     "node")
 # be toggled at the command line via env to A/B the two paths live.
 ROUTE_OPENCLI_ENABLED     = os.environ.get("VOICE_AGENT_ROUTE_OPENCLI", "1").lower() in {"1", "true", "yes"}
 ROUTE_BROWSER_TASK_ENABLED = os.environ.get("VOICE_AGENT_ROUTE_BROWSER_TASK", "1").lower() in {"1", "true", "yes"}
+# Ambient mode: run Deepgram from boot + glass-style intent detection that
+# surfaces suggestions every 5 final transcripts (not 12s wall-clock). Off
+# by default so push-to-talk keeps working without a live mic stream.
+AMBIENT_ENABLED = os.environ.get("VOICE_AGENT_AMBIENT", "0").lower() in {"1", "true", "yes"}
 # OpenCLI requires Node >= 22.19. Bypass the shebang and invoke node+entry
 # directly so a stale `env node` in PATH can't resolve to an older version.
 OPENCLI_NODE_BIN = os.environ.get(

@@ -93,6 +93,13 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
     from voice.capture import listen_for_command, request_ptt_session_from_wake
     from voice.wake_word import start_wake_word_listener
 
+    # Ambient listen loop (glass-style) runs in parallel with PTT when the
+    # flag is on. It does NOT intercept user commands — it only surfaces
+    # suggestions (tier 1-3) into the overlay. PTT still works.
+    from config.settings import AMBIENT_ENABLED
+    if AMBIENT_ENABLED:
+        agent_loop.create_task(_run_ambient_capture(overlay))
+
     async def _handle_transcript(transcript: str) -> None:
         async with command_lock:
             try:
@@ -366,6 +373,47 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
 
 
 _active_meeting: "MeetingCapture | None" = None  # type: ignore[name-defined]
+
+# Ambient listen (glass-style) — runs forever in background when
+# VOICE_AGENT_AMBIENT=1. Does not own user commands; only surfaces
+# suggestions via the overlay.
+_ambient_capture: "AmbientCapture | None" = None  # type: ignore[name-defined]
+
+
+async def _run_ambient_capture(overlay) -> None:
+    global _ambient_capture
+    from voice.ambient_capture import AmbientCapture
+    from voice.speak import speak
+
+    def _on_interim(text: str) -> None:
+        # Feather-light: just update the overlay's transcribing line so
+        # the user sees "I'm listening."
+        overlay.push("meeting_interim", text[:120])
+
+    def _on_final(text: str) -> None:
+        overlay.push("meeting_final", text[:200])
+
+    def _on_suggestion(analysis) -> None:
+        tier = analysis.tier
+        headline = analysis.headline.strip()
+        detail = (analysis.detail or headline).strip()
+        print(f"[ambient][tier-{tier}] {headline}")
+        overlay.push("assistant", headline[:200])
+        # Speak only tiers 1-2 (answer / define) to avoid audio spam for
+        # every suggested action. Tier-3 (suggest action) shows silently
+        # on the overlay; user can follow up with voice to execute.
+        if tier in (1, 2) and detail:
+            speak(detail[:400])
+
+    capture = AmbientCapture(_on_interim, _on_final, _on_suggestion)
+    _ambient_capture = capture
+    print("[ambient] starting glass-style listen loop (every 5 finals → analyse)")
+    try:
+        await capture.run()
+    except Exception as e:
+        print(f"[ambient] loop crashed: {e}")
+    finally:
+        _ambient_capture = None
 
 # Persistent browser sub-agent session. One session spans many voice
 # utterances so follow-ups ("now open my inbox", "reply to this person")

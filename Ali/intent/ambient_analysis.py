@@ -1,0 +1,191 @@
+"""Ambient-mode intent analysis.
+
+Unlike `meeting_intelligence` (which only extracts action items), this module
+runs glass-style: every N final transcripts, it analyses the rolling window
+and decides whether to *surface something* to the user — a recent question's
+answer, a term that just got dropped, a visible problem, or silence.
+
+The decision hierarchy is ported from pickle-com/glass
+(`src/features/listen/summary/summaryService.js` + `prompts/promptTemplates`).
+Their insight: the prompt IS the gate — if the LLM sees nothing to say, it
+emits the explicit 'stay silent' tier and we don't bother the user.
+
+Output is JSON so we can route tier-3 suggestions into the existing
+opencli / browser_task execution paths instead of just speaking text.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+from config.settings import GEMINI_API_KEY
+
+try:
+    from google import genai as _genai  # type: ignore
+    _AVAILABLE = bool(GEMINI_API_KEY)
+except ImportError:
+    _AVAILABLE = False
+
+
+_SYSTEM = """\
+You are an ambient AI assistant. You see a rolling transcript of what the
+user is saying (and people they're talking to) and decide whether to
+surface a short helpful note — or stay silent.
+
+Apply this decision hierarchy IN ORDER. Stop at the first tier that fires.
+
+  TIER 1 — answer a recent question.
+    If the transcript contains an unanswered factual question the user
+    would benefit from an answer to right now. Example triggers:
+      - "what is IRR again?"
+      - "when did OpenAI raise their Series C?"
+      - "who founded YC?"
+
+  TIER 2 — define a recent proper noun or jargon term.
+    The term has to be non-obvious and freshly introduced. Prefer to
+    surface over staying silent when a real term appeared. Examples that
+    should fire tier 2:
+      - "constitutional AI" (technique)
+      - "Series C" if introduced without context
+      - any acronym whose meaning isn't in the transcript
+
+  TIER 3 — suggest a concrete action.
+    The conversation implies the user should do something NOW (send an
+    email, open a site, find a file). Proposed action should be
+    executable by one of: opencli adapter, browser task, local desktop.
+
+  TIER 4 — stay silent.
+    Nothing above fires, or you would be repeating yourself.
+
+OUTPUT SCHEMA — emit a SINGLE JSON object. No prose. No markdown fences.
+Required keys:
+  tier:       integer 1-4
+  headline:   string, <=100 chars. MUST be non-empty for tiers 1-3,
+              MUST be empty string for tier 4.
+  detail:     string, 1-2 sentences. MUST be non-empty for tiers 1-2,
+              may be empty for tiers 3/4.
+  action_kind: string — one of "opencli","browser_task","local","none".
+              Use "none" for tiers 1/2/4.
+  action_text: string — the concrete action. For opencli, a space-
+              separated command like "wikipedia search IRR".
+              For browser_task, a one-sentence task.
+              For local, a goal name like "send_email" or "find_file".
+              Empty string when action_kind="none".
+
+Rules:
+- Do NOT repeat anything in the previous analysis if one is provided.
+  When in doubt, emit tier 4 over repetition.
+- Headlines are user-facing. No filler ("I think…", "It seems…").
+- Keep to one JSON object on one line when practical."""
+
+
+@dataclass
+class AmbientAnalysis:
+    tier: int = 4
+    headline: str = ""
+    detail: str = ""
+    action: dict[str, Any] | None = None
+    raw_json: str = ""
+
+    def should_surface(self) -> bool:
+        return self.tier in (1, 2, 3) and bool(self.headline.strip())
+
+
+_PREVIOUS_JSON_PREAMBLE = "PREVIOUS ANALYSIS (do not repeat):"
+_HISTORY_PREAMBLE       = "ROLLING TRANSCRIPT (oldest → newest):"
+
+
+def _best_effort_json(raw: str) -> tuple[dict[str, Any] | None, str]:
+    """Strip markdown fences, then try strict json.loads. If that fails,
+    find the outermost {…} block and parse just that. Returns (parsed,
+    cleaned_text) or (None, cleaned_text) on complete failure."""
+    cleaned = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(cleaned), cleaned
+    except json.JSONDecodeError:
+        pass
+    # Find the first balanced {…} in the cleaned text.
+    depth = 0
+    start = -1
+    for i, ch in enumerate(cleaned):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                snippet = cleaned[start:i + 1]
+                try:
+                    return json.loads(snippet), snippet
+                except json.JSONDecodeError:
+                    start = -1
+                    continue
+    return None, cleaned
+
+
+def _assemble_prompt(history: list[str], previous: AmbientAnalysis | None) -> str:
+    hist_block = "\n".join(f"- {line}" for line in history) or "(empty)"
+    prev_block = previous.raw_json if (previous and previous.raw_json) else "(none)"
+    return (
+        f"{_SYSTEM}\n\n"
+        f"{_HISTORY_PREAMBLE}\n{hist_block}\n\n"
+        f"{_PREVIOUS_JSON_PREAMBLE}\n{prev_block}\n\n"
+        "Emit your JSON object now."
+    )
+
+
+async def analyse(
+    history: list[str],
+    previous: AmbientAnalysis | None = None,
+) -> AmbientAnalysis:
+    """Run one pass of ambient analysis over the rolling transcript. Returns
+    a tier-4 (silent) result on any error so the caller never has to
+    exception-handle — ambient must fail quiet."""
+    if not _AVAILABLE or not history:
+        return AmbientAnalysis()
+
+    prompt = _assemble_prompt(history, previous)
+    loop = asyncio.get_event_loop()
+
+    def _call() -> str:
+        client = _genai.Client(api_key=GEMINI_API_KEY)
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=_genai.types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=2048,
+                response_mime_type="application/json",
+            ),
+        )
+        return (resp.text or "").strip()
+
+    try:
+        raw = await loop.run_in_executor(None, _call)
+        data, cleaned = _best_effort_json(raw)
+        if data is None:
+            raise ValueError("no parseable JSON object in response")
+    except Exception as e:
+        snippet = (raw[:160] if "raw" in locals() else "").replace("\n", " ")
+        print(f"[ambient] analyse failed: {e} — raw={snippet!r}")
+        return AmbientAnalysis()
+
+    tier = int(data.get("tier", 4))
+    headline = str(data.get("headline") or "").strip()
+    detail = str(data.get("detail") or "").strip()
+    kind = str(data.get("action_kind") or "none").strip().lower()
+    action_text = str(data.get("action_text") or "").strip()
+    action: dict[str, Any] | None = None
+    if kind != "none" and action_text:
+        action = {"kind": kind, "text": action_text}
+    return AmbientAnalysis(
+        tier=tier if 1 <= tier <= 4 else 4,
+        headline=headline,
+        detail=detail,
+        action=action,
+        raw_json=cleaned,
+    )
