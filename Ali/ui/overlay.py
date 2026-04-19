@@ -4,14 +4,40 @@ Liquid glass overlay — Apple-style frosted pill, top-center, expands downward.
 
 from __future__ import annotations
 
+import datetime
 import queue
+import threading
 
-from PySide6.QtCore import QPoint, QRect, Qt, QTimer  # pyright: ignore[reportMissingImports]
+import cv2  # type: ignore[reportMissingImports]
+
+from PySide6.QtCore import QPoint, QRect, Qt, QTimer, Signal, QObject  # pyright: ignore[reportMissingImports]
 from PySide6.QtGui import (  # pyright: ignore[reportMissingImports]
-    QBrush, QColor, QFont, QGuiApplication, QLinearGradient,
-    QPainter, QPainterPath, QPen,
+    QBrush, QColor, QFont, QGuiApplication, QImage, QLinearGradient,
+    QPainter, QPainterPath, QPen, QPixmap,
 )
 from PySide6.QtWidgets import QApplication, QWidget  # pyright: ignore[reportMissingImports]
+
+_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
+W_WAKE  = 560
+H_WAKE  = 200
+CAM_W   = 160
+CAM_H   = 160
+USER_NAME = "Alspencer"
+
+
+def _time_greeting() -> str:
+    h = datetime.datetime.now().hour
+    if h < 12:   return "Good morning"
+    if h < 17:   return "Good afternoon"
+    return "Good evening"
+
+
+class _CamBridge(QObject):
+    frame_ready = Signal(QImage)
+    greeted     = Signal()
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 FG          = QColor(246, 246, 250)       # primary text on liquid glass
@@ -58,6 +84,7 @@ def _apply_macos_overlay(win: QWidget) -> None:
 
         if ns_win is not None:
             ns_win.setLevel_(25)
+            # 1=CanJoinAllSpaces 16=IgnoresCycle 256=FullScreenAuxiliary
             ns_win.setCollectionBehavior_(1 | 16 | 256)
             ns_win.setOpaque_(False)
             ns_win.setBackgroundColor_(NSColor.clearColor())
@@ -70,6 +97,7 @@ def _apply_macos_overlay(win: QWidget) -> None:
             effect.setAutoresizingMask_(18)
             # No forced appearance — inherit system so blur stays subtle
             content.addSubview_positioned_relativeTo_(effect, 0, None)
+            win._ns_window = ns_win  # type: ignore[attr-defined]
             win._ns_effect = effect  # type: ignore[attr-defined]
             win._vibrancy_active = True  # type: ignore[attr-defined]
             print("[overlay] liquid glass vibrancy active")
@@ -107,11 +135,20 @@ class TranscriptionOverlay(QWidget):
         self._drag_offset: QPoint | None = None
         self._pulse_on = True
         self._recording = False
+        # wake / call state
+        self._wake_mode   = False
+        self._wake_greeted = False
+        self._wake_text   = ""
+        self._cam_pixmap  = QPixmap()
+        self._cam_bridge  = _CamBridge()
+        self._cam_running = False
+        self._cam_bridge.frame_ready.connect(self._on_cam_frame)
+        self._cam_bridge.greeted.connect(self._on_wake_greeted)
 
-        self._font_label = QFont("SF Pro Display", 15, QFont.Weight.Bold)
-        self._font_body  = QFont("SF Pro Text", 14)
-        self._font_small = QFont("SF Pro Text", 12)
-        self._font_close = QFont("SF Pro Text", 16, QFont.Weight.Medium)
+        self._font_label = QFont(".AppleSystemUIFont", 15, QFont.Weight.Bold)
+        self._font_body  = QFont(".AppleSystemUIFont", 14)
+        self._font_small = QFont(".AppleSystemUIFont", 12)
+        self._font_close = QFont(".AppleSystemUIFont", 16, QFont.Weight.Medium)
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -181,6 +218,96 @@ class TranscriptionOverlay(QWidget):
 
     # ── State ────────────────────────────────────────────────────────────────
 
+    def _on_cam_frame(self, img: QImage) -> None:
+        self._cam_pixmap = QPixmap.fromImage(img)
+        self.update()
+
+    def _on_wake_greeted(self) -> None:
+        self._wake_greeted = True
+        self.update()
+        # Stay visible until user dismisses (× button or Space + Right Option)
+
+    def _end_wake(self) -> None:
+        self._cam_running = False
+        self._wake_mode = False
+        self._wake_greeted = False
+        self._wake_text = ""
+        self.hide()
+
+    def _start_camera(self) -> None:
+        import time
+        self._cam_running = True
+
+        def _prepare_tts(text: str) -> "str | None":
+            import os, tempfile
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            if api_key:
+                try:
+                    from openai import OpenAI  # type: ignore[reportMissingImports]
+                    client = OpenAI(api_key=api_key)
+                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                        path = f.name
+                    with client.audio.speech.with_streaming_response.create(
+                        model="tts-1-hd", voice="nova", input=text, speed=1.0,
+                    ) as resp:
+                        resp.stream_to_file(path)
+                    return path
+                except Exception as e:
+                    print(f"[tts] OpenAI failed: {e} — falling back to say")
+            return None
+
+        def _play_tts(path: "str | None", text: str) -> None:
+            import os, subprocess
+            if path:
+                subprocess.run(["afplay", path], check=True)
+                os.unlink(path)
+            else:
+                subprocess.run(["say", "-v", "Flo (English (US))", "-r", "160", text])
+
+        def _loop() -> None:
+            cap = cv2.VideoCapture(0)
+            face_first: float | None = None
+            greeted = False
+            tts_started = False
+            greeting = (
+                f"{_time_greeting()}, {USER_NAME}. "
+                "While you were asleep I've been busy — "
+                "I found some great opportunities and took care of a few things. "
+                "Let me walk you through them."
+            )
+
+            while self._cam_running:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame = cv2.flip(frame, 1)
+                grey  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = _CASCADE.detectMultiScale(grey, 1.1, 5, minSize=(60, 60))
+
+                if len(faces) > 0 and not greeted and not tts_started:
+                    if face_first is None:
+                        face_first = time.time()
+                    if time.time() - face_first >= 1.2:
+                        greeted = True
+                        tts_started = True
+                        def _greet_sync(g=greeting) -> None:
+                            # Pre-generate audio first, then show text + play simultaneously
+                            audio_path = _prepare_tts(g)
+                            self._cam_bridge.greeted.emit()
+                            threading.Thread(target=_play_tts, args=(audio_path, g), daemon=True).start()
+                        threading.Thread(target=_greet_sync, daemon=True).start()
+                elif not greeted and not tts_started:
+                    face_first = None
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                fh, fw = rgb.shape[:2]
+                img = QImage(rgb.data, fw, fh, fw * 3, QImage.Format.Format_RGB888).copy()
+                self._cam_bridge.frame_ready.emit(img)
+
+            cap.release()
+
+        threading.Thread(target=_loop, daemon=True).start()
+
     def _apply(self, state: str, text: str) -> None:
         self._autohide_timer.stop()
         self._pulse_timer.stop()
@@ -189,11 +316,22 @@ class TranscriptionOverlay(QWidget):
             self._do_hide()
             return
 
+        if state == "wake":
+            self._wake_mode = True
+            self._wake_greeted = False
+            self._wake_text = ""
+            self._reposition(W_WAKE, H_WAKE)
+            self.show()
+            self.raise_()
+            self._start_camera()
+            return
+
         if state == "recording":
             self._history.clear()
             self._recording = True
             self._pulse_on = True
-            self._set_size(W_PILL, H_PILL)
+            if not self._wake_mode:
+                self._set_size(W_PILL, H_PILL)
             self.show()
             self.raise_()
             self._pulse_timer.start(PULSE_MS)
@@ -221,8 +359,7 @@ class TranscriptionOverlay(QWidget):
 
         self._history = self._history[-MAX_HIST:]
         self._set_size(W_FULL, self._calc_height())
-        self.show()
-        self.raise_()
+        self._present()
         self.update()
 
     def _calc_height(self) -> int:
@@ -256,6 +393,11 @@ class TranscriptionOverlay(QWidget):
 
         shell = QPainterPath()
         shell.addRoundedRect(QRect(0, 0, w, h), R, R)
+
+        # ── Wake / call mode — camera feed + greeting ────────────────────────
+        if self._wake_mode:
+            self._paint_wake(p, w, h, shell)
+            return
 
         # ── 1. Soft drop shadow (two offset layers for bloom) ─────────────────
         for offset, alpha in ((4, 14), (2, 8)):
@@ -314,6 +456,72 @@ class TranscriptionOverlay(QWidget):
             "Listening...",
         )
 
+    def _paint_wake(self, p: QPainter, w: int, h: int, shell: QPainterPath) -> None:
+        # Glass background
+        p.fillPath(shell, QColor(18, 18, 22, 210))
+        border = QLinearGradient(0, 0, 0, h)
+        border.setColorAt(0, QColor(255, 255, 255, 70))
+        border.setColorAt(1, QColor(255, 255, 255, 20))
+        p.setPen(QPen(QBrush(border), 1.2))
+        p.drawPath(shell)
+
+        pad = 16
+        cam_x, cam_y = pad, (h - CAM_H) // 2
+
+        # Camera feed (rounded)
+        if not self._cam_pixmap.isNull():
+            cam_path = QPainterPath()
+            cam_path.addRoundedRect(QRect(cam_x, cam_y, CAM_W, CAM_H), 14, 14)
+            p.setClipPath(cam_path)
+            scaled = self._cam_pixmap.scaled(
+                CAM_W, CAM_H,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            ox = (scaled.width()  - CAM_W) // 2
+            oy = (scaled.height() - CAM_H) // 2
+            p.drawPixmap(cam_x - ox, cam_y - oy, scaled)
+            p.setClipping(False)
+            p.setPen(QPen(QColor(255, 255, 255, 50), 1))
+            p.drawPath(cam_path)
+        else:
+            p.fillRect(QRect(cam_x, cam_y, CAM_W, CAM_H), QColor(40, 40, 44))
+
+        # Recording indicator (top-right corner when listening)
+        if self._recording:
+            dot_color = RED if self._pulse_on else QColor(200, 80, 76, 80)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(dot_color)
+            p.drawEllipse(QPoint(w - 20, 16), 6, 6)
+            p.setPen(DIM)
+            p.setFont(self._font_small)
+            p.drawText(QRect(w - 110, 8, 82, 16), Qt.AlignmentFlag.AlignRight, "Listening…")
+
+        # Text area (right of camera)
+        tx = cam_x + CAM_W + pad
+        tw = w - tx - pad
+
+        if not self._wake_greeted:
+            p.setPen(DIM)
+            p.setFont(self._font_small)
+            p.drawText(QRect(tx, cam_y + 10, tw, 30), Qt.AlignmentFlag.AlignLeft, "Ali is watching...")
+            # progress dots
+            p.setPen(FG)
+            p.setFont(self._font_body)
+            p.drawText(QRect(tx, cam_y + 50, tw, 30), Qt.AlignmentFlag.AlignLeft, "Detecting face...")
+        else:
+            p.setPen(GREEN)
+            p.setFont(self._font_label)
+            p.drawText(QRect(tx, cam_y + 8, tw, 28), Qt.AlignmentFlag.AlignLeft,
+                       f"{_time_greeting()}, {USER_NAME}!")
+            p.setPen(FG)
+            p.setFont(self._font_small)
+            p.drawText(
+                QRect(tx, cam_y + 44, tw, CAM_H - 50),
+                Qt.TextFlag.TextWordWrap,
+                "While you were asleep I've been busy — I found great opportunities and took care of things.",
+            )
+
     def _draw_mic(self, p: QPainter, cx: int, cy: int) -> None:
         pen = QPen(DIM, 1.8)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -366,3 +574,15 @@ class TranscriptionOverlay(QWidget):
         self._autohide_timer.stop()
         self._recording = False
         self.hide()
+
+    def _present(self) -> None:
+        """
+        Show overlay above the current app/space without activating a new space.
+        """
+        self.show()
+        try:
+            ns_win = getattr(self, "_ns_window", None)
+            if ns_win is not None:
+                ns_win.orderFrontRegardless()
+        except Exception:
+            pass

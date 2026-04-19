@@ -112,6 +112,29 @@ def _run_agent(overlay: "TranscriptionOverlay") -> None:
         loop.close()
 
 
+def _start_wake_listener(overlay: "TranscriptionOverlay") -> None:
+    """Listen for 'Ali' (voice) or backtick (keyboard fallback) to trigger wake."""
+    from pynput import keyboard  # pyright: ignore[reportMissingModuleSource]
+
+    def on_press(key):
+        try:
+            if key.char == "`":
+                overlay.push("wake")  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.daemon = True
+    listener.start()
+    print("[demo] Say 'Ali' or press ` (backtick) to trigger wake scene")
+
+    try:
+        from voice.wake_word import start_wake_word_listener
+        start_wake_word_listener(lambda: overlay.push("wake"))  # type: ignore[attr-defined]
+    except Exception as e:
+        print(f"[demo] Wake word listener failed to start: {e}")
+
+
 # ── Main (Qt on main thread) ──────────────────────────────────────────────────
 
 def main() -> None:
@@ -121,6 +144,8 @@ def main() -> None:
 
     agent_thread = threading.Thread(target=_run_agent, args=(overlay,), daemon=True)
     agent_thread.start()
+
+    _start_wake_listener(overlay)
 
     # Block here on the main thread running the selected UI loop
     run_ui()
