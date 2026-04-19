@@ -42,3 +42,8 @@ Prizes per special track:
 1. Read Cactus docs carefully: [Link](https://docs.cactuscompute.com/latest/)
 2. Read Gemma 4 on Cactus walkthrough carefully: [Link](https://docs.cactuscompute.com/latest/blog/gemma4/)
 3. Cactus & DeepMind team would be available on-site. 
+
+## Submissions
+1. Record a 60s demo video
+2. Submnit [here](https://forms.gle/gi4j5d4cQqkwk9uD7) by 11am 
+3. NO multiple submissions! 
