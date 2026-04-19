@@ -120,6 +120,14 @@ def _speak_openai(text: str) -> bool:
     return True
 
 
+async def wait_for_tts() -> None:
+    """Async-friendly wait until the current TTS playback finishes."""
+    import asyncio
+    await asyncio.sleep(0.15)   # brief pause to let TTS start
+    while tts_active.is_set():
+        await asyncio.sleep(0.1)
+
+
 def speak(text: str, voice: str | None = None, rate: str = DEFAULT_RATE) -> None:
     """Speak `text` asynchronously. Uses OpenAI TTS; falls back to macOS say."""
     if not text or not text.strip():

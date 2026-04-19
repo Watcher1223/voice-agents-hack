@@ -871,6 +871,8 @@ async def _run_find_flights_flow(
         f"{cheapest.get('flyTo', destination)}."
     )
     if n > 0:
+        from voice.speak import wait_for_tts
+        await wait_for_tts()
         cal_label = "events" if n > 1 else "event"
         speak(f"I've added {n} calendar {cal_label} for your trip.")
 
@@ -1362,6 +1364,8 @@ async def _execute_ambient_find_flights(
         f"{cheapest.get('flyTo', destination)}."
     )
     if n > 0:
+        from voice.speak import wait_for_tts
+        await wait_for_tts()
         cal_label = "events" if n > 1 else "event"
         speak(f"I've added {n} calendar {cal_label} for your trip.")
 
