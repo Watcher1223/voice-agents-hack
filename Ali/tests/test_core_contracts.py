@@ -1,6 +1,10 @@
+import asyncio
+import json
 import unittest
+from unittest.mock import patch
 
-from intent.parser import _rule_based_parse
+from intent import parser as intent_parser
+from intent.parser import _parse_json_response, _rule_based_parse, parse_intent
 from intent.schema import IntentObject, KnownGoal
 from orchestrator.orchestrator import _path_for_file_action, _resolve_params
 from orchestrator.plans import get_plan
@@ -21,6 +25,96 @@ class ParserRuleTests(unittest.TestCase):
     def test_calendar_intent_detected(self):
         intent = _rule_based_parse("add calendar event for tomorrow at 3")
         self.assertEqual(intent.goal, KnownGoal.ADD_CALENDAR_EVENT)
+
+
+class ParseIntentPriorityTests(unittest.TestCase):
+    """
+    parse_intent() is LLM-first: Gemini runs when available, Cactus is the
+    offline fallback, and the keyword rules are only a last-ditch fallback.
+    """
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _gemini_payload(self, **overrides):
+        base = {
+            "goal": "find_file",
+            "target": {"type": "file", "value": "resume"},
+            "uses_local_data": [],
+            "requires_browser": False,
+            "requires_submission": False,
+            "slots": {"file_query": "resume"},
+        }
+        base.update(overrides)
+        return json.dumps(base)
+
+    def test_gemini_result_wins_over_rules(self):
+        """Gemini should be consulted first and its answer used, even for
+        transcripts the old rule cascade would have grabbed (e.g. 'apply')."""
+
+        async def fake_gemini(transcript):
+            return _parse_json_response(
+                self._gemini_payload(
+                    goal="unknown",
+                    target={},
+                    uses_local_data=[],
+                    slots={},
+                ),
+                transcript,
+            )
+
+        with patch.object(intent_parser, "GEMINI_AVAILABLE", True), \
+             patch.object(intent_parser, "_parse_with_gemini", side_effect=fake_gemini):
+            intent = self._run(parse_intent("apply the filter to these photos"))
+
+        # Rule-based would have (incorrectly) fired APPLY_TO_JOB; Gemini says unknown.
+        self.assertEqual(intent.goal, KnownGoal.UNKNOWN)
+
+    def test_gemini_error_falls_through_to_rules_when_cactus_missing(self):
+        async def bad_gemini(_):
+            raise RuntimeError("network down")
+
+        with patch.object(intent_parser, "GEMINI_AVAILABLE", True), \
+             patch.object(intent_parser, "CACTUS_AVAILABLE", False), \
+             patch.object(intent_parser, "_parse_with_gemini", side_effect=bad_gemini):
+            intent = self._run(parse_intent("text Hanzi I'll be late"))
+
+        # Rule fallback should still classify this correctly.
+        self.assertEqual(intent.goal, KnownGoal.SEND_MESSAGE)
+
+    def test_rule_fallback_used_when_no_backends_available(self):
+        with patch.object(intent_parser, "GEMINI_AVAILABLE", False), \
+             patch.object(intent_parser, "CACTUS_AVAILABLE", False):
+            intent = self._run(parse_intent("find my 2024 taxes"))
+        self.assertEqual(intent.goal, KnownGoal.FIND_FILE)
+
+
+class ParseJsonResponseTests(unittest.TestCase):
+    def test_unknown_goal_string_coerces_to_unknown_enum(self):
+        raw = json.dumps({"goal": "launch_nukes", "target": {}, "slots": {}})
+        intent = _parse_json_response(raw, "do the thing")
+        self.assertEqual(intent.goal, KnownGoal.UNKNOWN)
+
+    def test_code_fences_are_stripped(self):
+        raw = "```json\n" + json.dumps({"goal": "open_url"}) + "\n```"
+        intent = _parse_json_response(raw, "open gmail")
+        self.assertEqual(intent.goal, KnownGoal.OPEN_URL)
+
+    def test_malformed_json_raises(self):
+        with self.assertRaises(RuntimeError):
+            _parse_json_response("not json at all", "whatever")
+
+    def test_non_object_payload_raises(self):
+        with self.assertRaises(RuntimeError):
+            _parse_json_response(json.dumps(["find_file"]), "whatever")
+
+    def test_field_defaults_applied(self):
+        intent = _parse_json_response(json.dumps({"goal": "find_file"}), "find my resume")
+        self.assertEqual(intent.target, {})
+        self.assertEqual(intent.uses_local_data, [])
+        self.assertEqual(intent.slots, {})
+        self.assertFalse(intent.requires_browser)
+        self.assertFalse(intent.requires_submission)
 
 
 class OrchestratorContractTests(unittest.TestCase):
