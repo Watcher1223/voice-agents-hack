@@ -106,6 +106,10 @@ Goal definitions (read carefully — pick the most specific one):
   slots: {"question": str}
   uses_local_data: ["index"].
 
+- find_flights: search for flights between two cities (e.g. "find flights from SF to Tokyo next weekend", "flights to Paris May 5th", "show me tickets from Boston to London").
+  slots: {"origin": str, "destination": str, "depart_date": "YYYY-MM-DD"?, "return_date": "YYYY-MM-DD"?}
+  requires_browser: false, requires_submission: false.
+
 - unknown: only when none of the above fit.
 
 Examples:
@@ -489,9 +493,95 @@ def _is_knowledge_question(transcript: str) -> bool:
     return any(t.startswith(prefix) for prefix in _KNOWLEDGE_QUESTION_STARTS)
 
 
+_FLIGHT_TRIGGERS = ("flight", "flights", "fly to", "fly from", "ticket to", "tickets to")
+
+
+def _parse_when_phrase(phrase: str, today) -> str | None:
+    """
+    Convert a natural-language date phrase into an absolute YYYY-MM-DD string.
+
+    `today` is a datetime.date (passed in so this stays testable).
+
+    Handle at minimum:
+      - "tomorrow"              → today + 1 day
+      - "next weekend"          → the upcoming Saturday
+      - "in N days" / "in N weeks"
+      - "may 5", "may 5th", "december 2"  (current year, or next year if already past)
+
+    Return None for anything you don't recognise — the caller will just
+    omit the date and Kiwi will show "any date".
+    """
+    import datetime as _dt
+    p = phrase.strip().lower().removeprefix("on ").strip()
+    if p == "tomorrow":
+        return (today + _dt.timedelta(days=1)).isoformat()
+    if "next weekend" in p or p == "weekend":
+        return (today + _dt.timedelta(days=(5 - today.weekday()) % 7 or 7)).isoformat()
+    m = re.match(r"in\s+(\d+)\s+(day|days|week|weeks)", p)
+    if m:
+        n = int(m.group(1)) * (7 if "week" in m.group(2) else 1)
+        return (today + _dt.timedelta(days=n)).isoformat()
+    months = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+    m = re.search(r"\b([a-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\b", p)
+    if m and m.group(1)[:3] in months:
+        mo, day = months[m.group(1)[:3]], int(m.group(2))
+        year = today.year if (mo, day) >= (today.month, today.day) else today.year + 1
+        try:
+            return _dt.date(year, mo, day).isoformat()
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_flight_slots(transcript: str) -> dict:
+    """
+    Pull origin/destination/dates out of phrases like:
+      "find flights from SF to Tokyo next weekend"
+      "flights to Paris on May 5"
+      "fly from Boston to London tomorrow"
+    """
+    import datetime
+    t = transcript.lower()
+
+    # Origin: "from X to Y" — capture everything between.
+    m = re.search(r"from\s+([a-z][a-z\s.]+?)\s+to\s+([a-z][a-z\s.]+?)(?:\s+(?:on|next|tomorrow|in|this|for)|[,.?!]|$)", t)
+    if m:
+        origin, destination = m.group(1).strip(), m.group(2).strip()
+    else:
+        # "flights to Tokyo" — no explicit origin.
+        m2 = re.search(r"(?:to|for)\s+([a-z][a-z\s.]+?)(?:\s+(?:on|next|tomorrow|in|this|for)|[,.?!]|$)", t)
+        origin = ""
+        destination = m2.group(1).strip() if m2 else ""
+
+    slots: dict = {"origin": origin, "destination": destination}
+
+    # Date phrase: grab what follows "on"/"next"/"tomorrow"/"in" and hand to
+    # the parser. Fine if nothing matches — date is optional.
+    d = re.search(r"(?:\b(?:on|next|tomorrow|in this|in)\b\s*)([a-z0-9\s]+?)(?:[,.?!]|$)", t)
+    if d:
+        date_str = _parse_when_phrase(d.group(0).strip(), datetime.date.today())
+        if date_str:
+            slots["depart_date"] = date_str
+
+    return slots
+
+
 def _rule_based_parse(transcript: str) -> IntentObject:
     """Keyword fallback covering the three core demo flows."""
     t = transcript.lower()
+
+    if any(kw in t for kw in _FLIGHT_TRIGGERS):
+        slots = _extract_flight_slots(transcript)
+        if slots.get("destination"):
+            return IntentObject(
+                goal=KnownGoal.FIND_FLIGHTS,
+                target={"type": "url", "value": "kiwi.com"},
+                uses_local_data=[],
+                requires_browser=False,
+                requires_submission=False,
+                slots=slots,
+                raw_transcript=transcript,
+            )
 
     url_target = _infer_open_url_target(transcript)
     if url_target is not None:
