@@ -101,4 +101,9 @@ def classify(action: dict | None) -> Safety:
                 return "safe"
         return "needs_confirm"
 
+    if kind == "find_flights":
+        # Read-only search — we just surface clickable deeplinks; the
+        # user commits by clicking a chip. Nothing books automatically.
+        return "safe"
+
     return "needs_confirm"

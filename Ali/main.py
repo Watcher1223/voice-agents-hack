@@ -359,38 +359,24 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     )
                     return
 
+                # Flights: hit Kiwi MCP for structured results and push the
+                # top 3 as clickable chips. Delegated to a helper so missing
+                # slots (origin, destination, date) can re-prompt the user
+                # via PTT, matching _run_send_message_flow's UX.
+                if intent.goal == KnownGoal.FIND_FLIGHTS:
+                    await _run_find_flights_flow(
+                        dict(intent.slots or {}),
+                        goal_label,
+                        overlay,
+                        menu_bar,
+                        request_ptt_session_from_wake,
+                    )
+                    return
+
                 # 3 — Execute (known intent)
                 print("[3/3] Executing...")
                 menu_bar.set_status("running")
                 overlay.push("action", f"Running: {goal_label}…")
-
-                # Flights: call Kiwi MCP for real structured results. Pick the
-                # cheapest, speak its summary, open Kiwi's booking deeplink.
-                if intent.goal == KnownGoal.FIND_FLIGHTS:
-                    from executors.flights import search_flights, format_flight_summary, FlightSearchError
-                    from voice.speak import speak
-                    try:
-                        flights = await search_flights(intent.slots)
-                    except FlightSearchError as e:
-                        overlay.push("error", f"Flight search failed: {e}")
-                        speak(str(e))
-                        return
-                    except Exception as e:
-                        overlay.push("error", f"Flight search error: {e}")
-                        speak("I couldn't reach the flight search service.")
-                        return
-                    if not flights:
-                        overlay.push("done", "No flights found")
-                        speak("I couldn't find any flights for that route.")
-                        return
-                    top = flights[0]
-                    summary = format_flight_summary(top)
-                    overlay.push("done", summary)
-                    speak(f"Found a flight for {top.get('price')} dollars, {summary.split('•')[-1].strip()}.")
-                    deeplink = top.get("deepLink")
-                    if deeplink:
-                        _open_url_local(deeplink)
-                    return
 
                 # Browser-shaped intents (open_url, apply_to_job, anything the
                 # parser flagged requires_browser=True) all enter the same
@@ -740,6 +726,110 @@ async def _run_send_message_flow(
     att_note = f" · {len(attachments)} attached" if attachments else ""
     overlay.push("assistant", f"✓ iMessage → {contact}: {body[:140]}{att_note}")
     speak("Sent.")
+
+
+async def _run_find_flights_flow(
+    slots: dict,
+    goal_label: str,
+    overlay,
+    menu_bar,
+    request_ptt_session_from_wake,
+) -> None:
+    """Search Kiwi for flights, re-prompting the user via PTT for any
+    missing slot (origin, destination, depart_date) before firing the
+    request. Top 3 results land on the overlay as clickable chips."""
+    from executors.flights import FlightSearchError, search_flights
+    from intent.parser import _parse_when_phrase
+    from voice.speak import speak
+    import datetime
+    import json as _json
+
+    import re as _re
+
+    origin = str(slots.get("origin") or "").strip()
+    destination = str(slots.get("destination") or "").strip()
+    depart_date = str(slots.get("depart_date") or "").strip()
+    # Any depart_date that isn't YYYY-MM-DD is unusable by Kiwi; treat
+    # it as "still missing" so the flow re-prompts rather than crashing
+    # deep inside _to_kiwi_date.
+    if depart_date and not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", depart_date):
+        parsed = _parse_when_phrase(depart_date, datetime.date.today())
+        depart_date = parsed or ""
+        slots["depart_date"] = depart_date
+
+    def _resume_with(key: str):
+        async def _inner(answer: str) -> None:
+            slots[key] = (answer or "").strip()
+            await _run_find_flights_flow(
+                slots, goal_label, overlay, menu_bar,
+                request_ptt_session_from_wake,
+            )
+        return _inner
+
+    if not origin:
+        _ask_followup(
+            "Where are you flying from?",
+            _resume_with("origin"),
+            overlay=overlay,
+            request_ptt=request_ptt_session_from_wake,
+            label="find_flights:origin",
+        )
+        return
+    if not destination:
+        _ask_followup(
+            "Where to?",
+            _resume_with("destination"),
+            overlay=overlay,
+            request_ptt=request_ptt_session_from_wake,
+            label="find_flights:destination",
+        )
+        return
+    if not depart_date:
+        _ask_followup(
+            "When do you want to fly?",
+            _resume_with("depart_date"),
+            overlay=overlay,
+            request_ptt=request_ptt_session_from_wake,
+            label="find_flights:depart_date",
+        )
+        return
+
+    print("[3/3] Executing flight search...")
+    menu_bar.set_status("running")
+    overlay.push("action", f"Running: {goal_label}…")
+
+    try:
+        flights = await search_flights(slots)
+    except FlightSearchError as exc:
+        overlay.push("error", f"Flight search failed: {exc}")
+        speak("I couldn't pull flights for that.")
+        return
+    except Exception as exc:
+        overlay.push("error", f"Flight search error: {exc}")
+        speak("I couldn't reach the flight search service.")
+        return
+
+    if not flights:
+        overlay.push("assistant", f"No flights {origin} → {destination}.")
+        speak("I didn't find any flights for that.")
+        return
+
+    top = flights[:3]
+    items: list[dict] = []
+    for f in top:
+        price = int(f.get("price") or 0)
+        label = f"${price} {f.get('flyFrom', '')}→{f.get('flyTo', '')}"
+        deeplink = str(f.get("deepLink") or "")
+        if deeplink:
+            items.append({"label": label, "path": deeplink})
+
+    if items:
+        overlay.push("cited_paths", _json.dumps(items, ensure_ascii=False))
+    cheapest = top[0]
+    speak(
+        f"Cheapest is {int(cheapest.get('price') or 0)} dollars to "
+        f"{cheapest.get('flyTo', destination)}."
+    )
 
 
 async def _split_body_and_extra_actions(
@@ -1096,6 +1186,9 @@ async def _execute_ambient_action(analysis, overlay) -> None:
         if kind == "browser_task":
             await _execute_ambient_browser_task(text, overlay, headline)
             return
+        if kind == "find_flights":
+            await _execute_ambient_find_flights(slots, overlay, headline)
+            return
         overlay.push("ambient_ack", f"✗ unsupported action kind {kind!r}")
         agent_log("ambient:exec", f"unsupported kind={kind}")
     except Exception as e:
@@ -1139,6 +1232,72 @@ async def _execute_ambient_browser_task(
     err = status.error or status.state or "browser task did not complete"
     overlay.push("ambient_ack", f"✗ {err[:160]}")
     agent_log("tool:browser_task:err", err[:200])
+
+
+async def _execute_ambient_find_flights(
+    slots: dict, overlay, headline: str
+) -> None:
+    """Search Kiwi's MCP with structured slots and push the top-3 as
+    clickable citation chips. The overlay's existing `cited_paths`
+    painter treats each chip as a link — `open <deeplink>` routes the
+    user into Kiwi's booking page in Chrome."""
+    from observer.agent_log import log as agent_log
+    from executors.flights import (
+        FlightSearchError,
+        search_flights,
+    )
+    from voice.speak import speak
+    import json as _json
+
+    origin = str(slots.get("origin") or "").strip()
+    destination = str(slots.get("destination") or "").strip()
+    depart_date = str(slots.get("depart_date") or "").strip()
+    # Ambient promises all three slots are filled — the prompt tells
+    # the model to omit the action otherwise. If we see a gap anyway,
+    # it means the model ignored the instruction; skip instead of
+    # defaulting, which would silently book for the wrong date.
+    if not origin or not destination or not depart_date:
+        overlay.push("ambient_ack", "✗ find_flights: incomplete slots")
+        agent_log("tool:find_flights:err", f"incomplete slots: {slots}")
+        return
+
+    slots = dict(slots)
+    overlay.push("action", f"▶  flights  ·  {origin} → {destination}")
+    agent_log("tool:find_flights", f"origin={origin} dest={destination} date={depart_date}")
+
+    try:
+        flights = await search_flights(slots)
+    except FlightSearchError as exc:
+        overlay.push("ambient_ack", f"✗ {exc}")
+        agent_log("tool:find_flights:err", str(exc)[:200])
+        return
+    except Exception as exc:
+        overlay.push("ambient_ack", f"✗ {exc}")
+        agent_log("tool:find_flights:err", str(exc)[:200])
+        return
+
+    if not flights:
+        overlay.push("assistant", f"No flights {origin} → {destination}.")
+        speak("I didn't find any flights for that.")
+        return
+
+    top = flights[:3]
+    items: list[dict] = []
+    for f in top:
+        price = int(f.get("price") or 0)
+        label = f"${price} {f.get('flyFrom', '')}→{f.get('flyTo', '')}"
+        deeplink = str(f.get("deepLink") or "")
+        if deeplink:
+            items.append({"label": label, "path": deeplink})
+
+    if items:
+        overlay.push("cited_paths", _json.dumps(items, ensure_ascii=False))
+    cheapest = top[0]
+    speak(
+        f"Cheapest is {int(cheapest.get('price') or 0)} dollars to "
+        f"{cheapest.get('flyTo', destination)}."
+    )
+    agent_log("tool:find_flights:done", f"top_price={top[0].get('price')} count={len(items)}")
 
 
 def _enrich_action_dict(

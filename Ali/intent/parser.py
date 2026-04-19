@@ -315,6 +315,36 @@ def _parse_json_response(raw: str, transcript: str) -> IntentObject:
     if not isinstance(slots, dict):
         slots = {}
 
+    # LLMs love to return "tomorrow" / "next weekend" verbatim in
+    # depart_date, but Kiwi needs YYYY-MM-DD. They also hallucinate the
+    # year ("April 20" → "2023-04-20") since training data skews past.
+    # Normalise both issues so every caller sees a clean future date.
+    if goal == KnownGoal.FIND_FLIGHTS:
+        import datetime as _dt
+        today = _dt.date.today()
+        for key in ("depart_date", "return_date"):
+            raw_date = str(slots.get(key) or "").strip()
+            if not raw_date:
+                continue
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date):
+                try:
+                    d = _dt.date.fromisoformat(raw_date)
+                except ValueError:
+                    continue
+                if d < today:
+                    # Roll forward to the next occurrence of (month, day).
+                    try:
+                        candidate = d.replace(year=today.year)
+                    except ValueError:
+                        candidate = d  # Feb 29 on non-leap year; leave as-is.
+                    if candidate < today:
+                        candidate = candidate.replace(year=today.year + 1)
+                    slots[key] = candidate.isoformat()
+            else:
+                iso = _parse_when_phrase(raw_date, today)
+                if iso:
+                    slots[key] = iso
+
     return IntentObject(
         goal=goal,
         target=target,
