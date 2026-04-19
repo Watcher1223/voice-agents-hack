@@ -42,6 +42,61 @@ TRIGGER_KEY = keyboard.Key.alt_r
 # request_ptt_session_from_wake() to reuse the same path as Right Option.
 _ptt_start_flag: threading.Event | None = None
 
+# macOS: backtick is delivered via AppKit global monitor (ui/overlay.py) → Qt
+# signal → this callback. Set by listen_for_command while the async loop runs.
+_backtick_callback: Callable[[], None] | None = None
+_right_option_down: Callable[[], None] | None = None
+_right_option_up: Callable[[], None] | None = None
+
+
+def register_backtick_callback(cb: Callable[[], None] | None) -> None:
+    """Wire the same handler as pynput's on_backtick (macOS global ` key)."""
+    global _backtick_callback
+    _backtick_callback = cb
+
+
+def invoke_backtick_callback() -> None:
+    """Called from Qt main thread when global backtick fires."""
+    cb = _backtick_callback
+    if cb is None:
+        print(
+            "[voice] Backtick ignored — voice loop not ready yet (wait for "
+            "\"ready — say 'Ali'…\").",
+            flush=True,
+        )
+        return
+    try:
+        cb()
+    except Exception as e:
+        print(f"[voice] backtick callback error: {e}", flush=True)
+
+
+def register_right_option_callbacks(
+    down: Callable[[], None] | None,
+    up: Callable[[], None] | None,
+) -> None:
+    """AppKit global monitor → same path as pynput Right Option."""
+    global _right_option_down, _right_option_up
+    _right_option_down, _right_option_up = down, up
+
+
+def invoke_right_option_down() -> None:
+    fn = _right_option_down
+    if fn is not None:
+        try:
+            fn()
+        except Exception as e:
+            print(f"[voice] Right Option down error: {e}", flush=True)
+
+
+def invoke_right_option_up() -> None:
+    fn = _right_option_up
+    if fn is not None:
+        try:
+            fn()
+        except Exception as e:
+            print(f"[voice] Right Option up error: {e}", flush=True)
+
 # Next capture after start_flag is triggered via wake/backtick: end-of-utterance
 # by silence (Option release still works to cut short).
 _conversational_lock = threading.Lock()
@@ -210,11 +265,9 @@ async def listen_for_command(
             except Exception:
                 pass
 
-    # macOS: pynput's Listener installs a CGEventTap from a secondary thread,
-    # which SIGTRAPs the process under a Qt QApplication main runloop. Disabled
-    # by default; opt in with ALI_ENABLE_HOTKEY=1 if/when we re-implement the
-    # global hotkey via a Qt/AppKit-native observer. Wake word ("Ali") still
-    # triggers the same capture path via request_ptt_session_from_wake.
+    # macOS: pynput's Listener can SIGTRAP under Qt; disabled by default. Backtick
+    # is handled by AppKit global monitor in ui/overlay.py (see
+    # invoke_backtick_callback). Set ALI_ENABLE_HOTKEY=1 to use pynput instead.
     _hotkey_enabled = os.environ.get("ALI_ENABLE_HOTKEY") == "1"
     listener = None
     if _hotkey_enabled:
@@ -222,7 +275,7 @@ async def listen_for_command(
         listener.start()
 
     print(
-        "[voice] Ready — say “Ali” to start a hands-free voice command",
+        "[voice] Ready — say “Ali”, press ` (backtick), or hold Right Option to record",
         flush=True,
     )
     loop = asyncio.get_event_loop()
@@ -240,6 +293,32 @@ async def listen_for_command(
                 print(f"[voice] Failed to start wake listener: {e}", flush=True)
 
         loop.create_task(_arm_wake_when_safe())
+
+    def _ro_down() -> None:
+        if is_recording.is_set():
+            return
+        try:
+            from voice.wake_word import recording_active
+
+            recording_active.set()
+        except Exception:
+            pass
+        if overlay:
+            overlay.push("recording")
+        start_flag.set()
+
+    def _ro_up() -> None:
+        if is_recording.is_set():
+            stop_flag.set()
+            try:
+                from voice.wake_word import recording_active
+
+                recording_active.clear()
+            except Exception:
+                pass
+
+    register_backtick_callback(on_backtick)
+    register_right_option_callbacks(_ro_down, _ro_up)
 
     global _next_session_conversational
 
@@ -309,6 +388,8 @@ async def listen_for_command(
 
     finally:
         _ptt_start_flag = None
+        register_backtick_callback(None)
+        register_right_option_callbacks(None, None)
         if listener is not None:
             listener.stop()
         audio.terminate()
