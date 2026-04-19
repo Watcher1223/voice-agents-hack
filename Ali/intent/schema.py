@@ -17,6 +17,7 @@ class KnownGoal(str, Enum):
     FIND_FILE = "find_file"
     CAPTURE_MEETING = "capture_meeting"
     ASK_KNOWLEDGE = "ask_knowledge"
+    FIND_FLIGHTS = "find_flights"
     UNKNOWN = "unknown"
 
 
