@@ -25,6 +25,12 @@ from observer.agent_log import log as _agent_log
 
 AMBIENT_TRIGGER_EVERY_FINALS = 5
 AMBIENT_HISTORY_TURNS = 30
+# Debounce raw Deepgram finals: if another final arrives <N seconds
+# after the last one, merge them into a single turn. Ported from glass
+# (src/features/listen/stt/sttService.js:COMPLETION_DEBOUNCE_MS=2000).
+# Gives the speaker time to finish a thought before the analyzer counts
+# it as a completed utterance.
+DEBOUNCE_SECONDS = 2.0
 
 
 def _log(tag: str, text: str) -> None:
@@ -62,6 +68,10 @@ class AmbientCapture:
         self._analysis_in_flight = False
         self._previous = None  # type: ignore[assignment]
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Debounce buffer for Deepgram finals. Accessed only on the
+        # asyncio loop so no lock is needed.
+        self._pending_parts: list[str] = []
+        self._debounce_handle: asyncio.TimerHandle | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -81,26 +91,13 @@ class AmbientCapture:
                 self._loop.call_soon_threadsafe(self._on_interim, text)
 
         def _final(text: str) -> None:
-            with self._lock:
-                self._history.append(text)
-                self._finals_since_trigger += 1
-                count = self._finals_since_trigger
-                total = len(self._history)
-                should_trigger = (
-                    count >= AMBIENT_TRIGGER_EVERY_FINALS
-                    and not self._analysis_in_flight
-                )
-                if should_trigger:
-                    self._finals_since_trigger = 0
-            # One line per final utterance so the user can see the loop
-            # is alive, how close we are to the next analysis, and what
-            # was actually heard.
-            marker = "↳ firing analysis" if should_trigger else f"({count}/{AMBIENT_TRIGGER_EVERY_FINALS} until next analysis)"
-            _log("final", f"{total:>2}: \"{text[:120]}\" {marker}")
-            if self._loop:
-                self._loop.call_soon_threadsafe(self._on_final, text)
-            if should_trigger and self._loop:
-                self._loop.call_soon_threadsafe(self._schedule_analysis)
+            # Don't commit this final immediately. Glass-style debounce:
+            # buffer it and start a timer. If another final arrives before
+            # DEBOUNCE_SECONDS elapse, merge them. Only when N seconds of
+            # silence pass do we commit the accumulated text as one turn.
+            if self._loop is None:
+                return
+            self._loop.call_soon_threadsafe(self._ingest_final, text)
 
         stream_thread = threading.Thread(
             target=stream_transcription_sync,
@@ -116,6 +113,54 @@ class AmbientCapture:
             self._stop_event.set()
             stop_meeting_audio()
             stream_thread.join(timeout=3.0)
+
+    def _ingest_final(self, text: str) -> None:
+        """Append a raw Deepgram final to the pending buffer + restart the
+        debounce timer. Runs on the asyncio loop — no threading concerns."""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._pending_parts.append(text)
+        # Live ticker: show the growing text so the user sees each final
+        # arrive even before the turn commits.
+        joined_preview = " ".join(self._pending_parts)
+        try:
+            self._on_final(joined_preview)
+        except Exception:
+            pass
+        # Restart the silence timer.
+        if self._debounce_handle is not None:
+            self._debounce_handle.cancel()
+        if self._loop is not None:
+            self._debounce_handle = self._loop.call_later(
+                DEBOUNCE_SECONDS, self._commit_pending_turn
+            )
+
+    def _commit_pending_turn(self) -> None:
+        """Silence-gap has elapsed — merge the buffered finals into one
+        turn and (maybe) trigger analysis."""
+        self._debounce_handle = None
+        if not self._pending_parts:
+            return
+        turn = " ".join(self._pending_parts).strip()
+        self._pending_parts = []
+        with self._lock:
+            self._history.append(turn)
+            self._finals_since_trigger += 1
+            count = self._finals_since_trigger
+            total = len(self._history)
+            should_trigger = (
+                count >= AMBIENT_TRIGGER_EVERY_FINALS
+                and not self._analysis_in_flight
+            )
+            if should_trigger:
+                self._finals_since_trigger = 0
+        marker = "↳ firing analysis" if should_trigger else (
+            f"({count}/{AMBIENT_TRIGGER_EVERY_FINALS} until next analysis)"
+        )
+        _log("final", f'{total:>2}: "{turn[:120]}" {marker}')
+        if should_trigger:
+            self._schedule_analysis()
 
     def _schedule_analysis(self) -> None:
         # Run in background; buffer continues to receive finals meanwhile.

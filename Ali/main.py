@@ -216,7 +216,9 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     agent_loop.create_task(_run_meeting_capture(overlay, menu_bar))
                     return
 
-                if intent.goal.value == "ask_knowledge":
+                _disk_on = os.environ.get("VOICE_AGENT_DISK_INDEX", "0").lower() in {"1", "true", "yes"}
+
+                if intent.goal.value == "ask_knowledge" and _disk_on:
                     from executors.local.disk_index import answer_question
                     from voice.speak import speak
                     print("[2.5/3] Knowledge question → retrieving from disk index...")
@@ -228,21 +230,26 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     speak(result.text or "I don't have that.")
                     return
 
-                if intent.goal.value == "unknown":
-                    from executors.local.disk_index import answer_question, index_exists
+                if intent.goal.value in ("unknown", "ask_knowledge"):
                     from intent.chat import chat_reply
                     from voice.speak import speak
                     print("[2.5/3] Unknown intent → conversational reply...")
                     reply = ""
-                    if index_exists():
-                        rag = await answer_question(transcript)
-                        if rag.snippets_used > 0 and rag.text:
-                            reply = rag.text
-                            overlay.push("assistant", reply)
-                            _push_citations(overlay, rag.cited_paths)
-                            speak(reply)
-                            print(f'      ← "{reply}" (rag backend={rag.backend})')
-                            return
+                    if _disk_on:
+                        # Only query the disk index when the feature flag is on.
+                        try:
+                            from executors.local.disk_index import answer_question, index_exists
+                            if index_exists():
+                                rag = await answer_question(transcript)
+                                if rag.snippets_used > 0 and rag.text:
+                                    reply = rag.text
+                                    overlay.push("assistant", reply)
+                                    _push_citations(overlay, rag.cited_paths)
+                                    speak(reply)
+                                    print(f'      ← "{reply}" (rag backend={rag.backend})')
+                                    return
+                        except Exception as e:
+                            print(f"[disk-index] fallback skipped: {e}")
                     reply = await chat_reply(transcript)
                     print(f'      ← "{reply}"')
                     # #region agent log
@@ -420,7 +427,17 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
             else:
                 request_ptt_session_from_wake(overlay)
 
-        start_wake_word_listener(_wake_heard)  # type: ignore[arg-type]
+        # In ambient mode the wake word is dead weight: the always-on
+        # Deepgram stream already hears everything, and the wake trigger
+        # fires false positives on words containing "ali" (e.g. "hamsi",
+        # "Italy", "alley"). Glass has no wake word at all for the same
+        # reason — see docs/cactus-findings or the comparison we ran.
+        # Backtick PTT still works for direct commands.
+        from config.settings import AMBIENT_ENABLED
+        if AMBIENT_ENABLED:
+            print("[wake_word] disabled — ambient mode is listening continuously")
+        else:
+            start_wake_word_listener(_wake_heard)  # type: ignore[arg-type]
 
     def _on_backtick() -> None:
         # Backtick stops meeting if one is running, otherwise starts wake
@@ -500,10 +517,14 @@ async def _run_ambient_capture(overlay) -> None:
         pass
 
     def _on_final(text: str) -> None:
-        # Per feedback: stop flooding the overlay with every utterance.
-        # Finals are written to ~/.ali/agent.log by AmbientCapture already;
-        # the overlay should only show surfaced tiers + action progress,
-        # not a running transcript.
+        # Show one short line per final so the pill visibly ticks with
+        # the speaker — without flooding. Overlay trims to the last
+        # ~8 lines, and surfaced tiers (or the initial 'Ali listening')
+        # stay pinned above them.
+        snippet = text.strip()
+        if len(snippet) > 56:
+            snippet = snippet[:55].rstrip() + "…"
+        overlay.push("assistant", f"· {snippet}")
         # Confirmation listener: if there's a pending action waiting on
         # "yes" / "no", try to consume this final transcript.
         global _pending_confirmation
@@ -1642,17 +1663,23 @@ def main() -> None:
     _phase("running preflight checks…")
     run_preflight_checks()
 
-    _phase("checking disk index…")
-    ensure_index(
-        force_rebuild=args.rebuild_index,
-        skip=args.skip_index,
-        background=not args.wait_for_index,
-    )
-
-    _phase("warming up embedder in background…")
-    threading.Thread(
-        target=_warmup_disk_index_embedder, daemon=True, name="index-warmup"
-    ).start()
+    # Disk-index / embedder: gated behind VOICE_AGENT_DISK_INDEX=1. Off by
+    # default while we stabilise the demo — the feature starts a laptop-
+    # wide index build on boot and takes over the `unknown` intent path,
+    # which collides with the ambient UX we're testing.
+    if os.environ.get("VOICE_AGENT_DISK_INDEX", "0").lower() in {"1", "true", "yes"}:
+        _phase("checking disk index…")
+        ensure_index(
+            force_rebuild=args.rebuild_index,
+            skip=args.skip_index,
+            background=not args.wait_for_index,
+        )
+        _phase("warming up embedder in background…")
+        threading.Thread(
+            target=_warmup_disk_index_embedder, daemon=True, name="index-warmup"
+        ).start()
+    else:
+        _phase("disk index disabled (set VOICE_AGENT_DISK_INDEX=1 to enable)")
 
     _phase("building UI (loads PySide6; takes ~3s first time)…")
     overlay, run_ui = _build_overlay()
