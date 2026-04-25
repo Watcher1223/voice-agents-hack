@@ -26,7 +26,20 @@
       "Bash(/usr/bin/python3 -c \"import sys; sys.path.insert\\(0, '/Users/alspenceramitojr/Desktop/Ali/Ali'\\); import voice.listen_brief; print\\('OK:', voice.listen_brief.__file__\\)\")",
       "Bash(/usr/bin/python3 -c ' *)",
       "Bash(/usr/bin/python3 -c \"import mcp\")",
-      "Bash(/usr/bin/python3 *)"
+      "Bash(/usr/bin/python3 *)",
+      "Bash(GIT_EDITOR=true git commit --no-edit)",
+      "Bash(git push *)",
+      "Bash(git checkout *)",
+      "Bash(npx tsc *)",
+      "Bash(npm run *)",
+      "Read(//tmp/**)",
+      "Bash(curl -s http://localhost:1420/)",
+      "WebFetch(domain:cactuscompute.com)",
+      "Bash(curl -sL https://cactuscompute.com/)",
+      "Bash(curl -sL \"https://cactuscompute.com/_next/static/css/f193ae6fb12dcb76.css?dpl=dpl_Yg3WzSVqCRehe9cTYPXRo8q7joT6\")",
+      "Bash(git ls-remote *)",
+      "Bash(git -C /Users/alspenceramitojr/Desktop/Ali stash push -u -m \"frontend-wip-favicon\" -- Ali/main.py Ali/voice/meeting_capture.py .claude/settings.local.json)",
+      "Bash(git -C /Users/alspenceramitojr/Desktop/Ali checkout landing-site)"
     ]
   }
 }

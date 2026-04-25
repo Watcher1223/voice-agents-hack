@@ -221,6 +221,13 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                         await resume(transcript.strip().rstrip(".!?"))
                         return
 
+                if _is_best_compliment(transcript):
+                    from voice.speak import speak
+                    reply = "yes, i know!"
+                    overlay.push("assistant", reply)
+                    speak(reply)
+                    return
+
                 # 0 — Session-reset phrases end the active browser session,
                 #     if any, and return. Otherwise fall through.
                 if _is_session_reset(transcript):
@@ -289,6 +296,8 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                 if intent.goal.value == "ask_knowledge":
                     from executors.local.disk_index import answer_question
                     from voice.speak import speak
+                    if await _try_answer_from_active_pdf(transcript, overlay):
+                        return
                     print("[2.5/3] Knowledge question → retrieving from disk index...")
                     result = await answer_question(transcript)
                     print(f'      ← "{result.text}" (backend={result.backend}, '
@@ -312,6 +321,8 @@ async def _agent_main(overlay: TranscriptionOverlay) -> None:
                     if any(c in _t_lower for c in _COMPLIMENTS):
                         overlay.push("assistant", "I know.")
                         speak("I know.")
+                        return
+                    if await _try_answer_from_active_pdf(transcript, overlay):
                         return
                     print("[2.5/3] Unknown intent → conversational reply...")
                     reply = ""
@@ -1096,6 +1107,17 @@ def _match_any(text: str, tokens: set[str]) -> bool:
     if t in tokens:
         return True
     return any(t.startswith(token + " ") or t.endswith(" " + token) or f" {token} " in f" {t} " for token in tokens)
+
+
+def _is_best_compliment(text: str) -> bool:
+    t = (text or "").strip().lower().rstrip(".!?")
+    if not t:
+        return False
+    for prefix in ("hey ali", "okay ali", "ok ali", "ali"):
+        if t.startswith(prefix + " "):
+            t = t[len(prefix):].strip()
+            break
+    return t in {"you're the best", "youre the best", "you are the best"}
 
 
 def _ambient_deepgram_final_is_explicit_wake(text: str) -> bool:
@@ -2638,17 +2660,27 @@ async def _maybe_speak_meeting_correction(
 
 
 async def _meeting_briefing(results: list[str], transcript: str) -> str:
-    """Use Gemini to generate a natural spoken end-of-meeting summary."""
+    """Use Gemini to generate a spoken recap with factual corrections."""
     from config.settings import GEMINI_API_KEY
     if not GEMINI_API_KEY:
-        return "Meeting done. " + ". ".join(results[:3]) + "."
+        if results:
+            return "Meeting done. " + ". ".join(results[:3]) + "."
+        return "Meeting done. Quick recap: we wrapped up and aligned on next steps."
 
     items_text = "\n".join(f"- {r}" for r in results)
+    transcript_text = (transcript or "").strip()
+    if len(transcript_text) > 7000:
+        transcript_text = transcript_text[-7000:]
     prompt = (
         "You are Ali, an AI chief of staff. A meeting just ended. "
-        "Summarize what was accomplished in 2-3 natural spoken sentences — "
-        "no markdown, no lists, no 'Certainly!'. Be direct. Mention specific results.\n\n"
+        "Give a 3-5 sentence spoken recap of the meeting: main decisions, key updates, "
+        "and action progress. "
+        "If a fact was stated incorrectly and corrected later (for example a revenue number), "
+        "explicitly use the corrected fact in the recap and do not repeat the wrong value. "
+        "Only correct facts when the transcript itself contains a clear correction; do not invent. "
+        "No markdown, no bullet list, no preamble like 'Certainly'.\n\n"
         f"Actions completed:\n{items_text}\n\n"
+        f"Meeting transcript:\n{transcript_text or '(no transcript provided)'}\n\n"
         "Spoken summary:"
     )
     import asyncio as _aio
@@ -2660,12 +2692,14 @@ async def _meeting_briefing(results: list[str], transcript: str) -> str:
             r = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt,
-                config=_genai.types.GenerateContentConfig(temperature=0.3, max_output_tokens=120),
+                config=_genai.types.GenerateContentConfig(temperature=0.3, max_output_tokens=220),
             )
             return (r.text or "").strip()
         return await loop.run_in_executor(None, _call)
     except Exception:
-        return "Meeting done. " + ". ".join(results[:3]) + "."
+        if results:
+            return "Meeting done. " + ". ".join(results[:3]) + "."
+        return "Meeting done. Quick recap: we wrapped up and aligned on next steps."
 
 
 def _revealed_basename(intent) -> str | None:
@@ -2732,6 +2766,36 @@ def _pretty_citation(path: str) -> str:
             return path
         return _SOURCE_LABELS.get(source, source.title())
     return os.path.basename(path)
+
+
+async def _try_answer_from_active_pdf(transcript: str, overlay) -> bool:
+    """If a PDF viewer is the focused window, answer from that PDF directly.
+
+    Returns True when we produced an answer (caller should stop routing),
+    False when no PDF was detected or text extraction yielded nothing.
+    """
+    try:
+        from intent.active_pdf import extract_active_pdf_text
+        from intent.pdf_answer import answer_from_pdf
+        from voice.speak import speak
+    except Exception as exc:
+        print(f"[pdf] import failed: {exc}")
+        return False
+
+    detected = extract_active_pdf_text()
+    if detected is None:
+        return False
+    pdf_path, pdf_text = detected
+    print(f"[pdf] active PDF: {pdf_path.name} ({len(pdf_text)} chars) — answering from doc")
+    overlay.push("assistant", f"Reading {pdf_path.name}…")
+    result = await answer_from_pdf(transcript, pdf_path, pdf_text)
+    if not result.text:
+        return False
+    overlay.push("assistant", result.text)
+    _push_citations(overlay, [str(pdf_path)])
+    speak(result.text)
+    print(f'[pdf] ← "{result.text[:120]}…" (backend={result.backend})')
+    return True
 
 
 def _push_citations(overlay, paths: list[str]) -> None:
