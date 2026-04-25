@@ -148,32 +148,6 @@ function Hero() {
           <span>Built for founders, operators, and teams who run meetings back-to-back.</span>
         </div>
       </div>
-
-      <div className="hero-card" aria-hidden>
-        <div className="hero-card-head">
-          <span className="hero-card-dot dot--live" />
-          <span>Live · Board sync</span>
-          <span className="hero-card-time">38:12</span>
-        </div>
-        <ul className="hero-card-list">
-          <li>
-            <span className="hcl-tag tag--done">Done</span>
-            Found 4 SFO → JFK flights for May 2 (Mon)
-          </li>
-          <li>
-            <span className="hcl-tag tag--queue">Queued</span>
-            Hold 30 min Tues w/ Maya — pending your review
-          </li>
-          <li>
-            <span className="hcl-tag tag--draft">Drafting</span>
-            Follow-up email to investors with deck v3
-          </li>
-          <li>
-            <span className="hcl-tag tag--hear">Listening</span>
-            “Let’s circle back on the pricing page…”
-          </li>
-        </ul>
-      </div>
     </header>
   );
 }
