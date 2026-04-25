@@ -16,6 +16,9 @@ except ImportError:
 # ── Gemini API (for fast text intent parsing) ─────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
+# ── Anthropic API (Claude verifier for proof-heavy PDF answers) ───────────────
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
 # ── Deepgram API (real-time streaming STT for meeting capture) ────────────────
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 

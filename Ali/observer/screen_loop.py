@@ -166,6 +166,16 @@ class ScreenObserver:
                     )
                 if changed:
                     print(f"[screen] focus → {app!r} / {title!r}  ({len(image)} bytes)")
+                    # Warm the active-PDF cache whenever a PDF window comes
+                    # into focus — by the time the user asks a question
+                    # focus has usually moved to Ali / their editor.
+                    try:
+                        from intent.active_pdf import note_focus
+                        cached = note_focus(app, title)
+                        if cached is not None:
+                            print(f"[screen] cached active PDF → {cached.name}")
+                    except Exception:
+                        pass
                 last_app, last_title = app, title
 
             # Sleep in small steps so stop() lands fast.

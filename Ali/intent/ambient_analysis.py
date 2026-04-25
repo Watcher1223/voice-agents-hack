@@ -150,6 +150,20 @@ Apply this decision hierarchy IN ORDER. Stop at the first tier that fires.
     Nothing above fires, or every candidate action is already on the
     checklist.
 
+NEVER create a tier-3 action when the user is asking a question about
+content they're working with — those belong in tier 1 (or tier 4 if
+silent). Examples that MUST NOT become tasks:
+  - "what is the answer to question 49"
+  - "answer question 3"
+  - "explain this proof"
+  - "what does idempotent mean"
+  - "how do I solve this"
+  - "what's on my screen"
+A question is for ANSWERING, not for spawning a "Search for X" or "Find
+Y" task. Even if the question references a file ("answer question 49 in
+this PDF"), the file is already on screen — do NOT generate a find_file
+action for it.
+
 OUTPUT SCHEMA — emit a SINGLE JSON object. No prose. No markdown fences.
 Required keys:
   tier:        integer 1-4
