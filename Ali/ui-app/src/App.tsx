@@ -104,12 +104,12 @@ function Hero() {
           <span className="dot" /> Now in private beta
         </span>
         <h1 className="hero-title">
-          The AI that <span className="grad">listens to your meetings</span>
-          <br /> and finishes the work for you.
+          Ask Ali about <span className="grad">anything on your screen</span>
+          <br /> — or anything in your meeting. It finishes the work.
         </h1>
         <p className="hero-sub">
-          Ali sits quietly on your laptop, hears what needs to happen, and gets it done in
-          parallel — flights booked, calendar held, docs drafted — before you’ve even said goodbye.
+          Open a PDF, share a tab, run a meeting — Ali keeps up with the context, answers
+          your questions, and quietly gets the work done while you keep going.
         </p>
         <div className="hero-cta">
           <a className="btn btn--primary btn--lg" href="#waitlist">
