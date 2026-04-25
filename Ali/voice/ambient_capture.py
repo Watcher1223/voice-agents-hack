@@ -73,6 +73,19 @@ class AmbientCapture:
     def stop(self) -> None:
         self._stop_event.set()
 
+    def discard_last_final(self) -> None:
+        """Remove the most recent final from history.
+
+        Used when an utterance was already handled by another path
+        (wake-word dispatch, checklist voice command) — leaving it in
+        history would let ambient analysis re-fire on the same words and
+        e.g. spawn a "Search for X" task from a question that was
+        already answered."""
+        with self._lock:
+            if self._history:
+                self._history.pop()
+            self._finals_since_trigger = max(0, self._finals_since_trigger - 1)
+
     async def run(self) -> None:
         from voice.deepgram_stream import (
             stream_transcription_sync,

@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import faulthandler
 import os
+import re
 import signal
 import sys
 import threading
@@ -1120,15 +1121,21 @@ def _is_best_compliment(text: str) -> bool:
     return t in {"you're the best", "youre the best", "you are the best"}
 
 
+_DIARIZATION_PREFIX_RE = re.compile(r"^\s*\[[^\]]+\]\s*")
+
+
 def _ambient_deepgram_final_is_explicit_wake(text: str) -> bool:
     """True when the ambient line looks like a wake phrase, not a casual mention.
 
     Deepgram finals drive this path while the default mic is streaming to
     ambient — avoids relying on a second SpeechRecognition capture for short
-    utterances like \"Ali\" alone."""
+    utterances like \"Ali\" alone. Strips Deepgram diarization prefixes
+    (\"[Me]\", \"[Speaker 1]\") so the wake match works on the actual words.
+    """
     t = (text or "").strip()
     if not t:
         return False
+    t = _DIARIZATION_PREFIX_RE.sub("", t)
     low = t.lower().rstrip(".!?")
     if low.startswith("hey ali"):
         return True
@@ -1166,15 +1173,27 @@ async def _run_ambient_capture(overlay) -> None:
         handled = _handle_checklist_voice_command(text, overlay, agent_loop)
         if handled:
             agent_log("checklist:voice", f"handled {text!r}")
+            if _ambient_capture is not None:
+                _ambient_capture.discard_last_final()
             return
         # Explicit wake on the ambient mic — same handler as Google wake STT.
         from voice.wake_word import try_acquire_wake_dispatch
 
-        if _ambient_deepgram_final_is_explicit_wake(text) and try_acquire_wake_dispatch():
+        if _ambient_deepgram_final_is_explicit_wake(text):
+            if not try_acquire_wake_dispatch():
+                print(f"[ambient:wake] cooldown — ignoring {text!r}")
+                return
             fn = _dispatch_wake_heard
-            if fn is not None:
-                agent_log("ambient:wake", f"Deepgram wake → PTT: {text!r}")
-                fn(text)
+            if fn is None:
+                print(f"[ambient:wake] dispatcher not ready yet — dropping {text!r}")
+                return
+            print(f"[ambient:wake] → PTT: {text!r}")
+            agent_log("ambient:wake", f"Deepgram wake → PTT: {text!r}")
+            # Drop this utterance from ambient history so tier-3 analysis
+            # doesn't also turn the same words into a "Search for X" task.
+            if _ambient_capture is not None:
+                _ambient_capture.discard_last_final()
+            fn(text)
 
     def _on_suggestion(analysis) -> None:
         tier = analysis.tier
@@ -2864,7 +2883,7 @@ def _extract_wake_tail(raw_text: str) -> str:
     For wake phrases like "ali open my resume", return "open my resume".
     If there's no command tail (just "ali"), return "".
     """
-    text_raw = (raw_text or "").strip()
+    text_raw = _DIARIZATION_PREFIX_RE.sub("", (raw_text or "").strip())
     text = text_raw.lower()
     for prefix in ("hey ali", "okay ali", "ok ali", "ali"):
         if text.startswith(prefix):

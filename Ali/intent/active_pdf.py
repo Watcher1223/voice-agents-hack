@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 from pathlib import Path
 
 # Apps whose front window is always a PDF.
@@ -123,8 +124,16 @@ def _resolve_filename(name: str) -> Path | None:
     return candidates[0]
 
 
+# Sticky cache: focus often moves to Cursor / Terminal between the user
+# looking at the PDF and Ali processing the question. Stamp every successful
+# detection so callers can fall back to "the PDF you were just on" within a
+# bounded time window.
+_last_detected: tuple[Path, float] | None = None
+
+
 def detect_active_pdf() -> Path | None:
     """Return the absolute path of the PDF in the focused window, if any."""
+    global _last_detected
     app, title = _front_app_and_title()
     if not app:
         return None
@@ -134,16 +143,66 @@ def detect_active_pdf() -> Path | None:
     name = _candidate_filename(app, title)
     if not name:
         return None
-    return _resolve_filename(name)
+    path = _resolve_filename(name)
+    if path is not None:
+        _last_detected = (path, time.monotonic())
+    return path
 
 
-def extract_active_pdf_text(max_chars: int = 200_000) -> tuple[Path, str] | None:
-    """If a PDF is in the focused window, return (path, extracted_text).
+def note_focus(app: str, title: str) -> Path | None:
+    """Resolve (app, title) to a PDF path and stamp the cache, if applicable.
+
+    Lets the screen observer warm the cache passively as the user moves
+    around — by the time they ask a question, the most recently focused
+    PDF is already cached, even if focus has since moved to Ali / a code
+    editor / a terminal.
+    """
+    global _last_detected
+    if not app:
+        return None
+    title = _normalize_title(title or "")
+    if app not in _PDF_APPS and app not in _BROWSER_APPS:
+        return None
+    name = _candidate_filename(app, title)
+    if not name:
+        return None
+    path = _resolve_filename(name)
+    if path is not None:
+        _last_detected = (path, time.monotonic())
+    return path
+
+
+def recent_active_pdf(window_seconds: float = 120.0) -> Path | None:
+    """Return the most recently focused PDF if it's still warm.
+
+    Falls back to this when ``detect_active_pdf()`` returns None — typically
+    because the user has switched to Cursor/Terminal/Ali while waiting for
+    the answer. The PDF on disk is still the right doc to ground in.
+    """
+    if _last_detected is None:
+        return None
+    path, when = _last_detected
+    if time.monotonic() - when > window_seconds:
+        return None
+    if not path.is_file():
+        return None
+    return path
+
+
+def extract_active_pdf_text(
+    max_chars: int = 200_000,
+    *,
+    fallback_window_seconds: float = 120.0,
+) -> tuple[Path, str] | None:
+    """If a PDF is in the focused window (or was recently), return (path, text).
 
     Uses the same `_read_pdf` helper that powers the disk index, so quirks
-    in malformed PDFs are handled the same way.
+    in malformed PDFs are handled the same way. Falls back to the most
+    recently focused PDF (within ``fallback_window_seconds``) when the
+    current foreground window isn't a PDF — typical when Ali processes the
+    question after focus has moved to its own UI.
     """
-    path = detect_active_pdf()
+    path = detect_active_pdf() or recent_active_pdf(fallback_window_seconds)
     if path is None:
         return None
     try:
