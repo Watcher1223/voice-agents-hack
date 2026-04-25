@@ -168,8 +168,8 @@ p {
 .hero {
   position: relative;
   max-width: var(--max);
-  margin: 40px auto 0;
-  padding: 80px 28px 100px;
+  margin: 0 auto;
+  padding: 36px 28px 100px;
   display: grid;
   grid-template-columns: 1.2fr 1fr;
   gap: 60px;
@@ -710,7 +710,7 @@ p {
   display: flex;
   gap: 36px;
   width: max-content;
-  animation: ticker-scroll 38s linear infinite;
+  animation: ticker-scroll 18s linear infinite;
 }
 
 .ticker-group {
