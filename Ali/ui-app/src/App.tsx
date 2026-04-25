@@ -95,6 +95,31 @@ function NavBar() {
   );
 }
 
+function TeamTicker() {
+  const items = ["Harvey Mudd", "MIT", "Y Combinator", "McGill"];
+  const Group = ({ ariaHidden }: { ariaHidden?: boolean }) => (
+    <div className="ticker-group" aria-hidden={ariaHidden || undefined}>
+      <span className="ticker-label">Built by a team from</span>
+      {items.map((it, i) => (
+        <span key={`${it}-${i}`} className="ticker-row">
+          <span className="ticker-item">{it}</span>
+          <span className="ticker-dot" aria-hidden>·</span>
+        </span>
+      ))}
+    </div>
+  );
+  return (
+    <div className="ticker" role="region" aria-label="Team backgrounds">
+      <div className="ticker-track">
+        <Group />
+        <Group ariaHidden />
+        <Group ariaHidden />
+        <Group ariaHidden />
+      </div>
+    </div>
+  );
+}
+
 function Hero() {
   return (
     <header className="hero" id="top">
@@ -104,8 +129,8 @@ function Hero() {
           <span className="dot" /> Now in private beta
         </span>
         <h1 className="hero-title">
-          Ask Ali about <span className="grad">anything on your screen</span>
-          <br /> — or anything in your meeting. It finishes the work.
+          Ask Ali <span className="grad">anything on your screen</span>
+          <br /> — or in your meeting.
         </h1>
         <p className="hero-sub">
           Open a PDF, share a tab, run a meeting — Ali keeps up with the context, answers
@@ -387,6 +412,7 @@ function App() {
   return (
     <div className="site">
       <NavBar />
+      <TeamTicker />
       <Hero />
       <Features />
       <HowItWorks />
