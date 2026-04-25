@@ -171,8 +171,9 @@ p {
   position: relative;
   max-width: var(--max);
   margin: 0 auto;
-  padding: 36px 28px 100px;
+  padding: 36px 28px 36px;
   display: block;
+  min-height: calc(100vh - 220px);
 }
 
 .hero-inner {
@@ -704,6 +705,7 @@ p {
   background: rgba(255, 255, 255, 0.02);
   overflow: hidden;
   position: relative;
+  margin-top: 36px;
   padding: 14px 0;
   -webkit-mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
           mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
